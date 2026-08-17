@@ -11,8 +11,9 @@ import {
   limit,
   writeBatch
 } from 'firebase/firestore';
-import { db as firestoreDb, handleFirestoreError } from '../firebase';
+import { db as firestoreDb, handleFirestoreError, getIsQuotaExceeded } from '../firebase';
 import { db as dexieDb, isRemoteSyncing, setRemoteSyncing } from '../db/dexie';
+
 
 export interface SyncStatus {
   isOnline: boolean;
@@ -102,7 +103,7 @@ export async function pushDocsBatchToFirestore(
   tableName: TableName,
   items: any[]
 ) {
-  if (isRemoteSyncing) return;
+  if (isRemoteSyncing || getIsQuotaExceeded()) return;
   if (!firestoreDb || !items || items.length === 0) return;
 
   try {
@@ -147,7 +148,7 @@ export async function pushDocToFirestore(
   data?: any,
   isDelete = false
 ) {
-  if (isRemoteSyncing) return;
+  if (isRemoteSyncing || getIsQuotaExceeded()) return;
   if (!firestoreDb) return;
 
   try {
@@ -175,6 +176,7 @@ export async function pushDocToFirestore(
     updateSyncStatus({ syncErrors: currentSyncStatus.syncErrors + 1 });
   }
 }
+
 
 // Real-time listener setup for all Firestore collections -> Dexie
 export function initRealtimeSync(): () => void {
