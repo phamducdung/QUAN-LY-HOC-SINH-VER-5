@@ -1,0 +1,6 @@
+{
+  "name": "Smart Edu Manager - Quản lý Lớp học Toán THCS",
+  "description": "Hệ thống quản lý lớp học và cảnh báo học tập thông minh chuyên biệt cho Giáo viên & Trợ giảng môn Toán THCS (Lớp 6 đến Lớp 9).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

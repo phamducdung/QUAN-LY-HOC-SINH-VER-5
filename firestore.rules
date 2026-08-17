@@ -1,0 +1,22 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isString(field) {
+      return field is string;
+    }
+
+    function isNumber(field) {
+      return field is int || field is float;
+    }
+
+    function isBoolean(field) {
+      return field is bool;
+    }
+
+    // Default allow for authenticated or general usage in demo/prototyping applet
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

@@ -1,0 +1,180 @@
+{
+  "entities": {
+    "school_years": {
+      "title": "School Years",
+      "description": "Academic school years",
+      "properties": {
+        "name": { "type": "string" },
+        "is_active": { "type": "boolean" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["name"]
+    },
+    "classes": {
+      "title": "Classes",
+      "description": "Classrooms managed by teachers",
+      "properties": {
+        "school_year_id": { "type": "string" },
+        "class_name": { "type": "string" },
+        "class_type": { "type": "string" },
+        "grade_level": { "type": "number" },
+        "target_description": { "type": "string" },
+        "schedule": { "type": "string" },
+        "assistant_name": { "type": "string" },
+        "assistant_phone": { "type": "string" },
+        "status": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["class_name"]
+    },
+    "students": {
+      "title": "Students",
+      "description": "Student roster",
+      "properties": {
+        "full_name": { "type": "string" },
+        "gender": { "type": "string" },
+        "birthday": { "type": "string" },
+        "phone": { "type": "string" },
+        "parent_name": { "type": "string" },
+        "parent_phone": { "type": "string" },
+        "address": { "type": "string" },
+        "note": { "type": "string" },
+        "status": { "type": "string" },
+        "leave_reason": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["full_name"]
+    },
+    "class_students": {
+      "title": "Class Students",
+      "description": "Mapping between students and classes",
+      "properties": {
+        "class_id": { "type": "string" },
+        "student_id": { "type": "string" },
+        "join_date": { "type": "string" },
+        "leave_date": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["class_id", "student_id"]
+    },
+    "sessions": {
+      "title": "Sessions",
+      "description": "Class study sessions",
+      "properties": {
+        "class_id": { "type": "string" },
+        "session_date": { "type": "string" },
+        "lesson_title": { "type": "string" },
+        "chapter": { "type": "string" },
+        "knowledge_tag_id": { "type": "string" },
+        "homework_description": { "type": "string" },
+        "has_homework": { "type": "boolean" },
+        "has_test": { "type": "boolean" },
+        "test_knowledge_tag": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["class_id", "session_date"]
+    },
+    "student_sessions": {
+      "title": "Student Sessions",
+      "description": "Session attendance, homework, test scores, and comments for students",
+      "properties": {
+        "student_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "attendance": { "type": "string" },
+        "homework_score": { "type": "number" },
+        "test_score": { "type": "number" },
+        "homework_submitted": { "type": "boolean" },
+        "late_submit": { "type": "boolean" },
+        "makeup_test": { "type": "boolean" },
+        "exempt": { "type": "boolean" },
+        "exempt_homework": { "type": "boolean" },
+        "exempt_test": { "type": "boolean" },
+        "custom_comment": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["student_id", "session_id"]
+    },
+    "knowledge_tags": {
+      "title": "Knowledge Tags",
+      "description": "Topics and knowledge areas in mathematics",
+      "properties": {
+        "grade_level": { "type": "number" },
+        "category": { "type": "string" },
+        "tag_name": { "type": "string" },
+        "reference_link": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["tag_name"]
+    },
+    "knowledge_results": {
+      "title": "Knowledge Results",
+      "description": "Student mastery per knowledge tag",
+      "properties": {
+        "student_id": { "type": "string" },
+        "knowledge_tag_id": { "type": "string" },
+        "mastery_score": { "type": "number" },
+        "is_demo": { "type": "boolean" },
+        "last_updated": { "type": "string" }
+      },
+      "required": ["student_id", "knowledge_tag_id"]
+    },
+    "warnings": {
+      "title": "Warnings",
+      "description": "Academic warnings and praises",
+      "properties": {
+        "student_id": { "type": "string" },
+        "class_id": { "type": "string" },
+        "priority": { "type": "string" },
+        "warning_type": { "type": "string" },
+        "reason": { "type": "string" },
+        "resolved": { "type": "boolean" },
+        "resolved_action": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["student_id", "class_id"]
+    },
+    "ai_diagnoses": {
+      "title": "AI Diagnoses",
+      "description": "AI generated diagnoses for student performance",
+      "properties": {
+        "student_id": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["student_id"]
+    },
+    "audit_logs": {
+      "title": "Audit Logs",
+      "description": "System audit logs for user actions",
+      "properties": {
+        "user_role": { "type": "string" },
+        "action_type": { "type": "string" },
+        "description": { "type": "string" },
+        "is_demo": { "type": "boolean" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["action_type"]
+    },
+    "settings": {
+      "title": "Settings",
+      "description": "System and class warning rules settings",
+      "properties": {
+        "theme": { "type": "string" },
+        "updated_at": { "type": "string" }
+      }
+    }
+  }
+}
