@@ -1,4 +1,4 @@
-import { Session, StudentSession, AttendanceStatus } from '../types';
+import { Session, StudentSession, AttendanceStatus, Student } from '../types';
 
 export interface StudentGradeBreakdown {
   studentId: string;
@@ -259,4 +259,130 @@ export function formatScore(score: number | null | undefined): string {
     return 'Miễn';
   }
   return score.toFixed(1);
+}
+
+export interface SessionSummaryMetrics {
+  total: number;
+  present: number;
+  presentPct: number;
+  absentCount: number;
+  hwDone: number;
+  hwPct: number;
+  avgHw: number;
+  avgTest: number;
+  pendingTestCount: number;
+  needSupport: number;
+  hasHomework: boolean;
+  hasTest: boolean;
+  hwCount: number;
+  testCount: number;
+}
+
+/**
+ * Standardized Single Source of Truth for calculating session-level metrics:
+ * Computes attendance, homework submission %, average homework score, and average test score.
+ * Handles exempt homework/test, late submissions, pending test gradings consistently across:
+ * 1. UltraFastGradeEntry Mini Dashboard
+ * 2. Printable A4 Session Report Preview Modal
+ * 3. Direct PDF Export Generator (pdfGenerator.ts)
+ */
+export function calculateSessionSummaryMetrics(
+  students: Student[],
+  studentSessions: Record<number | string, StudentSession | Partial<StudentSession>>,
+  selectedSession?: Session | null
+): SessionSummaryMetrics {
+  const total = students.length;
+  const hasHw = selectedSession?.has_homework !== false;
+  const hasTest = selectedSession?.has_test !== false;
+
+  if (total === 0) {
+    return {
+      total: 0,
+      present: 0,
+      presentPct: 0,
+      absentCount: 0,
+      hwDone: 0,
+      hwPct: 0,
+      avgHw: 0,
+      avgTest: 0,
+      pendingTestCount: 0,
+      needSupport: 0,
+      hasHomework: hasHw,
+      hasTest,
+      hwCount: 0,
+      testCount: 0,
+    };
+  }
+
+  let present = 0;
+  let absentCount = 0;
+  let hwDone = 0;
+  let totalHw = 0;
+  let hwCount = 0;
+  let totalTest = 0;
+  let testCount = 0;
+  let pendingTestCount = 0;
+  let needSupport = 0;
+
+  students.forEach((st) => {
+    const rec = studentSessions[st.id!];
+    const attendance = rec?.attendance;
+    const isAttended = !attendance || attendance === 'present' || attendance === 'late';
+    if (isAttended) {
+      present++;
+    } else {
+      absentCount++;
+    }
+
+    if (!rec) return;
+
+    const isHwExempt = !!(rec.exempt || rec.exempt_homework);
+    const isTestExempt = !!(rec.exempt || rec.exempt_test);
+
+    // 1. Nộp BTVN: Đã nộp (kể cả nộp muộn), hoặc được Miễn BTVN
+    const isHwSubmitted = isHwExempt || rec.homework_submitted !== false || rec.late_submit === true;
+    if (isAttended && hasHw && isHwSubmitted) {
+      hwDone++;
+    }
+
+    // 2. Điểm TB BTVN: Tất cả điểm số BTVN hợp lệ của học sinh có mặt và không miễn trừ (kể cả nộp muộn đã có điểm)
+    if (isAttended && hasHw && !isHwExempt && typeof rec.homework_score === 'number' && !Number.isNaN(rec.homework_score)) {
+      totalHw += rec.homework_score;
+      hwCount++;
+    }
+
+    // 3. Điểm TB Kiểm Tra & Chờ chấm
+    if (isAttended && hasTest && !isTestExempt) {
+      if (typeof rec.test_score === 'number' && !Number.isNaN(rec.test_score)) {
+        totalTest += rec.test_score;
+        testCount++;
+      } else if (rec.test_score === undefined || rec.test_score === null) {
+        pendingTestCount++;
+      }
+    }
+
+    // 4. Cần hỗ trợ
+    const isHwWeak = hasHw && !isHwExempt && (rec.homework_submitted === false || (typeof rec.homework_score === 'number' && rec.homework_score < 5));
+    const isTestWeak = hasTest && !isTestExempt && typeof rec.test_score === 'number' && rec.test_score < 5;
+    if (attendance === 'absent_unexcused' || (isAttended && (isHwWeak || isTestWeak))) {
+      needSupport++;
+    }
+  });
+
+  return {
+    total,
+    present,
+    presentPct: total > 0 ? Math.round((present / total) * 100) : 0,
+    absentCount,
+    hwDone,
+    hwPct: present > 0 ? Math.round((hwDone / present) * 100) : 0,
+    avgHw: hwCount > 0 ? parseFloat((totalHw / hwCount).toFixed(1)) : 0,
+    avgTest: testCount > 0 ? parseFloat((totalTest / testCount).toFixed(1)) : 0,
+    pendingTestCount: hasTest ? pendingTestCount : 0,
+    needSupport,
+    hasHomework: hasHw,
+    hasTest,
+    hwCount,
+    testCount,
+  };
 }

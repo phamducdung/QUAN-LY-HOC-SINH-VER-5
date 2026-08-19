@@ -250,10 +250,10 @@ export const PrintableCycleReport: React.FC<PrintableCycleReportProps> = ({
                       </div>
                     </td>
                     <td className="p-2 border border-black text-center font-bold font-mono text-emerald-700">
-                      {st.hwAvg > 0 ? `${st.hwAvg}đ` : '-'}
+                      {typeof st.hwAvg === 'number' && st.hwAvg >= 0 ? `${st.hwAvg}đ` : '-'}
                     </td>
                     <td className="p-2 border border-black text-center font-bold font-mono text-sky-700">
-                      {st.testAvg > 0 ? `${st.testAvg}đ` : '-'}
+                      {typeof st.testAvg === 'number' && st.testAvg >= 0 ? `${st.testAvg}đ` : '-'}
                     </td>
                     <td className="p-2 border border-black">
                       <div className="space-y-0.5">

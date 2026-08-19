@@ -12,10 +12,14 @@ interface GradeEntryRowProps {
   classNameTitle?: string;
   gradeLevel?: number | string;
   classStudent?: { join_date?: string; leave_date?: string };
+  showPrevTestColumn?: boolean;
+  prevSession?: Session | null;
+  prevRec?: Partial<StudentSession> | null;
   onSelectRow: (rowIndex: number) => void;
   onFocusCell: (rowIndex: number, colIndex: number) => void;
   onKeyDown: (e: React.KeyboardEvent, rowIndex: number, colIndex: number) => void;
   onUpdateSession: (studentId: number, field: keyof StudentSession, value: any) => void;
+  onUpdatePrevSession?: (studentId: number, field: keyof StudentSession, value: any) => void;
   cellRefs: React.MutableRefObject<{ [key: string]: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null }>;
 }
 
@@ -28,10 +32,14 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
   classNameTitle = 'Lớp Toán THCS',
   gradeLevel = 9,
   classStudent,
+  showPrevTestColumn = false,
+  prevSession,
+  prevRec,
   onSelectRow,
   onFocusCell,
   onKeyDown,
   onUpdateSession,
+  onUpdatePrevSession,
   cellRefs,
 }) => {
   const isAbsent = rec.attendance.startsWith('absent');
@@ -82,35 +90,35 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
       }`}
     >
       {/* STT */}
-      <td className="py-2.5 px-3 text-center font-bold text-slate-400">
+      <td className="py-2 px-1.5 text-center font-bold text-slate-400 w-9 min-w-[36px] text-xs">
         {rowIndex + 1}
       </td>
 
       {/* Student Info */}
-      <td className="py-2.5 px-4 font-bold text-slate-900 dark:text-slate-100">
-        <div className="flex items-center gap-2">
-          <span>{student.full_name}</span>
+      <td className="py-2 px-2.5 font-bold text-slate-900 dark:text-slate-100 w-40 min-w-[145px] max-w-[170px]">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-xs font-bold truncate max-w-[150px]" title={student.full_name}>{student.full_name}</span>
           {isBeforeJoin && (
-            <span className="px-1.5 py-0.5 text-[9px] font-extrabold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 rounded border border-slate-300 dark:border-slate-700" title={`Gia nhập ngày ${classStudent?.join_date}`}>
-              ⚪ Gia nhập {classStudent?.join_date?.slice(5)}
+            <span className="px-1 py-0.2 text-[8.5px] font-extrabold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 rounded border border-slate-300 dark:border-slate-700 whitespace-nowrap" title={`Gia nhập ngày ${classStudent?.join_date}`}>
+              ⚪ Vào {classStudent?.join_date?.slice(5)}
             </span>
           )}
           {isAfterLeave && (
-            <span className="px-1.5 py-0.5 text-[9px] font-extrabold bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 rounded border border-rose-200 dark:border-rose-800" title={`Rút lớp ngày ${classStudent?.leave_date}`}>
-              🔴 Đã rút {classStudent?.leave_date?.slice(5)}
+            <span className="px-1 py-0.2 text-[8.5px] font-extrabold bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 rounded border border-rose-200 dark:border-rose-800 whitespace-nowrap" title={`Rút lớp ngày ${classStudent?.leave_date}`}>
+              🔴 Rút {classStudent?.leave_date?.slice(5)}
             </span>
           )}
         </div>
-        <div className="text-[10px] text-slate-400 font-normal mt-0.5">
-          PH: {student.parent_name || 'N/A'}{student.parent_phone ? ` (${student.parent_phone})` : ''}
+        <div className="text-[9.5px] text-slate-400 font-normal mt-0.5 truncate" title={`PH: ${student.parent_name || 'N/A'}${student.parent_phone ? ` (${student.parent_phone})` : ''}`}>
+          PH: {student.parent_name || 'N/A'}
         </div>
       </td>
 
       {/* Attendance Col 0 */}
-      <td className="py-2.5 px-3">
+      <td className="py-2 px-1.5 w-28 min-w-[105px]">
         {isNotJoined ? (
-          <div className="px-2 py-1 bg-slate-200/70 dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 rounded-xl text-center text-xs font-bold border border-slate-300/50 dark:border-slate-700">
-            {isBeforeJoin ? 'Chưa gia nhập' : 'Đã rút lớp'}
+          <div className="px-1.5 py-1 bg-slate-200/70 dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 rounded-lg text-center text-[10.5px] font-bold border border-slate-300/50 dark:border-slate-700">
+            {isBeforeJoin ? 'Chưa vào' : 'Đã rút'}
           </div>
         ) : (
           <select
@@ -121,7 +129,7 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
             onChange={(e) =>
               onUpdateSession(student.id!, 'attendance', e.target.value as AttendanceStatus)
             }
-            className={`w-full px-2.5 py-1.5 rounded-xl border text-xs font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer ${
+            className={`w-full px-1.5 py-1 rounded-lg border text-[11px] font-bold focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer ${
               rec.attendance === 'present'
                 ? 'bg-emerald-50 border-emerald-300 text-emerald-800 dark:bg-emerald-950/80 dark:border-emerald-700 dark:text-emerald-200'
                 : rec.attendance === 'absent_excused'
@@ -132,8 +140,8 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
             }`}
           >
             <option value="present">Có mặt</option>
-            <option value="absent_excused">Vắng (Có phép)</option>
-            <option value="absent_unexcused">Vắng (KHÔNG PHÉP)</option>
+            <option value="absent_excused">Vắng (CP)</option>
+            <option value="absent_unexcused">Vắng (KP)</option>
             <option value="late">Đi muộn</option>
           </select>
         )}
@@ -141,8 +149,8 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
 
       {/* HW Score Col 1 */}
       {selectedSession?.has_homework !== false && (
-        <td className="py-2.5 px-3 text-center">
-          <div className="flex flex-col items-center gap-1.5">
+        <td className="py-2 px-1.5 text-center w-28 min-w-[110px]">
+          <div className="flex flex-col items-center gap-1">
             <input
               type="number"
               step="0.5"
@@ -158,9 +166,9 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
               }
               placeholder={
                 rec.exempt || rec.exempt_homework
-                  ? 'Miễn BTVN'
+                  ? 'Miễn'
                   : rec.late_submit
-                  ? 'Nộp muộn'
+                  ? 'Muộn'
                   : !rec.homework_submitted
                   ? 'Chưa làm'
                   : '0-10'
@@ -173,7 +181,7 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                 onUpdateSession(student.id!, 'homework_submitted', e.target.value !== '');
               }}
               disabled={isNotJoined || isAbsent || !!rec.late_submit || rec.exempt || rec.exempt_homework}
-              className={`w-20 px-2 py-1.5 text-center font-num border rounded-xl text-sm font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-60 transition-all ${
+              className={`w-16 h-7 px-1 py-0.5 text-center font-num border rounded-lg text-xs font-bold focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:opacity-60 transition-all ${
                 rec.exempt || rec.exempt_homework
                   ? 'bg-sky-50 border-sky-300 text-sky-800 dark:bg-sky-950/70 dark:border-sky-800 dark:text-sky-200 font-extrabold'
                   : rec.late_submit
@@ -185,8 +193,8 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                   : 'bg-white dark:bg-slate-800/90 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100'
               }`}
             />
-            <div className="flex items-center gap-1.5 flex-wrap justify-center">
-              <label className="flex items-center gap-1 text-[10px] font-extrabold text-sky-600 dark:text-sky-400 cursor-pointer select-none">
+            <div className="flex items-center gap-1.5 flex-nowrap justify-center">
+              <label className="flex items-center gap-0.5 text-[9px] font-extrabold text-sky-600 dark:text-sky-400 cursor-pointer select-none" title="Miễn BTVN">
                 <input
                   type="checkbox"
                   checked={!!(rec.exempt || rec.exempt_homework)}
@@ -200,11 +208,11 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                       onUpdateSession(student.id!, 'late_submit', false);
                     }
                   }}
-                  className="w-3 h-3 text-sky-600 border-slate-300 dark:border-slate-700 rounded focus:ring-sky-500"
+                  className="w-2.5 h-2.5 text-sky-600 border-slate-300 dark:border-slate-700 rounded focus:ring-sky-500"
                 />
                 <span>Miễn</span>
               </label>
-              <label className="flex items-center gap-1 text-[10px] font-extrabold text-rose-600 dark:text-rose-400 cursor-pointer select-none">
+              <label className="flex items-center gap-0.5 text-[9px] font-extrabold text-rose-600 dark:text-rose-400 cursor-pointer select-none" title="Chưa làm BTVN">
                 <input
                   type="checkbox"
                   checked={!rec.homework_submitted && !(rec.exempt || rec.exempt_homework)}
@@ -219,11 +227,11 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                       onUpdateSession(student.id!, 'homework_score', undefined);
                     }
                   }}
-                  className="w-3 h-3 text-rose-600 border-slate-300 dark:border-slate-700 rounded focus:ring-rose-500"
+                  className="w-2.5 h-2.5 text-rose-600 border-slate-300 dark:border-slate-700 rounded focus:ring-rose-500"
                 />
-                <span>Chưa làm</span>
+                <span>Chưa</span>
               </label>
-              <label className="flex items-center gap-1 text-[10px] font-extrabold text-amber-600 dark:text-amber-400 cursor-pointer select-none">
+              <label className="flex items-center gap-0.5 text-[9px] font-extrabold text-amber-600 dark:text-amber-400 cursor-pointer select-none" title="Nộp muộn BTVN">
                 <input
                   type="checkbox"
                   checked={!!rec.late_submit && !(rec.exempt || rec.exempt_homework)}
@@ -235,7 +243,7 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                       onUpdateSession(student.id!, 'homework_submitted', true);
                     }
                   }}
-                  className="w-3 h-3 text-amber-600 border-slate-300 dark:border-slate-700 rounded focus:ring-amber-500"
+                  className="w-2.5 h-2.5 text-amber-600 border-slate-300 dark:border-slate-700 rounded focus:ring-amber-500"
                 />
                 <span>Muộn</span>
               </label>
@@ -244,10 +252,87 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
         </td>
       )}
 
+      {/* Previous Session Test Score Col (Quick Grade Return Mode) */}
+      {showPrevTestColumn && prevSession && (
+        <td className="py-2 px-1.5 text-center bg-purple-50/40 dark:bg-purple-950/20 border-x border-purple-100 dark:border-purple-900/30 w-28 min-w-[110px]">
+          <div className="flex flex-col items-center gap-1">
+            <input
+              type="number"
+              step="0.5"
+              min="0"
+              max="10"
+              ref={(el) => (cellRefs.current[`${rowIndex}-prevTest`] = el)}
+              value={
+                prevRec?.exempt || prevRec?.exempt_test
+                  ? ''
+                  : prevRec?.test_score !== undefined && prevRec?.test_score !== null
+                  ? prevRec.test_score
+                  : ''
+              }
+              placeholder={
+                prevRec?.exempt || prevRec?.exempt_test
+                  ? 'Miễn'
+                  : prevRec?.attendance && prevRec.attendance.startsWith('absent') && (prevRec.test_score === undefined || prevRec.test_score === null)
+                  ? 'Vắng'
+                  : 'Chờ điểm'
+              }
+              onFocus={() => onFocusCell(rowIndex, 2)}
+              onChange={(e) => {
+                if (!onUpdatePrevSession) return;
+                const val = e.target.value === '' ? undefined : parseFloat(e.target.value);
+                onUpdatePrevSession(student.id!, 'test_score', val);
+              }}
+              disabled={isNotJoined || !!(prevRec?.exempt || prevRec?.exempt_test)}
+              className={`w-16 h-7 px-1 py-0.5 text-center font-num border rounded-lg text-xs font-bold focus:outline-none focus:ring-1 focus:ring-purple-500 disabled:opacity-60 transition-all ${
+                prevRec?.exempt || prevRec?.exempt_test
+                  ? 'bg-sky-50 border-sky-300 text-sky-800 dark:bg-sky-950/70 dark:border-sky-800 dark:text-sky-200 font-extrabold'
+                  : prevRec?.test_score !== undefined && prevRec?.test_score !== null && prevRec.test_score < 5
+                  ? 'bg-rose-50 border-rose-300 text-rose-900 dark:bg-rose-950/70 dark:border-rose-800 dark:text-rose-200 font-black'
+                  : prevRec?.test_score !== undefined && prevRec?.test_score !== null
+                  ? 'bg-purple-50 border-purple-300 text-purple-900 dark:bg-purple-950/60 dark:border-purple-800 dark:text-purple-200 font-extrabold'
+                  : 'bg-white dark:bg-slate-800/90 border-dashed border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 placeholder:text-purple-400 font-medium'
+              }`}
+            />
+            <div className="flex items-center gap-1.5 flex-nowrap justify-center">
+              <label className="flex items-center gap-0.5 text-[9px] font-extrabold text-sky-600 dark:text-sky-400 cursor-pointer select-none" title="Miễn kiểm tra">
+                <input
+                  type="checkbox"
+                  checked={!!(prevRec?.exempt || prevRec?.exempt_test)}
+                  onChange={(e) => {
+                    if (!onUpdatePrevSession) return;
+                    const isExempt = e.target.checked;
+                    onUpdatePrevSession(student.id!, 'exempt_test', isExempt);
+                    if (isExempt) {
+                      onUpdatePrevSession(student.id!, 'test_score', undefined);
+                      onUpdatePrevSession(student.id!, 'makeup_test', false);
+                    }
+                  }}
+                  className="w-2.5 h-2.5 text-sky-600 border-slate-300 dark:border-slate-700 rounded focus:ring-sky-500"
+                />
+                <span>Miễn</span>
+              </label>
+              <label className="flex items-center gap-0.5 text-[9px] font-extrabold text-amber-600 dark:text-amber-400 cursor-pointer select-none" title="Cần thi bù">
+                <input
+                  type="checkbox"
+                  checked={!!prevRec?.makeup_test && !(prevRec?.exempt || prevRec?.exempt_test)}
+                  onChange={(e) => {
+                    if (!onUpdatePrevSession) return;
+                    const isMakeup = e.target.checked;
+                    onUpdatePrevSession(student.id!, 'makeup_test', isMakeup);
+                  }}
+                  className="w-2.5 h-2.5 text-amber-600 border-slate-300 dark:border-slate-700 rounded focus:ring-amber-500"
+                />
+                <span>Bù</span>
+              </label>
+            </div>
+          </div>
+        </td>
+      )}
+
       {/* Test Score Col 2 */}
       {selectedSession?.has_test !== false && (
-        <td className="py-2.5 px-3 text-center">
-          <div className="flex flex-col items-center gap-1.5">
+        <td className="py-2 px-1.5 text-center w-28 min-w-[110px]">
+          <div className="flex flex-col items-center gap-1">
             <input
               type="number"
               step="0.5"
@@ -265,7 +350,7 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                 isAbsent
                   ? '-'
                   : rec.exempt || rec.exempt_test
-                  ? 'Miễn KT'
+                  ? 'Miễn'
                   : 'Chờ nhập'
               }
               onFocus={() => onFocusCell(rowIndex, 2)}
@@ -275,7 +360,7 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                 onUpdateSession(student.id!, 'test_score', val);
               }}
               disabled={isNotJoined || isAbsent || rec.exempt || rec.exempt_test}
-              className={`w-20 px-2 py-1.5 text-center font-num border rounded-xl text-sm font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-60 transition-all ${
+              className={`w-16 h-7 px-1 py-0.5 text-center font-num border rounded-lg text-xs font-bold focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:opacity-60 transition-all ${
                 rec.exempt || rec.exempt_test
                   ? 'bg-sky-50 border-sky-300 text-sky-800 dark:bg-sky-950/70 dark:border-sky-800 dark:text-sky-200 font-extrabold'
                   : rec.test_score !== undefined && rec.test_score !== null && rec.test_score < 5 && !isAbsent
@@ -285,8 +370,8 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                   : 'bg-white dark:bg-slate-800/90 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100'
               }`}
             />
-            <div className="flex items-center gap-1.5 flex-wrap justify-center">
-              <label className="flex items-center gap-1 text-[10px] font-extrabold text-sky-600 dark:text-sky-400 cursor-pointer select-none">
+            <div className="flex items-center gap-1.5 flex-nowrap justify-center">
+              <label className="flex items-center gap-0.5 text-[9px] font-extrabold text-sky-600 dark:text-sky-400 cursor-pointer select-none" title="Miễn kiểm tra">
                 <input
                   type="checkbox"
                   checked={!!(rec.exempt || rec.exempt_test)}
@@ -299,11 +384,11 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                       onUpdateSession(student.id!, 'makeup_test', false);
                     }
                   }}
-                  className="w-3 h-3 text-sky-600 border-slate-300 dark:border-slate-700 rounded focus:ring-sky-500"
+                  className="w-2.5 h-2.5 text-sky-600 border-slate-300 dark:border-slate-700 rounded focus:ring-sky-500"
                 />
                 <span>Miễn</span>
               </label>
-              <label className="flex items-center gap-1 text-[10px] font-extrabold text-amber-600 dark:text-amber-400 cursor-pointer select-none">
+              <label className="flex items-center gap-0.5 text-[9px] font-extrabold text-amber-600 dark:text-amber-400 cursor-pointer select-none" title="Cần thi bù">
                 <input
                   type="checkbox"
                   checked={!!rec.makeup_test && !(rec.exempt || rec.exempt_test)}
@@ -312,18 +397,18 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
                     const isMakeup = e.target.checked;
                     onUpdateSession(student.id!, 'makeup_test', isMakeup);
                   }}
-                  className="w-3 h-3 text-amber-600 border-slate-300 dark:border-slate-700 rounded focus:ring-amber-500"
+                  className="w-2.5 h-2.5 text-amber-600 border-slate-300 dark:border-slate-700 rounded focus:ring-amber-500"
                 />
-                <span>Thi bù</span>
+                <span>Bù</span>
               </label>
             </div>
           </div>
         </td>
       )}
 
-      {/* Custom Comment Col 3 */}
-      <td className="py-2.5 px-4 relative">
-        <div className="relative group/comment">
+      {/* Custom Comment Col 3 - Fluid remaining space */}
+      <td className="py-2 px-3 relative min-w-[320px] w-auto">
+        <div className="relative group/comment w-full">
           <textarea
             rows={isCommentFocused ? 5 : 2}
             ref={(el) => (cellRefs.current[`${rowIndex}-3`] = el)}

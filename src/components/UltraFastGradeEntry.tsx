@@ -13,13 +13,14 @@ import {
   Tooltip,
   Legend,
 } from 'recharts';
-import { ClassItem, Session, Student, StudentSession, AttendanceStatus, KnowledgeTag } from '../types';
+import { ClassItem, Session, Student, StudentSession, AttendanceStatus, KnowledgeTag, Warning } from '../types';
 import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { logAudit } from '../utils/auditLogger';
 import { exportSessionReportPDF } from '../utils/pdfGenerator';
 import { recalculateKnowledgeResultsForClass } from '../utils/knowledgeEngine';
 import { runWarningScanForClass } from '../utils/warningEngine';
+import { calculateSessionSummaryMetrics } from '../lib/calculations';
 import { GradeEntryRow } from './GradeEntryRow';
 import { GradebookView } from './GradebookView';
 import { generateAICommentsForSession, GeneratedAIComment } from '../services/aiCommentService';
@@ -244,11 +245,31 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
   const liveStudentSessions = useLiveQuery(() => db.student_sessions.toArray()) || [];
 
+  const liveWarnings = useLiveQuery(() => db.warnings.toArray()) || [];
+  const liveWarningsMap = useMemo(() => {
+    const map: Record<string, Warning[]> = {};
+    liveWarnings.filter((w) => !w.resolved).forEach((w) => {
+      const sId = String(w.student_id);
+      if (!map[sId]) map[sId] = [];
+      map[sId].push(w);
+    });
+    return map;
+  }, [liveWarnings]);
+
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | undefined>(undefined);
   const [students, setStudents] = useState<Student[]>([]);
   const [studentSessions, setStudentSessions] = useState<Record<string, StudentSession>>({});
   const initialStudentSessionsRef = useRef<Record<string, StudentSession>>({});
+
+  // Quick Grade Return Mode for Previous Session
+  const [showPrevTestReturn, setShowPrevTestReturn] = useState<boolean>(true);
+  const [prevStudentSessions, setPrevStudentSessions] = useState<Record<string, StudentSession>>({});
+  const initialPrevStudentSessionsRef = useRef<Record<string, StudentSession>>({});
+
+  // Print & PDF Export Column Preferences
+  const [printIncludePrevTest, setPrintIncludePrevTest] = useState<boolean>(true);
+  const [printIncludeCurrentTest, setPrintIncludeCurrentTest] = useState<boolean>(true);
 
   // Active view tab: 'entry', 'knowledge_map', or 'gradebook'
   const [activeTab, setActiveTab] = useState<'entry' | 'knowledge_map' | 'gradebook'>('entry');
@@ -538,78 +559,9 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     return sortStudentsByName(list);
   }, [students, studentSessions, focusFilter, searchQuery]);
 
-  // Mini Dashboard Statistics computed real-time
+  // Mini Dashboard Statistics computed real-time using unified calculation engine
   const sessionStats = useMemo(() => {
-    const total = students.length;
-    if (total === 0) {
-      return { total: 0, present: 0, presentPct: 0, hwDone: 0, hwPct: 0, avgHw: 0, avgTest: 0, pendingTestCount: 0, needSupport: 0 };
-    }
-
-    let present = 0;
-    let hwDone = 0;
-    let totalHw = 0;
-    let hwCount = 0;
-    let totalTest = 0;
-    let testCount = 0;
-    let pendingTestCount = 0;
-    let needSupport = 0;
-
-    const hasTest = selectedSession?.has_test !== false;
-    const hasHw = selectedSession?.has_homework !== false;
-
-    students.forEach((st) => {
-      const rec = studentSessions[st.id!];
-      // Default to present if record exists or missing
-      const attendance = rec?.attendance;
-      const isAttended = !attendance || attendance === 'present' || attendance === 'late';
-      if (isAttended) present++;
-
-      if (!rec) return;
-
-      const isHwExempt = rec.exempt || rec.exempt_homework;
-      const isTestExempt = rec.exempt || rec.exempt_test;
-
-      // 1. Nộp BTVN: Đã nộp (kể cả nộp muộn), hoặc được Miễn BTVN
-      const isHwSubmitted = isHwExempt || rec.homework_submitted !== false || rec.late_submit === true;
-      if (isAttended && hasHw && isHwSubmitted) {
-        hwDone++;
-      }
-
-      // 2. Điểm TB BTVN: Tất cả điểm số BTVN hợp lệ của học sinh có mặt và không miễn trừ
-      if (isAttended && hasHw && !isHwExempt && typeof rec.homework_score === 'number') {
-        totalHw += rec.homework_score;
-        hwCount++;
-      }
-
-      // 3. Điểm TB Kiểm Tra & Chờ chấm
-      if (isAttended && hasTest && !isTestExempt) {
-        if (typeof rec.test_score === 'number') {
-          totalTest += rec.test_score;
-          testCount++;
-        } else if (rec.test_score === undefined || rec.test_score === null) {
-          pendingTestCount++;
-        }
-      }
-
-      // 4. Cần hỗ trợ
-      const isHwWeak = hasHw && !isHwExempt && (rec.homework_submitted === false || (typeof rec.homework_score === 'number' && rec.homework_score < 5));
-      const isTestWeak = hasTest && !isTestExempt && typeof rec.test_score === 'number' && rec.test_score < 5;
-      if (attendance === 'absent_unexcused' || (isAttended && (isHwWeak || isTestWeak))) {
-        needSupport++;
-      }
-    });
-
-    return {
-      total,
-      present,
-      presentPct: total > 0 ? Math.round((present / total) * 100) : 0,
-      hwDone,
-      hwPct: present > 0 ? Math.round((hwDone / present) * 100) : 0,
-      avgHw: hwCount > 0 ? parseFloat((totalHw / hwCount).toFixed(1)) : 0,
-      avgTest: testCount > 0 ? parseFloat((totalTest / testCount).toFixed(1)) : 0,
-      pendingTestCount: hasTest ? pendingTestCount : 0,
-      needSupport,
-    };
+    return calculateSessionSummaryMetrics(students, studentSessions, selectedSession);
   }, [students, studentSessions, selectedSession]);
 
   const tagOptions = useMemo(() => {
@@ -878,6 +830,151 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     }
   }, [currentClass?.id, selectedSessionId, liveClassStudents, liveStudents, liveStudentSessions]);
 
+  // Synchronize Previous Session's student scores reactively
+  useEffect(() => {
+    if (!currentClass?.id || !previousSession?.id) {
+      setPrevStudentSessions({});
+      return;
+    }
+
+    const prevSessIdStr = String(previousSession.id);
+    const scoreRecords = liveStudentSessions.filter(
+      (ss) => String(ss.session_id) === prevSessIdStr
+    );
+
+    const recordMap: Record<string, StudentSession> = {};
+    students.forEach((st) => {
+      const found = scoreRecords.find((r) => String(r.student_id) === String(st.id));
+      if (found) {
+        recordMap[st.id!] = found;
+      } else {
+        recordMap[st.id!] = {
+          student_id: st.id!,
+          session_id: previousSession.id,
+          attendance: 'present',
+          homework_score: undefined as any,
+          test_score: undefined as any,
+          homework_submitted: true,
+          late_submit: false,
+          makeup_test: false,
+          exempt: false,
+          quick_preset_comments: [],
+          custom_comment: '',
+          updated_at: new Date().toISOString(),
+        };
+      }
+    });
+
+    initialPrevStudentSessionsRef.current = JSON.parse(JSON.stringify(recordMap));
+    setPrevStudentSessions(recordMap);
+  }, [currentClass?.id, previousSession?.id, liveStudentSessions, students]);
+
+  // Previous session statistics calculation
+  const prevSessionStats = useMemo(() => {
+    if (!previousSession || previousSession.has_test === false) {
+      return { pendingCount: 0, avgTest: 0, testCount: 0 };
+    }
+    const prevRecs = prevStudentSessions;
+    let pendingCount = 0;
+    let totalScore = 0;
+    let scoredCount = 0;
+
+    students.forEach((st) => {
+      const rec = prevRecs[st.id!];
+      const isExempt = rec?.exempt || rec?.exempt_test;
+      if (isExempt) return;
+
+      if (rec?.test_score !== undefined && rec.test_score !== null) {
+        totalScore += rec.test_score;
+        scoredCount += 1;
+      } else {
+        pendingCount += 1;
+      }
+    });
+
+    const avgTest = scoredCount > 0 ? Number((totalScore / scoredCount).toFixed(1)) : 0;
+    return { pendingCount, avgTest, testCount: scoredCount };
+  }, [previousSession, prevStudentSessions, students]);
+
+  // Handle Quick Grade Return entry for Previous Session
+  const handleUpdatePrevStudentSession = useCallback((
+    studentId: number,
+    field: keyof StudentSession,
+    value: any
+  ) => {
+    if (!previousSession?.id) return;
+    const stIdStr = String(studentId);
+
+    setPrevStudentSessions((prev) => {
+      const current = prev[stIdStr] || {
+        student_id: studentId,
+        session_id: previousSession.id,
+        attendance: 'present',
+        homework_score: undefined as any,
+        test_score: undefined as any,
+        homework_submitted: true,
+        late_submit: false,
+        makeup_test: false,
+        exempt: false,
+        quick_preset_comments: [],
+        custom_comment: '',
+        updated_at: new Date().toISOString(),
+      };
+
+      const updated = {
+        ...current,
+        [field]: value,
+        updated_at: new Date().toISOString(),
+      };
+
+      // Auto-save to Dexie & Firestore in background
+      (async () => {
+        try {
+          const existing = await db.student_sessions
+            .where('session_id')
+            .equals(previousSession.id)
+            .toArray();
+          const found = existing.find((x) => String(x.student_id) === stIdStr);
+          let finalId = found?.id;
+          if (found?.id) {
+            await db.student_sessions.update(found.id, updated);
+          } else {
+            finalId = `ss_${previousSession.id}_${studentId}_${Date.now()}`;
+            await db.student_sessions.add({
+              ...updated,
+              id: finalId,
+              student_id: studentId,
+              session_id: previousSession.id,
+            });
+          }
+
+          // Realtime multi-device cloud sync
+          pushBatchDocsToFirestore('student_sessions', [{
+            ...updated,
+            id: finalId || found?.id,
+            student_id: studentId,
+            session_id: previousSession.id,
+          }]);
+        } catch (err) {
+          console.error('Auto-save prevStudentSession error:', err);
+        }
+      })();
+
+      return {
+        ...prev,
+        [stIdStr]: updated,
+      };
+    });
+
+    // Schedule scan warnings
+    if (currentClass?.id) {
+      setTimeout(() => {
+        runWarningScanForClass(String(currentClass.id));
+        recalculateKnowledgeResultsForClass(currentClass.id!);
+      }, 600);
+    }
+  }, [previousSession?.id, currentClass?.id]);
+
   // Helper to focus grid cell by row & col
   const focusCell = (row: number, col: number) => {
     const clampedRow = Math.max(0, Math.min(students.length - 1, row));
@@ -1120,7 +1217,24 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       );
     });
 
-    if (dirtyRecords.length === 0) {
+    // Check dirty records for previous session as well (Quick Grade Return Mode)
+    const allPrevRecords: StudentSession[] = Object.values(prevStudentSessions);
+    const initialPrevMap = initialPrevStudentSessionsRef.current;
+    const dirtyPrevRecords = previousSession?.id
+      ? allPrevRecords.filter((rec: StudentSession) => {
+          const initRec = initialPrevMap[rec.student_id];
+          if (!initRec || !rec.id) return true;
+          return (
+            rec.test_score !== initRec.test_score ||
+            rec.exempt_test !== initRec.exempt_test ||
+            rec.makeup_test !== initRec.makeup_test ||
+            rec.exempt !== initRec.exempt ||
+            (rec.custom_comment || '') !== (initRec.custom_comment || '')
+          );
+        })
+      : [];
+
+    if (dirtyRecords.length === 0 && dirtyPrevRecords.length === 0) {
       // Không có thay đổi nào mới -> Không ghi thừa dữ liệu
       setSyncStatus('synced');
       setLastSyncedTime(new Date().toLocaleTimeString('vi-VN'));
@@ -1147,11 +1261,31 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       updated_at: now,
     }));
 
+    const prevRecordsToSave = dirtyPrevRecords.map((rec: StudentSession) => ({
+      student_id: rec.student_id,
+      session_id: rec.session_id,
+      attendance: rec.attendance,
+      homework_score: rec.homework_score,
+      test_score: rec.test_score,
+      homework_submitted: rec.homework_submitted,
+      late_submit: rec.late_submit,
+      makeup_test: rec.makeup_test,
+      exempt: rec.exempt,
+      exempt_homework: rec.exempt_homework,
+      exempt_test: rec.exempt_test,
+      quick_preset_comments: rec.quick_preset_comments,
+      custom_comment: rec.custom_comment,
+      id: rec.id,
+      updated_at: now,
+    }));
+
     const backupSessions = JSON.parse(JSON.stringify(studentSessions));
+    const backupPrevSessions = JSON.parse(JSON.stringify(prevStudentSessions));
     try {
       const updatedSessions = { ...studentSessions };
+      const updatedPrevSessions = { ...prevStudentSessions };
 
-      // Pre-fetch existing sessions for this session_id from Dexie in 1 query
+      // Pre-fetch existing sessions for this session_id and previousSession from Dexie
       const existingDbSessions = await db.student_sessions
         .where('session_id')
         .equals(selectedSessionId)
@@ -1186,6 +1320,39 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         }
       }
 
+      // Handle previous session records
+      if (previousSession?.id && prevRecordsToSave.length > 0) {
+        const existingPrevDbSessions = await db.student_sessions
+          .where('session_id')
+          .equals(previousSession.id)
+          .toArray();
+        const existingPrevMap = new Map(existingPrevDbSessions.map((s) => [String(s.student_id), s]));
+
+        for (const pRec of prevRecordsToSave) {
+          let finalId = pRec.id;
+          if (!finalId) {
+            const existing = existingPrevMap.get(String(pRec.student_id));
+            if (existing) {
+              finalId = existing.id;
+            }
+          }
+          if (!finalId) {
+            finalId = `ss_${pRec.session_id}_${pRec.student_id}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+          }
+
+          const payload = {
+            ...pRec,
+            id: finalId,
+          };
+
+          docsToBulkPut.push(payload);
+
+          if (pRec.student_id) {
+            updatedPrevSessions[pRec.student_id] = payload;
+          }
+        }
+      }
+
       // Bulk update IndexedDB
       if (docsToBulkPut.length > 0) {
         await db.student_sessions.bulkPut(docsToBulkPut);
@@ -1195,6 +1362,11 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
       setStudentSessions(updatedSessions);
       initialStudentSessionsRef.current = JSON.parse(JSON.stringify(updatedSessions));
+
+      if (previousSession?.id) {
+        setPrevStudentSessions(updatedPrevSessions);
+        initialPrevStudentSessionsRef.current = JSON.parse(JSON.stringify(updatedPrevSessions));
+      }
 
       setSyncStatus('synced');
       setLastSyncedTime(new Date().toLocaleTimeString('vi-VN'));
@@ -1209,7 +1381,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
           await logAudit(
             'TA',
             'Nhập điểm tốc độ cao',
-            `Lưu bảng điểm cho buổi học "${selectedSess?.lesson_title || selectedSessionId}" (Lớp ${currentClass.class_name}) - Cập nhật ${dirtyRecords.length} học sinh`
+            `Lưu bảng điểm cho buổi học "${selectedSess?.lesson_title || selectedSessionId}" (Lớp ${currentClass.class_name}) - Cập nhật ${dirtyRecords.length + dirtyPrevRecords.length} học sinh`
           );
         })(),
         recalculateKnowledgeResultsForClass(currentClass.id),
@@ -1223,6 +1395,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       console.error('Error saving grades:', error);
       // Rollback to prior UI state if saving crashes
       setStudentSessions(backupSessions);
+      setPrevStudentSessions(backupPrevSessions);
       setSyncStatus('offline');
       alert('Có lỗi khi lưu dữ liệu. Đã khôi phục lại trạng thái trước khi lưu!');
     }
@@ -1542,7 +1715,14 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         currentClass,
         selectedSess,
         students,
-        studentSessions
+        studentSessions,
+        liveWarningsMap,
+        {
+          includePrevTestScore: printIncludePrevTest,
+          includeCurrentTestScore: printIncludeCurrentTest,
+          prevSession: previousSession,
+          prevStudentSessions: prevStudentSessions,
+        }
       );
     } catch (error) {
       console.error('Error downloading direct PDF:', error);
@@ -2155,6 +2335,30 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
               >
                 ❌ Vắng mặt / Đi muộn
               </button>
+
+              {/* Quick Grade Return Mode Toggle Button */}
+              {previousSession && (
+                <button
+                  type="button"
+                  onClick={() => setShowPrevTestReturn(!showPrevTestReturn)}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+                    showPrevTestReturn
+                      ? 'bg-purple-600 text-white shadow-sm ring-2 ring-purple-400/40'
+                      : 'bg-purple-50 dark:bg-purple-950/40 text-purple-800 dark:text-purple-300 hover:bg-purple-100'
+                  }`}
+                  title="Bật/Tắt cột trả điểm bài kiểm tra của buổi học trước"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>
+                    📋 Trả điểm KT: {(previousSession.lesson_title || '').includes(' - ') ? previousSession.lesson_title.split(' - ').slice(-1)[0] : (previousSession.lesson_title || 'Buổi trước')}
+                  </span>
+                  {prevSessionStats.pendingCount > 0 && (
+                    <span className="px-1.5 py-0.2 text-[10px] bg-amber-400 text-slate-900 rounded-full font-black">
+                      {prevSessionStats.pendingCount}
+                    </span>
+                  )}
+                </button>
+              )}
             </div>
 
             {/* Search Input */}
@@ -2176,38 +2380,49 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
               <table className="w-full text-left border-separate border-spacing-0">
                 <thead className="sticky top-0 z-20 shadow-xs">
                   <tr className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 text-[11px] uppercase tracking-wider font-extrabold">
-                    <th className="py-3 px-3 w-12 text-center sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">STT</th>
-                    <th className="py-3 px-4 min-w-[170px] sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">Họ và Tên Học Sinh</th>
-                    <th className="py-3 px-3 min-w-[140px] sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">Điểm Danh</th>
+                    <th className="py-2.5 px-2 w-9 min-w-[36px] text-center sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">STT</th>
+                    <th className="py-2.5 px-3 w-40 min-w-[145px] max-w-[170px] sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">Họ và Tên Học Sinh</th>
+                    <th className="py-2.5 px-2 w-28 min-w-[105px] sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">Điểm Danh</th>
                     {selectedSession?.has_homework !== false && (
-                      <th className="py-2 px-3 min-w-[150px] text-center sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+                      <th className="py-2 px-2 w-28 min-w-[110px] text-center sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
                         <div>Điểm BTVN</div>
                         {previousSession ? (
-                          <div className="text-[9px] text-emerald-600 dark:text-emerald-400 font-bold normal-case mt-0.5 tracking-normal">
-                            (BTVN của: {(previousSession.lesson_title || '').includes(' - ') ? previousSession.lesson_title.split(' - ').slice(-1)[0] : (previousSession.lesson_title || 'Buổi trước')})
+                          <div className="text-[9px] text-emerald-600 dark:text-emerald-400 font-bold normal-case mt-0.5 tracking-normal truncate max-w-[105px]" title={previousSession.lesson_title}>
+                            (BTVN: {(previousSession.lesson_title || '').includes(' - ') ? previousSession.lesson_title.split(' - ').slice(-1)[0] : (previousSession.lesson_title || 'Buổi trước')})
                           </div>
                         ) : (
                           <div className="text-[9px] text-slate-400 font-normal normal-case mt-0.5 tracking-normal">
-                            (Buổi đầu tiên)
+                            (Buổi đầu)
                           </div>
                         )}
+                      </th>
+                    )}
+                    {/* Quick Grade Return Column Header */}
+                    {showPrevTestReturn && previousSession && (
+                      <th className="py-2 px-2 w-28 min-w-[110px] text-center sticky top-0 z-20 bg-purple-50 dark:bg-purple-950/80 border-b border-purple-200 dark:border-purple-800 text-purple-900 dark:text-purple-200">
+                        <div className="flex items-center justify-center gap-1">
+                          <span>Điểm KT Trước</span>
+                        </div>
+                        <div className="text-[9px] text-purple-700 dark:text-purple-300 font-bold normal-case mt-0.5 tracking-normal truncate max-w-[105px]" title={previousSession.lesson_title}>
+                          ({(previousSession.lesson_title || '').includes(' - ') ? previousSession.lesson_title.split(' - ').slice(-1)[0] : (previousSession.lesson_title || 'Buổi trước')})
+                        </div>
                       </th>
                     )}
                     {selectedSession?.has_test !== false && (
-                      <th className="py-2 px-3 min-w-[150px] text-center sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
-                        <div>Điểm Kiểm Tra</div>
+                      <th className="py-2 px-2 w-28 min-w-[110px] text-center sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+                        <div>Điểm KT Hôm nay</div>
                         {selectedSession?.test_knowledge_tag && selectedSession.test_knowledge_tag !== 'same' ? (
-                          <div className="text-[9px] text-blue-600 dark:text-blue-400 font-bold normal-case mt-0.5 tracking-normal" title={selectedSession.test_knowledge_tag}>
-                            (Chủ đề: {selectedSession.test_knowledge_tag})
+                          <div className="text-[9px] text-blue-600 dark:text-blue-400 font-bold normal-case mt-0.5 tracking-normal truncate max-w-[105px]" title={selectedSession.test_knowledge_tag}>
+                            ({selectedSession.test_knowledge_tag})
                           </div>
                         ) : (
                           <div className="text-[9px] text-slate-400 font-normal normal-case mt-0.5 tracking-normal">
-                            (Trùng chuyên đề bài học)
+                            (Chuyên đề hôm nay)
                           </div>
                         )}
                       </th>
                     )}
-                    <th className="py-3 px-4 min-w-[280px] sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+                    <th className="py-2.5 px-3 min-w-[320px] sticky top-0 z-20 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
                       <div className="flex items-center justify-between gap-2">
                         <span>Nhận Xét & Preset Toán THCS</span>
                         <button
@@ -2236,7 +2451,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60 text-xs">
                   {filteredStudents.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-8 text-center text-slate-400 font-medium">
+                      <td colSpan={7} className="py-8 text-center text-slate-400 font-medium">
                         Không tìm thấy học sinh nào phù hợp với bộ lọc.
                       </td>
                     </tr>
@@ -2266,6 +2481,9 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                           classNameTitle={currentClass?.class_name}
                           gradeLevel={currentClass?.grade_level}
                           classStudent={csLink}
+                          showPrevTestColumn={showPrevTestReturn && !!previousSession}
+                          prevSession={previousSession}
+                          prevRec={prevStudentSessions[st.id!]}
                           onSelectRow={(idx) => setActiveRow(idx)}
                           onFocusCell={(r, c) => {
                             setActiveRow(r);
@@ -2273,6 +2491,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                           }}
                           onKeyDown={handleKeyDown}
                           onUpdateSession={handleUpdateStudentSession}
+                          onUpdatePrevSession={handleUpdatePrevStudentSession}
                           cellRefs={cellRefs}
                         />
                       );
@@ -2756,6 +2975,38 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
               </div>
             </div>
 
+            {/* Print Options Toolbar */}
+            <div className="bg-slate-100 dark:bg-slate-800/80 p-3 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs no-print">
+              <div className="flex items-center gap-2 font-bold text-slate-700 dark:text-slate-300">
+                <span>⚙️ Tùy chọn cột xuất báo cáo:</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                {previousSession && (
+                  <label className="flex items-center gap-1.5 cursor-pointer font-semibold text-purple-900 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/60 px-2.5 py-1 rounded-lg border border-purple-200 dark:border-purple-800">
+                    <input
+                      type="checkbox"
+                      checked={printIncludePrevTest}
+                      onChange={(e) => setPrintIncludePrevTest(e.target.checked)}
+                      className="w-3.5 h-3.5 text-purple-600 rounded border-slate-300 focus:ring-purple-500"
+                    />
+                    <span>📋 Điểm KT Buổi trước ({(previousSession.lesson_title || '').includes(' - ') ? previousSession.lesson_title.split(' - ').slice(-1)[0] : (previousSession.lesson_title || 'Buổi trước')})</span>
+                  </label>
+                )}
+
+                {selectedSession?.has_test !== false && (
+                  <label className="flex items-center gap-1.5 cursor-pointer font-semibold text-slate-700 dark:text-slate-300 bg-white dark:bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={printIncludeCurrentTest}
+                      onChange={(e) => setPrintIncludeCurrentTest(e.target.checked)}
+                      className="w-3.5 h-3.5 text-emerald-600 rounded border-slate-300 focus:ring-emerald-500"
+                    />
+                    <span>📝 Điểm KT Buổi hiện tại</span>
+                  </label>
+                )}
+              </div>
+            </div>
+
             {/* A4 Printable Area */}
             <div className="printable-a4-area bg-white text-slate-900 p-8 rounded-xl border border-slate-200 shadow-sm space-y-6 text-sm font-sans">
               {/* Report Header */}
@@ -2801,73 +3052,39 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
               </div>
 
               {/* Attendance & Score Summary Stats */}
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-center">
+              <div className={`grid grid-cols-2 ${printIncludePrevTest && previousSession ? 'sm:grid-cols-5' : 'sm:grid-cols-4'} gap-3 text-center`}>
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
                   <p className="text-[11px] font-bold text-slate-500">Tổng số học sinh</p>
-                  <p className="text-lg font-black text-slate-900">{students.length}</p>
+                  <p className="text-lg font-black text-slate-900">{sessionStats.total}</p>
                 </div>
                 <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-200">
                   <p className="text-[11px] font-bold text-emerald-700">Có mặt / Đi muộn</p>
                   <p className="text-lg font-black text-emerald-800">
-                    {students.filter(s => {
-                      const att = studentSessions[s.id!]?.attendance;
-                      return !att || att === 'present' || att === 'late';
-                    }).length}
-                  </p>
-                </div>
-                <div className="p-3 bg-rose-50 rounded-lg border border-rose-200">
-                  <p className="text-[11px] font-bold text-rose-700">Vắng mặt</p>
-                  <p className="text-lg font-black text-rose-800">
-                    {students.filter(s => {
-                      const att = studentSessions[s.id!]?.attendance;
-                      return att === 'absent_excused' || att === 'absent_unexcused';
-                    }).length}
+                    {sessionStats.present}
                   </p>
                 </div>
                 <div className="p-3 bg-sky-50 rounded-lg border border-sky-200">
                   <p className="text-[11px] font-bold text-sky-700">Điểm TB BTVN</p>
                   <p className="text-lg font-black text-sky-800">
-                    {(() => {
-                      if (selectedSession?.has_homework === false) return '';
-                      let totalHw = 0;
-                      let validCount = 0;
-
-                      students.forEach(s => {
-                        const rec = studentSessions[s.id!];
-                        if (!rec || rec.attendance.startsWith('absent') || rec.exempt) return;
-                        
-                        if (rec.homework_submitted !== false && !rec.late_submit && rec.homework_score !== undefined) {
-                          totalHw += rec.homework_score;
-                          validCount++;
-                        }
-                      });
-
-                      return validCount > 0 ? (totalHw / validCount).toFixed(1) : '-';
-                    })()}
+                    {selectedSession?.has_homework !== false ? (sessionStats.avgHw > 0 ? `${sessionStats.avgHw}đ` : '-') : ''}
                   </p>
                 </div>
-                <div className="p-3 bg-purple-50 rounded-lg border border-purple-200">
-                  <p className="text-[11px] font-bold text-purple-700">Điểm TB Kiểm Tra</p>
-                  <p className="text-lg font-black text-purple-800">
-                    {(() => {
-                      if (selectedSession?.has_test === false) return '';
-                      let totalTest = 0;
-                      let validCount = 0;
-
-                      students.forEach(s => {
-                        const rec = studentSessions[s.id!];
-                        if (!rec || rec.attendance.startsWith('absent') || rec.exempt) return;
-                        
-                        if (rec.test_score !== undefined) {
-                          totalTest += rec.test_score;
-                          validCount++;
-                        }
-                      });
-
-                      return validCount > 0 ? (totalTest / validCount).toFixed(1) : '-';
-                    })()}
-                  </p>
-                </div>
+                {printIncludePrevTest && previousSession && (
+                  <div className="p-3 bg-purple-50 rounded-lg border border-purple-200">
+                    <p className="text-[11px] font-bold text-purple-700">Điểm TB KT Buổi trước</p>
+                    <p className="text-lg font-black text-purple-800">
+                      {prevSessionStats.avgTest > 0 ? `${prevSessionStats.avgTest}đ` : '-'}
+                    </p>
+                  </div>
+                )}
+                {printIncludeCurrentTest && selectedSession?.has_test !== false && (
+                  <div className="p-3 bg-blue-50 rounded-lg border border-blue-200">
+                    <p className="text-[11px] font-bold text-blue-700">Điểm TB KT Hôm nay</p>
+                    <p className="text-lg font-black text-blue-800">
+                      {sessionStats.avgTest > 0 ? `${sessionStats.avgTest}đ` : '-'}
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Student Roster Table */}
@@ -2881,8 +3098,13 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                       {selectedSession?.has_homework !== false && (
                         <th className="p-2.5 border-b border-emerald-800 text-center w-20">Điểm BTVN</th>
                       )}
-                      {selectedSession?.has_test !== false && (
-                        <th className="p-2.5 border-b border-emerald-800 text-center w-20">Điểm KT</th>
+                      {printIncludePrevTest && previousSession && (
+                        <th className="p-2.5 border-b border-emerald-800 text-center w-24 bg-purple-800 text-purple-100">
+                          <div>KT Buổi trước</div>
+                        </th>
+                      )}
+                      {printIncludeCurrentTest && selectedSession?.has_test !== false && (
+                        <th className="p-2.5 border-b border-emerald-800 text-center w-20">KT Hôm nay</th>
                       )}
                       <th className="p-2.5 border-b border-emerald-800">Nhận xét chi tiết Thầy/Cô</th>
                     </tr>
@@ -2910,6 +3132,8 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                         : rec.quick_preset_comments && rec.quick_preset_comments.length > 0
                         ? rec.quick_preset_comments.join('; ')
                         : 'Học tập tích cực, hoàn thành bài tốt.';
+
+                      const prevRec = prevStudentSessions[student.id!];
 
                       return (
                         <tr key={student.id || idx} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-slate-50/60'} avoid-break`}>
@@ -2949,7 +3173,21 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                               })()}
                             </td>
                           )}
-                          {selectedSession?.has_test !== false && (
+                          {printIncludePrevTest && previousSession && (
+                            <td className="p-2.5 text-center font-bold text-purple-700 bg-purple-50/40">
+                              {(() => {
+                                if (prevRec?.exempt || prevRec?.exempt_test) {
+                                  return (
+                                    <span className="text-sky-600 font-extrabold block text-[10px] leading-tight">
+                                      Miễn
+                                    </span>
+                                  );
+                                }
+                                return prevRec?.test_score !== undefined && prevRec.test_score !== null ? `${prevRec.test_score}đ` : <span className="text-slate-400 font-medium">Chưa nhập</span>;
+                              })()}
+                            </td>
+                          )}
+                          {printIncludeCurrentTest && selectedSession?.has_test !== false && (
                             <td className="p-2.5 text-center font-bold text-emerald-700">
                               {(() => {
                                 if (!isAttended) return '-';

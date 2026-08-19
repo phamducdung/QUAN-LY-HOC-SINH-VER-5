@@ -2,6 +2,7 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { ClassItem, Session, Student, StudentSession, Warning } from '../types';
 import { sortStudentsByName } from './sortUtils';
+import { calculateSessionSummaryMetrics } from '../lib/calculations';
 
 /**
  * Normalizes Vietnamese text for standard jsPDF fonts to prevent garbled character output
@@ -55,12 +56,20 @@ async function getFontBase64(isBold: boolean = false): Promise<string | null> {
   }
 }
 
+export interface SessionReportPDFOptions {
+  includePrevTestScore?: boolean;
+  includeCurrentTestScore?: boolean;
+  prevSession?: Session | null;
+  prevStudentSessions?: Record<string | number, StudentSession | Partial<StudentSession>> | null;
+}
+
 export async function exportSessionReportPDF(
   selectedClass: ClassItem,
   selectedSession: Session,
   students: Student[],
-  studentSessions: Record<number, StudentSession>,
-  activeClassWarnings?: Record<number, Warning[]>
+  studentSessions: Record<string | number, StudentSession | Partial<StudentSession>>,
+  activeClassWarnings?: Record<string | number, Warning[]>,
+  options?: SessionReportPDFOptions
 ) {
   const doc = new jsPDF();
 
@@ -136,38 +145,34 @@ export async function exportSessionReportPDF(
   );
   currentY += 6;
 
-  // Calculate session summary metrics for PDF header
-  let totalHw = 0;
-  let hwCount = 0;
-  let totalTest = 0;
-  let testCount = 0;
-  let presentCount = 0;
-
+  // Calculate session summary metrics for PDF header using standardized helper
+  const metrics = calculateSessionSummaryMetrics(students, studentSessions, selectedSession);
   const sortedStudents = sortStudentsByName(students);
 
-  sortedStudents.forEach((s) => {
-    const ss = studentSessions[s.id!] || {};
-    const isAttended = !ss.attendance || ss.attendance === 'present' || ss.attendance === 'late';
-    if (isAttended) {
-      presentCount++;
-      if (selectedSession.has_homework !== false && !(ss.exempt || ss.exempt_homework) && typeof ss.homework_score === 'number') {
-        totalHw += ss.homework_score;
-        hwCount++;
-      }
-      if (selectedSession.has_test !== false && ss.test_score !== undefined) {
-        totalTest += ss.test_score;
-        testCount++;
-      }
-    }
-  });
+  const showHw = selectedSession.has_homework !== false;
+  const showPrevTest = !!(options?.includePrevTestScore && options?.prevSession);
+  const showCurrentTest = options?.includeCurrentTestScore !== false && selectedSession.has_test !== false;
 
-  const avgHwText = selectedSession.has_homework !== false && hwCount > 0 ? `${(totalHw / hwCount).toFixed(1)}/10` : '';
-  const avgTestText = selectedSession.has_test !== false && testCount > 0 ? `${(totalTest / testCount).toFixed(1)}/10` : '';
+  const avgHwText = metrics.hasHomework && metrics.hwCount > 0 ? `${metrics.avgHw}/10` : '';
+  const avgTestText = metrics.hasTest && metrics.testCount > 0 ? `${metrics.avgTest}/10` : '';
+
+  let avgPrevTestText = '';
+  if (showPrevTest && options?.prevSession && options?.prevStudentSessions) {
+    const prevMetrics = calculateSessionSummaryMetrics(students, options.prevStudentSessions, options.prevSession);
+    if (prevMetrics.testCount > 0) {
+      avgPrevTestText = `${prevMetrics.avgTest}/10`;
+    }
+  }
+
+  const metricSummaryParts = [
+    `Sĩ số có mặt: ${metrics.present}/${metrics.total}`,
+    showHw ? `Điểm TB BTVN: ${avgHwText || 'Trống'}` : null,
+    showPrevTest ? `Điểm TB KT Buổi trước: ${avgPrevTestText || 'Trống'}` : null,
+    showCurrentTest ? `Điểm TB KT Hôm nay: ${avgTestText || 'Trống'}` : null,
+  ].filter(Boolean);
 
   doc.text(
-    cleanText(
-      `Sĩ số có mặt: ${presentCount}/${students.length} | Điểm TB BTVN: ${avgHwText || 'Trống'} | Điểm TB Kiểm Tra: ${avgTestText || 'Trống'}`
-    ),
+    cleanText(metricSummaryParts.join(' | ')),
     14,
     currentY
   );
@@ -211,7 +216,6 @@ export async function exportSessionReportPDF(
     const isAttended = !ss.attendance || ss.attendance === 'present' || ss.attendance === 'late';
 
     const formatHomeworkScore = () => {
-      if (selectedSession.has_homework === false) return '';
       if (!isAttended) return '-';
       if (ss.exempt || ss.exempt_homework) return 'Miễn';
       if (ss.homework_submitted === false) return 'Chưa làm';
@@ -219,38 +223,84 @@ export async function exportSessionReportPDF(
       return ss.homework_score !== undefined ? `${ss.homework_score}đ` : '';
     };
 
-    const formatTestScore = () => {
-      if (selectedSession.has_test === false) return '';
+    const formatPrevTestScore = () => {
+      if (!options?.prevSession) return '';
+      const prevRec = options.prevStudentSessions ? options.prevStudentSessions[s.id!] : null;
+      if (!prevRec) return '-';
+      if (prevRec.exempt || prevRec.exempt_test) return 'Miễn';
+      if (prevRec.makeup_test) {
+        return prevRec.test_score !== undefined && prevRec.test_score !== null ? `${prevRec.test_score}đ (Bù)` : 'Chờ (Bù)';
+      }
+      if (prevRec.test_score !== undefined && prevRec.test_score !== null) {
+        return `${prevRec.test_score}đ`;
+      }
+      if (prevRec.attendance && prevRec.attendance.startsWith('absent')) {
+        return 'Chưa thi';
+      }
+      return 'Chờ điểm';
+    };
+
+    const formatCurrentTestScore = () => {
       if (!isAttended) return '-';
       if (ss.exempt || ss.exempt_test) return 'Miễn';
       if (ss.makeup_test) return ss.test_score !== undefined && ss.test_score !== null ? `${ss.test_score}đ (Bù)` : 'Chờ (Bù)';
       return ss.test_score !== undefined && ss.test_score !== null ? `${ss.test_score}đ` : '';
     };
 
-    return [
+    const row = [
       (index + 1).toString(),
       cleanText(s.full_name),
       cleanText(warningText),
       cleanText(attText),
-      cleanText(formatHomeworkScore()),
-      cleanText(formatTestScore()),
-      cleanText(commentStr),
     ];
+
+    if (showHw) {
+      row.push(cleanText(formatHomeworkScore()));
+    }
+    if (showPrevTest) {
+      row.push(cleanText(formatPrevTestScore()));
+    }
+    if (showCurrentTest) {
+      row.push(cleanText(formatCurrentTestScore()));
+    }
+
+    row.push(cleanText(commentStr));
+
+    return row;
   });
+
+  const headers = [
+    cleanText('STT'),
+    cleanText('Họ và tên Học sinh'),
+    cleanText('Cảnh báo / Tuyên dương'),
+    cleanText('Điểm danh'),
+  ];
+  if (showHw) headers.push(cleanText('Điểm BTVN'));
+  if (showPrevTest) headers.push(cleanText('Điểm KT Buổi trước'));
+  if (showCurrentTest) headers.push(cleanText(showPrevTest ? 'Điểm KT Hôm nay' : 'Điểm KT'));
+  headers.push(cleanText('Nhận xét Thầy/Cô'));
+
+  let colIdx = 0;
+  const colStyles: Record<number, { cellWidth?: number | 'auto'; halign?: 'left' | 'center' | 'right' }> = {
+    [colIdx++]: { cellWidth: 8, halign: 'center' },
+    [colIdx++]: { cellWidth: 32 },
+    [colIdx++]: { cellWidth: 28 },
+    [colIdx++]: { cellWidth: 18, halign: 'center' },
+  };
+  if (showHw) {
+    colStyles[colIdx++] = { cellWidth: 16, halign: 'center' };
+  }
+  if (showPrevTest) {
+    colStyles[colIdx++] = { cellWidth: 18, halign: 'center' };
+  }
+  if (showCurrentTest) {
+    colStyles[colIdx++] = { cellWidth: 16, halign: 'center' };
+  }
+  colStyles[colIdx++] = { cellWidth: 'auto' };
 
   autoTable(doc, {
     startY: currentY,
-    head: [
-      [
-        cleanText('STT'),
-        cleanText('Họ và tên Học sinh'),
-        cleanText('Cảnh báo / Tuyên dương'),
-        cleanText('Điểm danh'),
-        cleanText('Điểm BTVN'),
-        cleanText('Điểm KT'),
-        cleanText('Nhận xét Thầy/Cô'),
-      ],
-    ],
+    head: [headers],
     body: tableRows,
     theme: 'grid',
     headStyles: {
@@ -266,15 +316,7 @@ export async function exportSessionReportPDF(
       cellPadding: 2.5,
       overflow: 'linebreak',
     },
-    columnStyles: {
-      0: { cellWidth: 10, halign: 'center' },
-      1: { cellWidth: 35 },
-      2: { cellWidth: 32 },
-      3: { cellWidth: 22, halign: 'center' },
-      4: { cellWidth: 18, halign: 'center' },
-      5: { cellWidth: 18, halign: 'center' },
-      6: { cellWidth: 'auto' },
-    },
+    columnStyles: colStyles,
     rowPageBreak: 'avoid',
   });
 
