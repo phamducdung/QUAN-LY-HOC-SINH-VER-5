@@ -6,11 +6,10 @@ import { DataFreshnessBar } from './DataFreshnessBar';
 import { DashboardHeader } from './dashboard/DashboardHeader';
 import { DashboardKpiCards } from './dashboard/DashboardKpiCards';
 import { TodayClassesCard } from './dashboard/TodayClassesCard';
-import { GradeTrendCharts } from './dashboard/GradeTrendCharts';
+import { ClassComparisonCard } from './dashboard/ClassComparisonCard';
 import { UrgentWarningsCard } from './dashboard/UrgentWarningsCard';
 import {
   computeDashboardMetrics,
-  computeGradeLevelTrends,
   computeTodayClassesList,
 } from '../services/dashboardService';
 import { Loader2, Plus, BookOpen, Inbox } from 'lucide-react';
@@ -97,11 +96,6 @@ export const Dashboard: React.FC<DashboardProps> = ({
       classStudents
     );
   }, [filteredClasses, filteredStudents, filteredWarnings, filteredStudentSessions, classStudents]);
-
-  // Compute 4 grade level trend charts (4 latest sessions for Grades 6, 7, 8, 9)
-  const gradeTrends = useMemo(() => {
-    return computeGradeLevelTrends(classes, sessions, studentSessions);
-  }, [classes, sessions, studentSessions]);
 
   // Compute class schedules & status
   const todayClassesList = useMemo(() => {
@@ -206,11 +200,18 @@ export const Dashboard: React.FC<DashboardProps> = ({
         </div>
       </div>
 
-      {/* Full-width 4-Grade Level Trend Charts (4 latest sessions: BTVN vs Test Score) */}
+      {/* Inter-Class Benchmark Comparison (So Sánh Lực Học Các Lớp Cùng Khối) */}
       <div className="pt-1">
-        <GradeTrendCharts
-          gradeTrends={gradeTrends}
+        <ClassComparisonCard
+          classes={classes}
+          sessions={sessions}
+          studentSessions={studentSessions}
+          warnings={warnings}
+          classStudents={classStudents}
           selectedGradeFilter={selectedGrade}
+          onSelectClassForGradeEntry={handleSelectClass}
+          onNavigateToClasses={() => onNavigateTab('classes')}
+          onNavigateToWarnings={() => onNavigateTab('warnings')}
         />
       </div>
     </div>

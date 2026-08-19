@@ -1,7 +1,9 @@
-import React, { memo, useState } from 'react';
-import { Student, StudentSession, AttendanceStatus, Session } from '../types';
-import { Sparkles, Loader2, Wand2 } from 'lucide-react';
+import React, { memo, useState, useRef } from 'react';
+import { Student, StudentSession, AttendanceStatus, Session, CommentTemplate } from '../types';
+import { Sparkles, Loader2, Wand2, Zap, Lightbulb } from 'lucide-react';
 import { generateSingleAIComment } from '../services/aiCommentService';
+import { CommentExpansionPopup } from './common/CommentExpansionPopup';
+import { findTemplateByExactShortcut } from '../utils/mathCommentBank';
 
 interface GradeEntryRowProps {
   student: Student;
@@ -46,6 +48,11 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
   const [isCommentFocused, setIsCommentFocused] = useState(false);
   const [isGeneratingAi, setIsGeneratingAi] = useState(false);
 
+  // Expansion & Template state
+  const [isAutocompleteOpen, setIsAutocompleteOpen] = useState(false);
+  const [autocompleteQuery, setAutocompleteQuery] = useState('');
+  const [isFullBankModalOpen, setIsFullBankModalOpen] = useState(false);
+
   const handleGenerateSingleAiComment = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (!selectedSession || !student.id || isGeneratingAi) return;
@@ -70,6 +77,90 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
     } finally {
       setIsGeneratingAi(false);
     }
+  };
+
+  // Handle comment text changes & detect slash shortcut typing
+  const handleCommentTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    onUpdateSession(student.id!, 'custom_comment', val);
+
+    const cursorPos = e.target.selectionStart || val.length;
+    const textBeforeCursor = val.slice(0, cursorPos);
+    const lastWordMatch = textBeforeCursor.match(/(^|\s)(\/[a-zA-Z0-9_À-ỹ]*)$/);
+
+    if (lastWordMatch) {
+      const shortcutToken = lastWordMatch[2]; // e.g. "/au" or "/"
+      setAutocompleteQuery(shortcutToken);
+      setIsAutocompleteOpen(true);
+    } else {
+      setIsAutocompleteOpen(false);
+    }
+  };
+
+  // Select template from popup
+  const handleSelectTemplate = (tpl: CommentTemplate) => {
+    const currentVal = rec.custom_comment || '';
+    const textareaEl = cellRefs.current[`${rowIndex}-3`] as HTMLTextAreaElement | null;
+    const cursorPos = textareaEl ? textareaEl.selectionStart : currentVal.length;
+
+    const textBeforeCursor = currentVal.slice(0, cursorPos);
+    const textAfterCursor = currentVal.slice(cursorPos);
+
+    // Replace the trailing slash word if exists, otherwise append
+    const match = textBeforeCursor.match(/(^|\s)(\/[a-zA-Z0-9_À-ỹ]*)$/);
+    let newText = '';
+    if (match) {
+      const prefix = textBeforeCursor.slice(0, textBeforeCursor.length - match[2].length);
+      newText = prefix + tpl.fullText + ' ' + textAfterCursor;
+    } else {
+      newText = (currentVal ? currentVal + ' ' : '') + tpl.fullText;
+    }
+
+    onUpdateSession(student.id!, 'custom_comment', newText);
+    setIsAutocompleteOpen(false);
+    setIsFullBankModalOpen(false);
+
+    if (textareaEl) {
+      setTimeout(() => {
+        textareaEl.focus();
+      }, 50);
+    }
+  };
+
+  // Keyboard shortcut expansion on Space / Enter / Tab
+  const handleCommentKeyDownCustom = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const currentVal = rec.custom_comment || '';
+    const textareaEl = e.currentTarget;
+    const cursorPos = textareaEl.selectionStart || currentVal.length;
+    const textBeforeCursor = currentVal.slice(0, cursorPos);
+
+    // Check if user is triggering space expansion on exact shortcut match like "/au"
+    if (e.key === ' ' || e.key === 'Enter' || e.key === 'Tab') {
+      const match = textBeforeCursor.match(/(^|\s)(\/[a-zA-Z0-9_À-ỹ]+)$/);
+      if (match) {
+        const shortcutToken = match[2];
+        const tpl = findTemplateByExactShortcut(shortcutToken);
+        if (tpl) {
+          e.preventDefault();
+          const prefix = textBeforeCursor.slice(0, textBeforeCursor.length - shortcutToken.length);
+          const suffix = currentVal.slice(cursorPos);
+          const separator = e.key === 'Enter' ? '\n' : ' ';
+          const newText = prefix + tpl.fullText + separator + suffix;
+
+          onUpdateSession(student.id!, 'custom_comment', newText);
+          setIsAutocompleteOpen(false);
+          return;
+        }
+      }
+    }
+
+    if (e.key === 'Escape') {
+      setIsAutocompleteOpen(false);
+      return;
+    }
+
+    // Call normal row onKeyDown for cell navigation (Shift+Enter for next row, etc.)
+    onKeyDown(e, rowIndex, 3);
   };
 
   // Lifecycle check
@@ -413,42 +504,97 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
             rows={isCommentFocused ? 5 : 2}
             ref={(el) => (cellRefs.current[`${rowIndex}-3`] = el)}
             value={rec.custom_comment || ''}
-            placeholder={"BTVN: \nBài KT: "}
+            placeholder={"BTVN: \nBài KT: (Gõ / để mở phím tắt nhận xét Toán)"}
             onFocus={() => {
               setIsCommentFocused(true);
               onFocusCell(rowIndex, 3);
             }}
-            onBlur={() => setIsCommentFocused(false)}
-            onKeyDown={(e) => onKeyDown(e, rowIndex, 3)}
-            onChange={(e) => onUpdateSession(student.id!, 'custom_comment', e.target.value)}
-            className={`w-full px-3 py-2 pr-8 border rounded-xl text-xs font-medium text-slate-900 dark:text-slate-100 focus:outline-none transition-all duration-200 resize-none leading-relaxed ${
+            onBlur={() => {
+              // Delay blur to allow clicks inside autocomplete popup
+              setTimeout(() => {
+                setIsCommentFocused(false);
+                setIsAutocompleteOpen(false);
+              }, 200);
+            }}
+            onKeyDown={handleCommentKeyDownCustom}
+            onChange={handleCommentTextChange}
+            className={`w-full px-3 py-2 pr-16 border rounded-xl text-xs font-medium text-slate-900 dark:text-slate-100 focus:outline-none transition-all duration-200 resize-none leading-relaxed ${
               isCommentFocused
                 ? 'h-36 min-h-[140px] bg-white dark:bg-slate-900 border-emerald-500 ring-2 ring-emerald-500/20 shadow-xl z-30 relative'
                 : 'h-14 bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 shadow-none'
             }`}
           />
-          {/* Quick AI Single Generate Button */}
-          <button
-            type="button"
-            onClick={handleGenerateSingleAiComment}
-            disabled={isGeneratingAi || isNotJoined}
-            className={`absolute right-2 top-2 p-1.5 rounded-lg border transition-all shadow-xs ${
-              isGeneratingAi
-                ? 'bg-amber-100 dark:bg-amber-950/70 border-amber-300 text-amber-600'
-                : 'bg-white/90 dark:bg-slate-800/90 border-slate-200 dark:border-slate-700 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/60 hover:border-emerald-300'
-            } ${isCommentFocused ? 'z-40' : 'z-10'}`}
-            title="Tạo nhận xét cá nhân hóa bằng Gemini AI"
-          >
-            {isGeneratingAi ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <Sparkles className="w-3.5 h-3.5" />
-            )}
-          </button>
+
+          {/* Inline Autocomplete Popup for slash commands */}
+          {isAutocompleteOpen && (
+            <CommentExpansionPopup
+              isOpen={isAutocompleteOpen}
+              searchQuery={autocompleteQuery}
+              onSelectTemplate={handleSelectTemplate}
+              onClose={() => setIsAutocompleteOpen(false)}
+              mode="inline_autocomplete"
+            />
+          )}
+
+          {/* Full Template Bank Modal */}
+          {isFullBankModalOpen && (
+            <CommentExpansionPopup
+              isOpen={isFullBankModalOpen}
+              searchQuery=""
+              onSelectTemplate={handleSelectTemplate}
+              onClose={() => setIsFullBankModalOpen(false)}
+              mode="full_modal"
+            />
+          )}
+
+          {/* Action Buttons Top Right: 💡 Math Bank & ✨ AI Gemini */}
+          <div className={`absolute right-2 top-2 flex items-center gap-1 ${isCommentFocused ? 'z-40' : 'z-10'}`}>
+            {/* Quick Template Bank Picker Button */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsFullBankModalOpen(true);
+              }}
+              className="p-1.5 rounded-lg border bg-white/90 dark:bg-slate-800/90 border-slate-200 dark:border-slate-700 text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/60 hover:border-amber-300 transition-all shadow-xs"
+              title="Mở ngân hàng mẫu nhận xét môn Toán THCS"
+            >
+              <Lightbulb className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Quick AI Single Generate Button */}
+            <button
+              type="button"
+              onClick={handleGenerateSingleAiComment}
+              disabled={isGeneratingAi || isNotJoined}
+              className={`p-1.5 rounded-lg border transition-all shadow-xs ${
+                isGeneratingAi
+                  ? 'bg-amber-100 dark:bg-amber-950/70 border-amber-300 text-amber-600'
+                  : 'bg-white/90 dark:bg-slate-800/90 border-slate-200 dark:border-slate-700 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/60 hover:border-emerald-300'
+              }`}
+              title="Tạo nhận xét cá nhân hóa bằng Gemini AI"
+            >
+              {isGeneratingAi ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Sparkles className="w-3.5 h-3.5" />
+              )}
+            </button>
+          </div>
 
           {isCommentFocused && (
-            <div className="absolute right-2.5 bottom-2.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 bg-emerald-50/90 dark:bg-emerald-950/90 backdrop-blur px-2 py-0.5 rounded-md border border-emerald-200 dark:border-emerald-800 pointer-events-none z-40 shadow-sm animate-in fade-in duration-150">
-              Enter: xuống dòng • Shift+Enter: học sinh tiếp
+            <div className="mt-1.5 flex flex-wrap items-center justify-between gap-1 text-[10.5px] font-medium text-slate-500 dark:text-slate-400 px-1 select-none animate-in fade-in duration-150">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="flex items-center gap-1 text-emerald-700 dark:text-emerald-400 font-semibold">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
+                  Gõ <kbd className="px-1 py-0.2 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded font-mono font-bold text-indigo-600 dark:text-indigo-400">/</kbd> mở phím tắt Toán
+                </span>
+                <span className="text-slate-300 dark:text-slate-700">•</span>
+                <span><kbd className="px-1 py-0.2 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded text-[9.5px]">Enter</kbd> xuống dòng</span>
+              </div>
+              <div className="text-slate-400 dark:text-slate-500 text-[10px]">
+                <kbd className="px-1 py-0.2 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded text-[9.5px]">Shift+Enter</kbd> học sinh tiếp
+              </div>
             </div>
           )}
         </div>

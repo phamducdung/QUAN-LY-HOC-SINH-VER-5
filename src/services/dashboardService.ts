@@ -510,3 +510,367 @@ export function computeTodayClassesList(
     };
   });
 }
+
+export type ComparisonTimeframe = 'this_week' | 'last_2_weeks' | 'latest_4_sessions';
+
+export interface ClassBenchmarkItem {
+  classId: string;
+  className: string;
+  gradeLevel: GradeLevel;
+  teacherName?: string;
+  studentCount: number;
+  sessionCount: number;
+  
+  // Academic Metrics
+  avgTestScore: number;
+  avgHwScore: number;
+  hwSubmissionRate: number;
+  attendanceRate: number;
+  
+  // Composite Performance Score (0 - 10)
+  performanceScore: number;
+  
+  // Growth / Progress compared to previous sessions
+  deltaTestScore?: number;
+  
+  // Risk
+  p1WarningCount: number;
+  
+  // Ranking & Badges
+  rank: number;
+  badge?: 'top_performer' | 'most_improved' | 'needs_support' | 'steady';
+  summaryInsight: string;
+}
+
+export interface GradeComparisonData {
+  gradeLevel: GradeLevel;
+  gradeName: string;
+  timeframe: ComparisonTimeframe;
+  classes: ClassBenchmarkItem[];
+  gradeAvgTest: number;
+  gradeAvgHw: number;
+  gradeAvgHwSubmission: number;
+  topPerformerClass?: ClassBenchmarkItem;
+  mostImprovedClass?: ClassBenchmarkItem;
+  needsSupportClass?: ClassBenchmarkItem;
+  hasData: boolean;
+}
+
+/**
+ * Helper to get week start and end dates (Monday to Sunday)
+ */
+function getWeekDateRange(): { start: string; end: string } {
+  const now = new Date();
+  const dayOfWeek = now.getDay(); // 0 is Sun, 1 is Mon...
+  const distanceToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+  
+  const monday = new Date(now);
+  monday.setDate(now.getDate() + distanceToMonday);
+  monday.setHours(0, 0, 0, 0);
+  
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  sunday.setHours(23, 59, 59, 999);
+  
+  const fmt = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  
+  return { start: fmt(monday), end: fmt(sunday) };
+}
+
+/**
+ * Helper to get 14 days ago date string
+ */
+function getPast14DaysDate(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 14);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * Compute Inter-Class Benchmarks and Rankings for a given Grade Level
+ */
+export function computeInterClassBenchmarks(
+  grade: GradeLevel,
+  classes: ClassItem[],
+  sessions: Session[],
+  studentSessions: StudentSession[],
+  warnings: Warning[] = [],
+  classStudents: { class_id: string; student_id: string; leave_date?: string }[] = [],
+  timeframe: ComparisonTimeframe = 'this_week'
+): GradeComparisonData {
+  const gradeClasses = classes.filter((c) => c.status === 'active' && c.grade_level === grade);
+  
+  // Student counts map (active students only)
+  const activeStudentCountMap = new Map<string, number>();
+  classStudents.forEach((cs) => {
+    if (!cs.leave_date) {
+      const count = activeStudentCountMap.get(cs.class_id) || 0;
+      activeStudentCountMap.set(cs.class_id, count + 1);
+    }
+  });
+
+  // P1 warnings count per class
+  const p1WarningsByClass = new Map<string, number>();
+  warnings.forEach((w) => {
+    if (!w.resolved && w.priority === 'P1') {
+      const count = p1WarningsByClass.get(w.class_id) || 0;
+      p1WarningsByClass.set(w.class_id, count + 1);
+    }
+  });
+
+  // Index studentSessions by session_id
+  const ssBySessionId = new Map<string, StudentSession[]>();
+  studentSessions.forEach((ss) => {
+    const list = ssBySessionId.get(ss.session_id) || [];
+    list.push(ss);
+    ssBySessionId.set(ss.session_id, list);
+  });
+
+  const weekRange = getWeekDateRange();
+  const past14Days = getPast14DaysDate();
+
+  const classBenchmarks: ClassBenchmarkItem[] = [];
+
+  for (const cls of gradeClasses) {
+    if (!cls.id) continue;
+    const classId = cls.id;
+
+    // Get all sessions of this class
+    const allClassSessions = sessions
+      .filter((s) => s.class_id === classId)
+      .sort((a, b) => (b.session_date || '').localeCompare(a.session_date || '')); // newest first
+
+    // Filter sessions by timeframe
+    let targetSessions: Session[] = [];
+    if (timeframe === 'this_week') {
+      targetSessions = allClassSessions.filter(
+        (s) => s.session_date && s.session_date >= weekRange.start && s.session_date <= weekRange.end
+      );
+      // Fallback: If no sessions this week, pick up to 2 latest sessions so the comparison is not blank
+      if (targetSessions.length === 0 && allClassSessions.length > 0) {
+        targetSessions = allClassSessions.slice(0, 2);
+      }
+    } else if (timeframe === 'last_2_weeks') {
+      targetSessions = allClassSessions.filter((s) => s.session_date && s.session_date >= past14Days);
+      if (targetSessions.length === 0 && allClassSessions.length > 0) {
+        targetSessions = allClassSessions.slice(0, 3);
+      }
+    } else {
+      // latest_4_sessions
+      targetSessions = allClassSessions.slice(0, 4);
+    }
+
+    let testScoreSum = 0;
+    let testScoreCount = 0;
+    let hwScoreSum = 0;
+    let hwScoreCount = 0;
+    let totalHwAssigned = 0;
+    let submittedHwCount = 0;
+    let totalAttendance = 0;
+    let presentAttendance = 0;
+
+    // Growth calculation: latest session vs older sessions in the batch
+    let latestSessionTestAvg: number | null = null;
+    let olderSessionsTestSum = 0;
+    let olderSessionsTestCount = 0;
+
+    targetSessions.forEach((session, sIdx) => {
+      if (!session.id) return;
+      const records = ssBySessionId.get(session.id) || [];
+
+      let sessionTestSum = 0;
+      let sessionTestCount = 0;
+
+      for (const r of records) {
+        // Attendance
+        if (r.attendance) {
+          totalAttendance++;
+          if (r.attendance === 'present' || r.attendance === 'late') {
+            presentAttendance++;
+          }
+        }
+
+        // Homework
+        if (!r.exempt && !r.exempt_homework) {
+          totalHwAssigned++;
+          if (r.homework_submitted || (r.homework_score !== undefined && r.homework_score > 0)) {
+            submittedHwCount++;
+          }
+          if (r.homework_score !== undefined && r.homework_score !== null && r.homework_score >= 0) {
+            hwScoreSum += r.homework_score;
+            hwScoreCount++;
+          }
+        }
+
+        // Test
+        if (!r.exempt && !r.exempt_test) {
+          if (r.test_score !== undefined && r.test_score !== null && r.test_score >= 0) {
+            testScoreSum += r.test_score;
+            testScoreCount++;
+            sessionTestSum += r.test_score;
+            sessionTestCount++;
+          }
+        }
+      }
+
+      if (sessionTestCount > 0) {
+        const sAvg = sessionTestSum / sessionTestCount;
+        if (sIdx === 0) {
+          latestSessionTestAvg = sAvg;
+        } else {
+          olderSessionsTestSum += sessionTestSum;
+          olderSessionsTestCount += sessionTestCount;
+        }
+      }
+    });
+
+    const avgTestScore = testScoreCount > 0 ? Math.round((testScoreSum / testScoreCount) * 10) / 10 : 0;
+    const avgHwScore = hwScoreCount > 0 ? Math.round((hwScoreSum / hwScoreCount) * 10) / 10 : 0;
+    const hwSubmissionRate = totalHwAssigned > 0 ? Math.round((submittedHwCount / totalHwAssigned) * 100) : 100;
+    const attendanceRate = totalAttendance > 0 ? Math.round((presentAttendance / totalAttendance) * 100) : 100;
+
+    // Delta test calculation
+    let deltaTestScore: number | undefined = undefined;
+    if (latestSessionTestAvg !== null && olderSessionsTestCount > 0) {
+      const olderAvg = olderSessionsTestSum / olderSessionsTestCount;
+      deltaTestScore = Math.round((latestSessionTestAvg - olderAvg) * 10) / 10;
+    }
+
+    // Performance Score Formula (0 to 10 scale)
+    // 50% Test + 30% Homework + 10% HW Completion Rate + 10% Attendance Rate
+    let performanceScore = 0;
+    if (testScoreCount > 0 || hwScoreCount > 0) {
+      const testComponent = avgTestScore * 0.5;
+      const hwComponent = (avgHwScore > 0 ? avgHwScore : avgTestScore) * 0.3;
+      const submissionComponent = (hwSubmissionRate / 10) * 0.1;
+      const attendanceComponent = (attendanceRate / 10) * 0.1;
+      performanceScore = Math.round((testComponent + hwComponent + submissionComponent + attendanceComponent) * 10) / 10;
+    }
+
+    const p1Count = p1WarningsByClass.get(classId) || 0;
+
+    // Dynamic Summary Insight
+    let summaryInsight = '';
+    if (avgTestScore >= 8.5 && hwSubmissionRate >= 90) {
+      summaryInsight = 'Phong độ xuất sắc, nề nếp BTVN rất tốt';
+    } else if (deltaTestScore !== undefined && deltaTestScore >= 0.5) {
+      summaryInsight = `Tiến bộ vượt trội (+${deltaTestScore}đ so với buổi trước)`;
+    } else if (hwSubmissionRate < 75) {
+      summaryInsight = `Tỉ lệ nộp BTVN thấp (${hwSubmissionRate}%), cần nhắc nhở`;
+    } else if (avgTestScore > 0 && avgTestScore < 6.0) {
+      summaryInsight = `Điểm kiểm tra chưa đạt chuẩn (${avgTestScore}đ), cần phụ đạo`;
+    } else if (p1Count > 0) {
+      summaryInsight = `Có ${p1Count} học sinh cảnh báo khẩn cấp P1`;
+    } else {
+      summaryInsight = 'Học lực và nề nếp duy trì ổn định';
+    }
+
+    classBenchmarks.push({
+      classId,
+      className: cls.class_name,
+      gradeLevel: grade,
+      teacherName: cls.assistant_name || 'Giáo viên bộ môn',
+      studentCount: activeStudentCountMap.get(classId) || 0,
+      sessionCount: targetSessions.length,
+      avgTestScore,
+      avgHwScore,
+      hwSubmissionRate,
+      attendanceRate,
+      performanceScore,
+      deltaTestScore,
+      p1WarningCount: p1Count,
+      rank: 1, // will rank after sorting
+      summaryInsight,
+    });
+  }
+
+  // Sort classes by Performance Score descending, then by avgTestScore
+  classBenchmarks.sort((a, b) => {
+    if (b.performanceScore !== a.performanceScore) {
+      return b.performanceScore - a.performanceScore;
+    }
+    return b.avgTestScore - a.avgTestScore;
+  });
+
+  // Assign ranks
+  classBenchmarks.forEach((item, index) => {
+    item.rank = index + 1;
+  });
+
+  // Find Top Performer, Most Improved, and Needs Support
+  let topPerformerClass: ClassBenchmarkItem | undefined = undefined;
+  let mostImprovedClass: ClassBenchmarkItem | undefined = undefined;
+  let needsSupportClass: ClassBenchmarkItem | undefined = undefined;
+
+  if (classBenchmarks.length > 0) {
+    const validClassesWithData = classBenchmarks.filter((c) => c.performanceScore > 0);
+    
+    if (validClassesWithData.length > 0) {
+      topPerformerClass = validClassesWithData[0];
+      topPerformerClass.badge = 'top_performer';
+
+      // Find most improved (highest positive delta)
+      const improvedCandidates = [...validClassesWithData]
+        .filter((c) => c.deltaTestScore !== undefined && c.deltaTestScore > 0)
+        .sort((a, b) => (b.deltaTestScore || 0) - (a.deltaTestScore || 0));
+      
+      if (improvedCandidates.length > 0 && improvedCandidates[0].classId !== topPerformerClass.classId) {
+        mostImprovedClass = improvedCandidates[0];
+        mostImprovedClass.badge = 'most_improved';
+      }
+
+      // Find needs support (lowest performanceScore or hwSubmissionRate < 75% or avgTest < 6.5)
+      const supportCandidates = [...validClassesWithData].filter(
+        (c) =>
+          c.classId !== topPerformerClass?.classId &&
+          c.classId !== mostImprovedClass?.classId &&
+          (c.avgTestScore < 6.5 || c.hwSubmissionRate < 75 || c.p1WarningCount > 0)
+      );
+
+      if (supportCandidates.length > 0) {
+        // Pick the one with lowest performance score
+        supportCandidates.sort((a, b) => a.performanceScore - b.performanceScore);
+        needsSupportClass = supportCandidates[0];
+        needsSupportClass.badge = 'needs_support';
+      }
+    }
+  }
+
+  // Calculate overall Grade benchmarks
+  let gradeTestSum = 0;
+  let gradeTestCount = 0;
+  let gradeHwSum = 0;
+  let gradeHwCount = 0;
+  let gradeHwSubSum = 0;
+
+  classBenchmarks.forEach((c) => {
+    if (c.avgTestScore > 0) {
+      gradeTestSum += c.avgTestScore;
+      gradeTestCount++;
+    }
+    if (c.avgHwScore > 0) {
+      gradeHwSum += c.avgHwScore;
+      gradeHwCount++;
+    }
+    gradeHwSubSum += c.hwSubmissionRate;
+  });
+
+  const gradeAvgTest = gradeTestCount > 0 ? Math.round((gradeTestSum / gradeTestCount) * 10) / 10 : 0;
+  const gradeAvgHw = gradeHwCount > 0 ? Math.round((gradeHwSum / gradeHwCount) * 10) / 10 : 0;
+  const gradeAvgHwSubmission = classBenchmarks.length > 0 ? Math.round(gradeHwSubSum / classBenchmarks.length) : 100;
+
+  return {
+    gradeLevel: grade,
+    gradeName: `Khối ${grade}`,
+    timeframe,
+    classes: classBenchmarks,
+    gradeAvgTest,
+    gradeAvgHw,
+    gradeAvgHwSubmission,
+    topPerformerClass,
+    mostImprovedClass,
+    needsSupportClass,
+    hasData: classBenchmarks.some((c) => c.sessionCount > 0),
+  };
+}

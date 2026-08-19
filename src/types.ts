@@ -231,3 +231,22 @@ export interface Settings {
   theme: 'light' | 'dark';
   updated_at: string;
 }
+
+export type CommentCategory =
+  | 'btvn_tot'
+  | 'btvn_thieu'
+  | 'kt_gioi'
+  | 'trinh_bay'
+  | 'lo_hong'
+  | 'dong_vien'
+  | 'custom';
+
+export interface CommentTemplate {
+  id: string;
+  shortcut: string; // e.g. "/au", "/btvn_tot", "/nham_dau"
+  label: string; // short title
+  fullText: string; // full pedagogical text
+  category: CommentCategory;
+  isCustom?: boolean;
+}
+
