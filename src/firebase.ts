@@ -7,7 +7,54 @@ import {
   setLogLevel,
 } from 'firebase/firestore';
 import { getAuth, GoogleAuthProvider, Auth } from 'firebase/auth';
-import firebaseConfig from '../firebase-applet-config.json';
+
+// Safe optional load of ../firebase-applet-config.json so `vite build` on Vercel/GitHub
+// never fails if AI Studio's GitHub exporter excludes firebase-applet-config.json
+const configModules = (import.meta as any).glob
+  ? (import.meta as any).glob('../firebase-applet-config.json', { eager: true })
+  : {};
+const loadedJsonConfig =
+  (Object.values(configModules)[0] as any)?.default ||
+  (Object.values(configModules)[0] as any) ||
+  null;
+
+const env = (import.meta as any).env || {};
+
+const firebaseConfig = {
+  projectId:
+    env.VITE_FIREBASE_PROJECT_ID ||
+    loadedJsonConfig?.projectId ||
+    'tranquil-amp-140ks',
+  appId:
+    env.VITE_FIREBASE_APP_ID ||
+    loadedJsonConfig?.appId ||
+    '1:116706140397:web:6aeec2216a8c2fdc322ce4',
+  apiKey:
+    env.VITE_FIREBASE_API_KEY ||
+    loadedJsonConfig?.apiKey ||
+    'AIzaSyBJSc-wU7sFd_ebZ7Zm1AnG1aSxCpakvkA',
+  authDomain:
+    env.VITE_FIREBASE_AUTH_DOMAIN ||
+    loadedJsonConfig?.authDomain ||
+    'tranquil-amp-140ks.firebaseapp.com',
+  firestoreDatabaseId:
+    env.VITE_FIREBASE_DATABASE_ID ||
+    loadedJsonConfig?.firestoreDatabaseId ||
+    'ai-studio-qunllphctonthcs-f4826bd8-ef41-43fe-8cff-8dd629fb5e56',
+  storageBucket:
+    env.VITE_FIREBASE_STORAGE_BUCKET ||
+    loadedJsonConfig?.storageBucket ||
+    'tranquil-amp-140ks.firebasestorage.app',
+  messagingSenderId:
+    env.VITE_FIREBASE_MESSAGING_SENDER_ID ||
+    loadedJsonConfig?.messagingSenderId ||
+    '116706140397',
+  measurementId: loadedJsonConfig?.measurementId || '',
+  oAuthClientId:
+    loadedJsonConfig?.oAuthClientId ||
+    '116706140397-a0493rg3e3m6j0lgciauoosff80hhlnn.apps.googleusercontent.com',
+  recaptchaSiteKey: loadedJsonConfig?.recaptchaSiteKey || '',
+};
 
 // Silence internal @firebase/firestore backoff/quota console.error noise so circuit breaker handles it cleanly
 try {
