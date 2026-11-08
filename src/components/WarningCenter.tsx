@@ -52,13 +52,13 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
 }) => {
   const [statusFilter, setStatusFilter] = useState<'unresolved' | 'resolved' | 'all'>('unresolved');
   const [priorityFilter, setPriorityFilter] = useState<'P1' | 'P2' | 'P3' | 'Praise' | 'all'>('all');
-  const [selectedClassId, setSelectedClassId] = useState<number | 'all'>('all');
+  const [selectedClassId, setSelectedClassId] = useState<string | number | 'all'>('all');
 
   // Sub Tab Navigation
   const [activeSubTab, setActiveSubTab] = useState<'warnings_list' | 'periodic_reports'>('warnings_list');
 
   // Periodic Report State
-  const [reportClassId, setReportClassId] = useState<number | undefined>(undefined);
+  const [reportClassId, setReportClassId] = useState<string | number | undefined>(undefined);
   const [cycles, setCycles] = useState<Array<{
     index: number;
     name: string;
@@ -213,6 +213,9 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
             attendance: ss.attendance,
             homework_score: ss.homework_score,
             test_score: ss.test_score,
+            exempt: ss.exempt,
+            exempt_homework: ss.exempt_homework,
+            exempt_test: ss.exempt_test,
             session_date: session.session_date,
             lesson_title: session.lesson_title,
           } : null;
@@ -1424,7 +1427,7 @@ Trân trọng cảm ơn PH!`;
                   <select
                     value={selectedCycleIndex !== undefined ? selectedCycleIndex : ''}
                     onChange={(e) => {
-                      setSelectedCycleIndex(e.target.value);
+                      setSelectedCycleIndex(e.target.value === '' ? undefined : Number(e.target.value));
                       setAiReport(null);
                     }}
                     className="text-xs font-bold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2 rounded-xl outline-none"

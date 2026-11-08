@@ -8,7 +8,7 @@ import { findTemplateByExactShortcut } from '../utils/mathCommentBank';
 interface GradeEntryRowProps {
   student: Student;
   rowIndex: number;
-  rec: StudentSession;
+  rec: StudentSession | Partial<StudentSession>;
   isRowActive: boolean;
   selectedSession?: Session;
   classNameTitle?: string;
@@ -20,9 +20,9 @@ interface GradeEntryRowProps {
   onSelectRow: (rowIndex: number) => void;
   onFocusCell: (rowIndex: number, colIndex: number) => void;
   onKeyDown: (e: React.KeyboardEvent, rowIndex: number, colIndex: number) => void;
-  onUpdateSession: (studentId: number, field: keyof StudentSession, value: any) => void;
-  onUpdatePrevSession?: (studentId: number, field: keyof StudentSession, value: any) => void;
-  cellRefs: React.MutableRefObject<{ [key: string]: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null }>;
+  onUpdateSession: (studentId: string | number, field: keyof StudentSession, value: any) => void;
+  onUpdatePrevSession?: (studentId: string | number, field: keyof StudentSession, value: any) => void;
+  cellRefs: React.MutableRefObject<{ [key: string]: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null } | Record<string, any>>;
 }
 
 export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
@@ -267,7 +267,8 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
               onFocus={() => onFocusCell(rowIndex, 1)}
               onKeyDown={(e) => onKeyDown(e, rowIndex, 1)}
               onChange={(e) => {
-                const val = e.target.value === '' ? undefined : parseFloat(e.target.value);
+                const parsed = parseFloat(e.target.value);
+                const val = e.target.value === '' || Number.isNaN(parsed) ? undefined : parsed;
                 onUpdateSession(student.id!, 'homework_score', val);
                 onUpdateSession(student.id!, 'homework_submitted', e.target.value !== '');
               }}
@@ -370,7 +371,8 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
               onFocus={() => onFocusCell(rowIndex, 2)}
               onChange={(e) => {
                 if (!onUpdatePrevSession) return;
-                const val = e.target.value === '' ? undefined : parseFloat(e.target.value);
+                const parsed = parseFloat(e.target.value);
+                const val = e.target.value === '' || Number.isNaN(parsed) ? undefined : parsed;
                 onUpdatePrevSession(student.id!, 'test_score', val);
               }}
               disabled={isNotJoined || !!(prevRec?.exempt || prevRec?.exempt_test)}
@@ -447,7 +449,8 @@ export const GradeEntryRow: React.FC<GradeEntryRowProps> = memo(({
               onFocus={() => onFocusCell(rowIndex, 2)}
               onKeyDown={(e) => onKeyDown(e, rowIndex, 2)}
               onChange={(e) => {
-                const val = e.target.value === '' ? undefined : parseFloat(e.target.value);
+                const parsed = parseFloat(e.target.value);
+                const val = e.target.value === '' || Number.isNaN(parsed) ? undefined : parsed;
                 onUpdateSession(student.id!, 'test_score', val);
               }}
               disabled={isNotJoined || isAbsent || rec.exempt || rec.exempt_test}

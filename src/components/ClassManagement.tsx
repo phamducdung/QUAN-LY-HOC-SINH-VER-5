@@ -332,12 +332,13 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     const activeLinks = studentLinks.filter(l => !l.leave_date);
     for (const link of activeLinks) {
       const csPayload = {
+        id: `cs_${newClassId}_${link.student_id}`,
         class_id: newClassId,
         student_id: link.student_id,
         join_date: now.split('T')[0],
         created_at: now,
       };
-      await db.class_students.add(csPayload);
+      await db.class_students.put(csPayload);
     }
 
     await logAudit(currentRole as UserRole, 'Chuyển khối / Lên lớp', `Chuyển lớp ${promotingClass.class_name} lên Khối ${nextGrade}`);

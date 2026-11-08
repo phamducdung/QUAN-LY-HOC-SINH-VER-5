@@ -86,7 +86,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
   const [activeTab, setActiveTab] = useState<'performance' | 'gaps' | 'classes' | 'warnings'>('performance');
   const [studentSessionsRaw, setStudentSessionsRaw] = useState<StudentSession[]>([]);
   const [studentSessionsList, setStudentSessionsList] = useState<Session[]>([]);
-  const [selectedProfileClassId, setSelectedProfileClassId] = useState<number | 'all'>('all');
+  const [selectedProfileClassId, setSelectedProfileClassId] = useState<string | number | 'all'>('all');
 
   // Quick resolution states within student profile
   const [resolvingWarningId, setResolvingWarningId] = useState<string | null>(null);
@@ -95,8 +95,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
   const [isResolvingProfile, setIsResolvingProfile] = useState(false);
 
   // Transfer class states
-  const [transferFromClassId, setTransferFromClassId] = useState<number | ''>('');
-  const [transferToClassId, setTransferToClassId] = useState<number | ''>('');
+  const [transferFromClassId, setTransferFromClassId] = useState<string | number | ''>('');
+  const [transferToClassId, setTransferToClassId] = useState<string | number | ''>('');
 
   // Dynamically calculate performance history based on class filter
   const studentPerformanceHistory = useMemo(() => {
@@ -106,7 +106,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
       ? studentSessionsRaw
       : studentSessionsRaw.filter(ss => {
           const sess = studentSessionsList.find(s => s.id === ss.session_id);
-          return sess && sess.class_id === selectedProfileClassId;
+          return sess && String(sess.class_id) === String(selectedProfileClassId);
         });
 
     const sortedSessList = [...studentSessionsList].sort((a, b) => a.session_date.localeCompare(b.session_date));
@@ -144,7 +144,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
       ? studentSessionsRaw
       : studentSessionsRaw.filter(ss => {
           const sess = studentSessionsList.find(s => s.id === ss.session_id);
-          return sess && sess.class_id === selectedProfileClassId;
+          return sess && String(sess.class_id) === String(selectedProfileClassId);
         });
 
     filteredRaw.forEach((ss) => {
@@ -196,7 +196,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
     return Object.entries(topicGroupMap).map(([name, data]) => ({
       topic: name,
       category: data.category === 'Algebra' ? 'Đại số' : 'Hình học',
-      avgScore: parseFloat((data.sum / data.count).toFixed(1)),
+      avgScore: data.count > 0 && !Number.isNaN(data.sum / data.count) ? parseFloat((data.sum / data.count).toFixed(1)) : 0,
     }));
   }, [viewingStudent, studentSessionsRaw, studentSessionsList, selectedProfileClassId, knowledgeTags]);
 
@@ -355,12 +355,13 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
       const todayStr = now.split('T')[0];
       for (const classId of enrollClassIds) {
         const csPayload = {
+          id: `cs_${classId}_${studentId}`,
           class_id: classId,
           student_id: studentId,
           join_date: todayStr,
           created_at: now
         };
-        await db.class_students.add(csPayload);
+        await db.class_students.put(csPayload);
       }
       
       await db.audit_logs.add({
@@ -1149,13 +1150,13 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                   // Determine target description based on selected profile class or student active class
                   let targetDesc = 'Thi vào Lớp 10 Công lập 8.0+';
                   if (selectedProfileClassId !== 'all') {
-                    const specificClass = classes.find(c => c.id === selectedProfileClassId);
+                    const specificClass = classes.find(c => String(c.id) === String(selectedProfileClassId));
                     if (specificClass?.target_description) {
                       targetDesc = specificClass.target_description;
                     }
                   } else {
-                    const activeRel = classStudents.find(cs => cs.student_id === viewingStudent.id && !cs.leave_date);
-                    const activeClassObj = activeRel ? classes.find(c => c.id === activeRel.class_id) : null;
+                    const activeRel = classStudents.find(cs => String(cs.student_id) === String(viewingStudent.id) && !cs.leave_date);
+                    const activeClassObj = activeRel ? classes.find(c => String(c.id) === String(activeRel.class_id)) : null;
                     if (activeClassObj?.target_description) {
                       targetDesc = activeClassObj.target_description;
                     }
@@ -1570,9 +1571,9 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                         >
                           <option value="">-- Chọn lớp rời đi --</option>
                           {classStudents
-                            .filter((cs) => cs.student_id === viewingStudent.id && !cs.leave_date)
+                            .filter((cs) => String(cs.student_id) === String(viewingStudent.id) && !cs.leave_date)
                             .map((cs, idx) => {
-                              const c = classes.find((cls) => cls.id === cs.class_id);
+                              const c = classes.find((cls) => String(cls.id) === String(cs.class_id));
                               if (!c) return null;
                               return (
                                 <option key={c.id ? `${c.id}-${idx}` : idx} value={c.id}>
@@ -1595,9 +1596,9 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                             .filter((c) => c.status === 'active')
                             .filter((c) => {
                               const enrolledActiveIds = classStudents
-                                .filter((cs) => cs.student_id === viewingStudent.id && !cs.leave_date)
-                                .map((cs) => cs.class_id);
-                              return !enrolledActiveIds.includes(c.id!);
+                                .filter((cs) => String(cs.student_id) === String(viewingStudent.id) && !cs.leave_date)
+                                .map((cs) => String(cs.class_id));
+                              return !enrolledActiveIds.includes(String(c.id));
                             })
                             .map((c, idx) => (
                               <option key={c.id ? `${c.id}-${idx}` : idx} value={c.id}>
@@ -1616,8 +1617,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                             return;
                           }
 
-                          const oldClass = classes.find((c) => c.id === transferFromClassId);
-                          const newClass = classes.find((c) => c.id === transferToClassId);
+                          const oldClass = classes.find((c) => String(c.id) === String(transferFromClassId));
+                          const newClass = classes.find((c) => String(c.id) === String(transferToClassId));
 
                           if (!oldClass || !newClass) return;
 
@@ -1630,7 +1631,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
 
                             // 1. Update old class leave_date
                             const oldRel = classStudents.find(
-                              (cs) => cs.student_id === viewingStudent.id && cs.class_id === transferFromClassId && !cs.leave_date
+                              (cs) => String(cs.student_id) === String(viewingStudent.id) && String(cs.class_id) === String(transferFromClassId) && !cs.leave_date
                             );
                             if (oldRel) {
                               await db.class_students.update(oldRel.id!, {
@@ -1639,8 +1640,9 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                             }
 
                             // 2. Add new class join_date
-                            await db.class_students.add({
-                              class_id: transferToClassId,
+                            await db.class_students.put({
+                              id: `cs_${String(transferToClassId)}_${String(viewingStudent.id!)}`,
+                              class_id: String(transferToClassId),
                               student_id: viewingStudent.id!,
                               join_date: todayStr,
                               created_at: new Date().toISOString(),
@@ -1711,7 +1713,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                           const targetClass = classes.find(c => c.id === targetClassId);
                           const todayStr = new Date().toISOString().split('T')[0];
                           
-                          await db.class_students.add({
+                          await db.class_students.put({
+                            id: `cs_${targetClassId}_${String(viewingStudent.id!)}`,
                             class_id: targetClassId,
                             student_id: viewingStudent.id!,
                             join_date: todayStr,

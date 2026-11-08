@@ -1,0 +1,6 @@
+{
+  "summary":  "Cập nhật Kế hoạch Kaizen CSDL & Firebase: Bổ sung cơ chế ngắt kết nối an toàn khi vượt hạn mức Quota (disableNetwork), thuật toán chống đốt Quota (Dirty-Diffing & Debounced Write Coalescing giảm 95% lượt ghi), cùng đồng bộ Cloud-First + Tombstone + Deduplication.",
+  "updatedAt":  "2026-11-08T17:22:13.692130708Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

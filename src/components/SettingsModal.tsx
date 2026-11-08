@@ -197,12 +197,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       updated_at: now,
     };
 
-    const settingId = sList.length > 0 ? sList[0].id : undefined;
-    if (settingId) {
-      await db.settings.update(settingId, newSetting);
-    } else {
-      await db.settings.add(newSetting);
-    }
+    await db.settings.put({
+      ...newSetting,
+      id: 'system_settings',
+    });
 
     setSaveSuccess(true);
     setTimeout(() => setSaveSuccess(false), 3000);
@@ -662,16 +660,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             type="button"
             disabled={!isAdmin}
             onClick={async () => {
-              if (window.confirm("Thầy cô có chắc chắn muốn nạp dữ liệu mẫu? Hệ thống sẽ cập nhật dữ liệu mẫu thử nghiệm. Các dữ liệu do thầy cô tự tạo trước đó sẽ được GIỮ NGUYÊN HOÀN TOÀN.")) {
-                try {
-                  localStorage.setItem('demo_action_message', 'seed_success');
-                  await seedDemoData();
-                  window.location.reload();
-                } catch (err) {
-                  console.error("Failed to seed demo data:", err);
-                  localStorage.removeItem('demo_action_message');
-                  alert("Đã xảy ra lỗi khi nạp dữ liệu mẫu.");
-                }
+              try {
+                await seedDemoData();
+                setDemoMessage('seed_success');
+              } catch (err) {
+                console.error("Failed to seed demo data:", err);
               }
             }}
             className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
@@ -684,16 +677,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             type="button"
             disabled={!isAdmin}
             onClick={async () => {
-              if (window.confirm("Thầy cô có chắc chắn muốn xóa toàn bộ dữ liệu mẫu thử nghiệm? Toàn bộ các dữ liệu thật do thầy cô tự tạo trước đó sẽ được GIỮ LẠI NGUYÊN VẸN, không bị ảnh hưởng.")) {
-                try {
-                  localStorage.setItem('demo_action_message', 'delete_success');
-                  await deleteOnlyDemoTestData();
-                  window.location.reload();
-                } catch (err) {
-                  console.error("Failed to delete demo data:", err);
-                  localStorage.removeItem('demo_action_message');
-                  alert("Đã xảy ra lỗi khi xóa dữ liệu thử nghiệm.");
-                }
+              try {
+                await deleteOnlyDemoTestData();
+                setDemoMessage('delete_success');
+              } catch (err) {
+                console.error("Failed to delete demo data:", err);
               }
             }}
             className="px-4 py-2 bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50 flex items-center gap-1.5 border border-slate-300 dark:border-slate-700 cursor-pointer"

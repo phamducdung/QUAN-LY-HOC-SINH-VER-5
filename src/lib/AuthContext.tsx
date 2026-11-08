@@ -122,14 +122,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (createErr?.code === 'auth/email-already-in-use') {
             throw new Error('Sai mật khẩu đăng nhập. Vui lòng thử lại!');
           }
-          throw createErr;
+          throw new Error(createErr?.message || 'Lỗi khi khởi tạo tài khoản Firebase Auth.');
         }
       } else if (error?.code === 'auth/wrong-password') {
         throw new Error('Mật khẩu không chính xác. Vui lòng kiểm tra lại!');
       } else if (error?.code === 'auth/invalid-email') {
         throw new Error('Địa chỉ Email không đúng định dạng.');
       } else {
-        throw error;
+        throw new Error(error?.message || (typeof error === 'string' ? error : 'Lỗi xác thực tài khoản. Vui lòng thử lại!'));
       }
     }
 

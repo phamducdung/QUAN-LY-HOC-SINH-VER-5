@@ -74,7 +74,7 @@ export async function generateSingleAIComment(
   className: string,
   gradeLevel: number | string,
   student: Student,
-  studentSession: StudentSession,
+  studentSession: StudentSession | Partial<StudentSession>,
   userApiKey?: string
 ): Promise<{ success: boolean; comment?: string; error?: string }> {
   const params: GenerateCommentsParams = {
@@ -89,7 +89,7 @@ export async function generateSingleAIComment(
       {
         student_id: student.id!,
         student_name: student.full_name,
-        attendance: studentSession.attendance,
+        attendance: studentSession.attendance || 'present',
         homework_submitted: studentSession.homework_submitted,
         homework_score: studentSession.homework_score,
         exempt_homework: studentSession.exempt || studentSession.exempt_homework,

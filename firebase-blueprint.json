@@ -171,10 +171,29 @@
     "settings": {
       "title": "Settings",
       "description": "System and class warning rules settings",
+      "type": "object",
       "properties": {
         "theme": { "type": "string" },
         "updated_at": { "type": "string" }
       }
+    },
+    "deleted_records": {
+      "title": "Deleted Records Tombstones",
+      "description": "Tombstone records for synchronized deletions across devices",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "table_name": { "type": "string" },
+        "record_id": { "type": "string" },
+        "deleted_at": { "type": "string" }
+      },
+      "required": ["table_name", "record_id", "deleted_at"]
+    }
+  },
+  "firestore": {
+    "/deleted_records/{tombstoneId}": {
+      "schema": "deleted_records",
+      "description": "Tombstones for multi-device deletion reconciliation"
     }
   }
 }

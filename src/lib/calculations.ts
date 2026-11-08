@@ -154,7 +154,7 @@ export function calculateStudentCycleGrades(
         hwValidCount++;
         hwTotalScore += 0;
         unsubmittedHwCount++;
-      } else if (typeof ss.homework_score === 'number' && ss.homework_score >= 0) {
+      } else if (typeof ss.homework_score === 'number' && !Number.isNaN(ss.homework_score) && ss.homework_score >= 0) {
         // Được chấm điểm bình thường
         hwStatus = 'graded';
         effectiveHwScore = ss.homework_score;
@@ -181,7 +181,7 @@ export function calculateStudentCycleGrades(
         testTotalScore += 0;
       } else if (ss.attendance === 'absent_excused') {
         // Vắng có phép: Nếu đã có điểm thi bù -> tính điểm thi bù. Nếu chưa -> Tạm miễn (chờ thi bù)
-        if (typeof ss.test_score === 'number' && ss.test_score >= 0) {
+        if (typeof ss.test_score === 'number' && !Number.isNaN(ss.test_score) && ss.test_score >= 0) {
           testStatus = 'makeup_graded';
           effectiveTestScore = ss.test_score;
           testValidCount++;
@@ -190,7 +190,7 @@ export function calculateStudentCycleGrades(
           testStatus = 'pending_makeup';
           hasPendingMakeup = true;
         }
-      } else if (typeof ss.test_score === 'number' && ss.test_score >= 0) {
+      } else if (typeof ss.test_score === 'number' && !Number.isNaN(ss.test_score) && ss.test_score >= 0) {
         testStatus = ss.makeup_test ? 'makeup_graded' : 'graded';
         effectiveTestScore = ss.test_score;
         testValidCount++;
@@ -217,13 +217,17 @@ export function calculateStudentCycleGrades(
   });
 
   // Calculate averages
-  const hwAverage = hwValidCount > 0 ? parseFloat((hwTotalScore / hwValidCount).toFixed(1)) : null;
-  const testAverage = testValidCount > 0 ? parseFloat((testTotalScore / testValidCount).toFixed(1)) : null;
+  const hwAverageRaw = hwValidCount > 0 ? parseFloat((hwTotalScore / hwValidCount).toFixed(1)) : null;
+  const hwAverage = hwAverageRaw !== null && !Number.isNaN(hwAverageRaw) ? hwAverageRaw : null;
+
+  const testAverageRaw = testValidCount > 0 ? parseFloat((testTotalScore / testValidCount).toFixed(1)) : null;
+  const testAverage = testAverageRaw !== null && !Number.isNaN(testAverageRaw) ? testAverageRaw : null;
 
   // Calculate weighted average
   let weightedAverage: number | null = null;
   if (hwAverage !== null && testAverage !== null) {
-    weightedAverage = parseFloat((hwAverage * 0.3 + testAverage * 0.7).toFixed(1));
+    const calc = parseFloat((hwAverage * 0.3 + testAverage * 0.7).toFixed(1));
+    weightedAverage = !Number.isNaN(calc) ? calc : null;
   } else if (hwAverage !== null) {
     weightedAverage = hwAverage; // 100% weight to HW if test is totally exempt
   } else if (testAverage !== null) {
@@ -255,7 +259,7 @@ export function calculateStudentCycleGrades(
  * Format average score for display
  */
 export function formatScore(score: number | null | undefined): string {
-  if (score === null || score === undefined || Number.isNaN(score)) {
+  if (score === null || score === undefined || typeof score !== 'number' || Number.isNaN(score) || !Number.isFinite(score)) {
     return 'Miễn';
   }
   return score.toFixed(1);
@@ -276,15 +280,24 @@ export interface SessionSummaryMetrics {
   hasTest: boolean;
   hwCount: number;
   testCount: number;
+  hwRequiredCount: number; // Số học sinh có nghĩa vụ nộp BTVN (Sĩ số - Miễn - Vắng có phép)
+  unsubmittedHwCount: number; // Số học sinh không nộp/chưa làm
+  unexcusedAbsentCount: number; // Số học sinh vắng không phép (bị 0đ)
 }
 
 /**
  * Standardized Single Source of Truth for calculating session-level metrics:
- * Computes attendance, homework submission %, average homework score, and average test score.
- * Handles exempt homework/test, late submissions, pending test gradings consistently across:
- * 1. UltraFastGradeEntry Mini Dashboard
- * 2. Printable A4 Session Report Preview Modal
- * 3. Direct PDF Export Generator (pdfGenerator.ts)
+ * Chuẩn hóa Quản lý Chất lượng Giáo dục (QA Educational Matrix):
+ * - BTVN:
+ *   + Có điểm hợp lệ -> Cộng điểm, mẫu số + 1
+ *   + Chưa làm / Không nộp BTVN -> Tự động 0đ, mẫu số + 1
+ *   + Vắng không phép (absent_unexcused) -> Tự động 0đ, mẫu số + 1
+ *   + Miễn BTVN, Vắng có phép, Nộp muộn chờ chấm -> Loại khỏi mẫu số
+ * - Bài Kiểm Tra:
+ *   + Có điểm hợp lệ -> Cộng điểm, mẫu số + 1
+ *   + Vắng không phép -> Tự động 0đ, mẫu số + 1
+ *   + Vắng có phép / Chờ thi bù / Miễn KT -> Loại khỏi mẫu số
+ * - Tỉ lệ Nộp BTVN (%): hwDone / hwRequiredCount * 100
  */
 export function calculateSessionSummaryMetrics(
   students: Student[],
@@ -311,12 +324,18 @@ export function calculateSessionSummaryMetrics(
       hasTest,
       hwCount: 0,
       testCount: 0,
+      hwRequiredCount: 0,
+      unsubmittedHwCount: 0,
+      unexcusedAbsentCount: 0,
     };
   }
 
   let present = 0;
   let absentCount = 0;
+  let unexcusedAbsentCount = 0;
   let hwDone = 0;
+  let hwRequiredCount = 0;
+  let unsubmittedHwCount = 0;
   let totalHw = 0;
   let hwCount = 0;
   let totalTest = 0;
@@ -326,48 +345,121 @@ export function calculateSessionSummaryMetrics(
 
   students.forEach((st) => {
     const rec = studentSessions[st.id!];
-    const attendance = rec?.attendance;
-    const isAttended = !attendance || attendance === 'present' || attendance === 'late';
+    const attendance = rec?.attendance || 'present';
+    const isAttended = attendance === 'present' || attendance === 'late';
+    const isAbsentExcused = attendance === 'absent_excused';
+    const isAbsentUnexcused = attendance === 'absent_unexcused';
+
     if (isAttended) {
       present++;
     } else {
       absentCount++;
+      if (isAbsentUnexcused) unexcusedAbsentCount++;
     }
 
-    if (!rec) return;
+    if (!rec) {
+      // Trường hợp học sinh chưa có record nhưng có đi học
+      if (hasHw && isAttended) {
+        hwRequiredCount++;
+      }
+      return;
+    }
 
     const isHwExempt = !!(rec.exempt || rec.exempt_homework);
     const isTestExempt = !!(rec.exempt || rec.exempt_test);
 
-    // 1. Nộp BTVN: Đã nộp (kể cả nộp muộn), hoặc được Miễn BTVN
-    const isHwSubmitted = isHwExempt || rec.homework_submitted !== false || rec.late_submit === true;
-    if (isAttended && hasHw && isHwSubmitted) {
-      hwDone++;
-    }
+    // ==========================================
+    // 1. TÍNH TOÁN BÀI TẬP VỀ NHÀ (BTVN)
+    // ==========================================
+    if (hasHw) {
+      const isObligatedForHw = !isHwExempt && !isAbsentExcused;
+      if (isObligatedForHw) {
+        hwRequiredCount++;
+      }
 
-    // 2. Điểm TB BTVN: Tất cả điểm số BTVN hợp lệ của học sinh có mặt và không miễn trừ (kể cả nộp muộn đã có điểm)
-    if (isAttended && hasHw && !isHwExempt && typeof rec.homework_score === 'number' && !Number.isNaN(rec.homework_score)) {
-      totalHw += rec.homework_score;
-      hwCount++;
-    }
-
-    // 3. Điểm TB Kiểm Tra & Chờ chấm
-    if (isAttended && hasTest && !isTestExempt) {
-      if (typeof rec.test_score === 'number' && !Number.isNaN(rec.test_score)) {
-        totalTest += rec.test_score;
-        testCount++;
-      } else if (rec.test_score === undefined || rec.test_score === null) {
-        pendingTestCount++;
+      if (isHwExempt) {
+        // Miễn BTVN: Bỏ qua khỏi ĐTB và tỷ lệ
+      } else if (isAbsentExcused) {
+        // Vắng có phép: Bỏ qua (học sinh được quyền nộp bù sau)
+      } else if (isAbsentUnexcused) {
+        // Vắng không phép: Nhận 0đ kỷ luật vào ĐTB buổi học
+        totalHw += 0;
+        hwCount++;
+        unsubmittedHwCount++;
+      } else if (isAttended) {
+        // Học sinh có mặt/đi muộn
+        if (rec.late_submit) {
+          // Nộp muộn:
+          if (typeof rec.homework_score === 'number' && !Number.isNaN(rec.homework_score) && rec.homework_score >= 0) {
+            totalHw += rec.homework_score;
+            hwCount++;
+            hwDone++;
+          }
+          // Nếu nộp muộn mà chưa chấm điểm -> tạm thời chờ chấm, không phạt 0đ ngay
+        } else if (rec.homework_submitted === false) {
+          // Chưa làm / Không nộp BTVN -> Tự động 0đ vào ĐTB
+          const score = typeof rec.homework_score === 'number' && !Number.isNaN(rec.homework_score) ? rec.homework_score : 0;
+          totalHw += score;
+          hwCount++;
+          unsubmittedHwCount++;
+        } else if (typeof rec.homework_score === 'number' && !Number.isNaN(rec.homework_score) && rec.homework_score >= 0) {
+          // Đã làm và có điểm hợp lệ
+          totalHw += rec.homework_score;
+          hwCount++;
+          hwDone++;
+        } else {
+          // homework_submitted === true nhưng chưa gõ điểm -> đang chấm dở, chưa tính vào hwCount
+          hwDone++;
+        }
       }
     }
 
-    // 4. Cần hỗ trợ
-    const isHwWeak = hasHw && !isHwExempt && (rec.homework_submitted === false || (typeof rec.homework_score === 'number' && rec.homework_score < 5));
+    // ==========================================
+    // 2. TÍNH TOÁN BÀI KIỂM TRA (TEST)
+    // ==========================================
+    if (hasTest) {
+      if (isTestExempt) {
+        // Miễn kiểm tra
+      } else if (isAbsentExcused) {
+        // Vắng có phép: Nếu đã thi bù có điểm -> tính điểm thi bù. Nếu chưa -> loại khỏi mẫu số
+        if (typeof rec.test_score === 'number' && !Number.isNaN(rec.test_score) && rec.test_score >= 0) {
+          totalTest += rec.test_score;
+          testCount++;
+        }
+      } else if (isAbsentUnexcused) {
+        // Vắng không phép: Nhận 0đ kỷ luật vào ĐTB bài kiểm tra
+        totalTest += 0;
+        testCount++;
+      } else if (isAttended) {
+        if (rec.makeup_test && (rec.test_score === undefined || rec.test_score === null)) {
+          // Chờ thi bù
+          pendingTestCount++;
+        } else if (typeof rec.test_score === 'number' && !Number.isNaN(rec.test_score) && rec.test_score >= 0) {
+          // Đã có điểm kiểm tra
+          totalTest += rec.test_score;
+          testCount++;
+        } else {
+          // Chưa nhập điểm
+          pendingTestCount++;
+        }
+      }
+    }
+
+    // ==========================================
+    // 3. ĐÁNH GIÁ HỌC SINH CẦN HỖ TRỢ / NGUY CƠ
+    // ==========================================
+    const isHwWeak = hasHw && !isHwExempt && (
+      rec.homework_submitted === false ||
+      (typeof rec.homework_score === 'number' && rec.homework_score < 5)
+    );
     const isTestWeak = hasTest && !isTestExempt && typeof rec.test_score === 'number' && rec.test_score < 5;
-    if (attendance === 'absent_unexcused' || (isAttended && (isHwWeak || isTestWeak))) {
+
+    if (isAbsentUnexcused || (isAttended && (isHwWeak || isTestWeak))) {
       needSupport++;
     }
   });
+
+  const effectiveHwPct = hwRequiredCount > 0 ? Math.round((hwDone / hwRequiredCount) * 100) : (present > 0 ? Math.round((hwDone / present) * 100) : 0);
 
   return {
     total,
@@ -375,7 +467,7 @@ export function calculateSessionSummaryMetrics(
     presentPct: total > 0 ? Math.round((present / total) * 100) : 0,
     absentCount,
     hwDone,
-    hwPct: present > 0 ? Math.round((hwDone / present) * 100) : 0,
+    hwPct: effectiveHwPct,
     avgHw: hwCount > 0 ? parseFloat((totalHw / hwCount).toFixed(1)) : 0,
     avgTest: testCount > 0 ? parseFloat((totalTest / testCount).toFixed(1)) : 0,
     pendingTestCount: hasTest ? pendingTestCount : 0,
@@ -384,5 +476,8 @@ export function calculateSessionSummaryMetrics(
     hasTest,
     hwCount,
     testCount,
+    hwRequiredCount,
+    unsubmittedHwCount,
+    unexcusedAbsentCount,
   };
 }

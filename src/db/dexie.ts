@@ -7,6 +7,7 @@ import {
   Session,
   StudentSession,
   KnowledgeTag,
+  GradeLevel,
   KnowledgeResult,
   Warning,
   AIDiagnosis,
@@ -14,7 +15,16 @@ import {
   Settings,
 } from '../types';
 
-import { pushDocToFirestore, pushDocsBatchToFirestore, broadcastLocalMutation } from '../services/syncService';
+import {
+  pushDocToFirestore,
+  pushDocsBatchToFirestore,
+  broadcastLocalMutation,
+  getCanonicalDocId,
+  enqueueSyncOperation,
+  kaizenDeduplicateAndMerge,
+  TableName,
+} from '../services/syncService';
+import { getIsQuotaExceeded } from '../firebase';
 
 export let isRemoteSyncing = false;
 export function setRemoteSyncing(val: boolean) {
@@ -22,22 +32,30 @@ export function setRemoteSyncing(val: boolean) {
 }
 
 export async function pushBatchDocsToFirestore(tableName: string, items: any[]) {
-  if (isRemoteSyncing) return;
+  if (isRemoteSyncing || getIsQuotaExceeded() || !items || items.length === 0) return;
   try {
-    items.forEach(item => {
-      if (item?.id) broadcastLocalMutation(tableName, 'put', item.id);
+    items.forEach((item) => {
+      if (item?.id && item.is_demo !== true) {
+        broadcastLocalMutation(tableName, 'put', item.id);
+      }
     });
-    await pushDocsBatchToFirestore(tableName as any, items);
+    await pushDocsBatchToFirestore(tableName as TableName, items);
   } catch (err) {
     console.warn(`[Sync] Failed to batch push ${tableName}:`, err);
   }
 }
 
-export async function pushSingleDocToFirestore(tableName: string, docId: string | number, data: any, isDelete = false) {
+export async function pushSingleDocToFirestore(
+  tableName: string,
+  docId: string | number,
+  data: any,
+  isDelete = false
+) {
   if (isRemoteSyncing) return;
+  if (!isDelete && data?.is_demo === true) return;
   try {
     broadcastLocalMutation(tableName, isDelete ? 'delete' : 'put', docId);
-    await pushDocToFirestore(tableName as any, String(docId), data, isDelete);
+    await pushDocToFirestore(tableName as TableName, String(docId), data, isDelete);
   } catch (err) {
     console.warn(`[Sync] Failed to push ${tableName}/${docId}:`, err);
   }
@@ -70,34 +88,49 @@ export class SmartEduDatabase extends Dexie {
       knowledge_results: 'id, student_id, knowledge_tag_id',
       warnings: 'id, student_id, class_id, priority, resolved',
       ai_diagnoses: 'id, student_id',
-      audit_logs: 'id, user_role, timestamp',
+      audit_logs: 'id, user_role, timestamp, session_id, class_id, student_id, action_type',
       settings: 'id',
     });
 
-    this.tables.forEach(table => {
-      const tableName = table.name;
-      table.hook('creating', function (primKey, obj, trans) {
-        if (!primKey) {
-          const uuid = crypto.randomUUID();
-          obj.id = uuid;
-          primKey = uuid;
-        }
-        if (!isRemoteSyncing) {
-          pushSingleDocToFirestore(tableName, String(primKey || obj.id), obj, false);
+    this.version(2).stores({
+      audit_logs: 'id, user_role, timestamp, session_id, class_id, student_id, action_type',
+      warnings: 'id, student_id, class_id, priority, resolved, [student_id+class_id+resolved]',
+      knowledge_results: 'id, student_id, knowledge_tag_id, [student_id+knowledge_tag_id]',
+    });
+
+    this.tables.forEach((table) => {
+      const tableName = table.name as TableName;
+      table.hook('creating', function (primKey, obj) {
+        const canonicalId = getCanonicalDocId(tableName, obj, primKey);
+        obj.id = canonicalId;
+        primKey = canonicalId;
+
+        if (!isRemoteSyncing && obj?.is_demo !== true) {
+          broadcastLocalMutation(tableName, 'put', canonicalId);
+          enqueueSyncOperation(tableName, canonicalId, obj, false);
         }
         return primKey;
       });
 
-      table.hook('updating', function (mods, primKey, obj, trans) {
+      table.hook('updating', function (mods, primKey, obj) {
         if (!isRemoteSyncing) {
-          const updatedObj = { ...obj, ...mods, updated_at: new Date().toISOString() };
-          pushSingleDocToFirestore(tableName, String(primKey), updatedObj, false);
+          const updatedObj = {
+            ...obj,
+            ...mods,
+            id: String(primKey),
+            updated_at: (mods as any)?.updated_at || new Date().toISOString(),
+          };
+          if (updatedObj.is_demo !== true) {
+            broadcastLocalMutation(tableName, 'put', String(primKey));
+            enqueueSyncOperation(tableName, String(primKey), updatedObj, false);
+          }
         }
       });
 
-      table.hook('deleting', function (primKey, obj, trans) {
-        if (!isRemoteSyncing) {
-          pushSingleDocToFirestore(tableName, String(primKey), null, true);
+      table.hook('deleting', function (primKey, obj) {
+        if (!isRemoteSyncing && obj?.is_demo !== true) {
+          broadcastLocalMutation(tableName, 'delete', String(primKey));
+          enqueueSyncOperation(tableName, String(primKey), null, true);
         }
       });
     });
@@ -106,8 +139,8 @@ export class SmartEduDatabase extends Dexie {
 
 export const db = new SmartEduDatabase();
 
-export async function recordDeletionTombstone(id: string, tableName: string, studentId?: string) {
-  // Offline-first: Tombstones no longer required
+export async function recordDeletionTombstone(id: string, tableName: string, _studentId?: string) {
+  enqueueSyncOperation(tableName as TableName, String(id), null, true);
 }
 
 export async function deleteStudent(studentId: string | number) {
@@ -115,59 +148,32 @@ export async function deleteStudent(studentId: string | number) {
   const sidNum = Number(studentId);
   const isNum = !isNaN(sidNum);
 
-  await db.transaction('rw', [db.students, db.class_students, db.student_sessions, db.warnings, db.knowledge_results, db.ai_diagnoses], async () => {
-    await db.students.delete(sidStr);
-    if (isNum) await db.students.delete(sidNum as any);
+  await db.transaction(
+    'rw',
+    [db.students, db.class_students, db.student_sessions, db.warnings, db.knowledge_results, db.ai_diagnoses],
+    async () => {
+      await db.students.delete(sidStr);
+      if (isNum) await db.students.delete(sidNum as any);
 
-    const deleteFromTable = async (table: any) => {
-      await table.where('student_id').equals(sidStr).delete();
-      if (isNum) await table.where('student_id').equals(sidNum).delete();
-    };
+      const deleteFromTable = async (table: any) => {
+        await table.where('student_id').equals(sidStr).delete();
+        if (isNum) await table.where('student_id').equals(sidNum).delete();
+      };
 
-    await deleteFromTable(db.class_students);
-    await deleteFromTable(db.student_sessions);
-    await deleteFromTable(db.warnings);
-    await deleteFromTable(db.knowledge_results);
-    await deleteFromTable(db.ai_diagnoses);
-  });
+      await deleteFromTable(db.class_students);
+      await deleteFromTable(db.student_sessions);
+      await deleteFromTable(db.warnings);
+      await deleteFromTable(db.knowledge_results);
+      await deleteFromTable(db.ai_diagnoses);
+    }
+  );
 }
 
 export async function cleanDuplicateStudentSessions() {
   try {
-    const allStudSessions = await db.student_sessions.toArray();
-    const groups = new Map<string, StudentSession[]>();
-
-    allStudSessions.forEach((ss) => {
-      const key = `${String(ss.student_id)}_${String(ss.session_id)}`;
-      if (!groups.has(key)) {
-        groups.set(key, []);
-      }
-      groups.get(key)!.push(ss);
-    });
-
-    const idsToDelete: (string | number)[] = [];
-
-    groups.forEach((records) => {
-      if (records.length > 1) {
-        records.sort((a, b) => {
-          const timeA = a.updated_at ? new Date(a.updated_at).getTime() : 0;
-          const timeB = b.updated_at ? new Date(b.updated_at).getTime() : 0;
-          return timeB - timeA;
-        });
-        for (let i = 1; i < records.length; i++) {
-          if (records[i].id !== undefined) {
-            idsToDelete.push(records[i].id!);
-          }
-        }
-      }
-    });
-
-    if (idsToDelete.length > 0) {
-      console.log(`[Clean Data] Deleting ${idsToDelete.length} duplicate student_session records...`);
-      await db.student_sessions.bulkDelete(idsToDelete as any);
-    }
+    await kaizenDeduplicateAndMerge();
   } catch (err) {
-    console.warn('[Clean Data] Error cleaning duplicate student sessions:', err);
+    console.warn('[Clean Data] Error running Kaizen deduplication:', err);
   }
 }
 
@@ -179,7 +185,8 @@ export async function initializeDefaultSystemData() {
     const now = new Date().toISOString();
 
     if (yearsCount === 0) {
-      await db.school_years.add({
+      await db.school_years.put({
+        id: 'sy_2025_2026',
         name: '2025-2026',
         is_active: true,
         created_at: now,
@@ -200,12 +207,13 @@ export async function initializeDefaultSystemData() {
         enablePraiseAttendanceHw: true,
       };
 
-      await db.settings.add({
+      await db.settings.put({
+        id: 'system_settings',
         warning_rule_config: baseConfig,
         class_profile_configs: {
           standard: { ...baseConfig },
           specialized: { ...baseConfig, minTestScore: 7.0, minHomeworkScore: 7.0 },
-          remedial: { ...baseConfig, minTestScore: 4.0, minHomeworkScore: 4.0 }
+          remedial: { ...baseConfig, minTestScore: 4.0, minHomeworkScore: 4.0 },
         },
         pronoun_config: {
           teacher_title: 'Thầy/Cô',
@@ -216,12 +224,12 @@ export async function initializeDefaultSystemData() {
         updated_at: now,
       });
     }
-
-    // Always run deduplication on init to maintain clean database state
-    await cleanDuplicateStudentSessions();
   } finally {
     setRemoteSyncing(false);
   }
+
+  // Always run Kaizen deduplication on init to merge any legacy duplicate IDs
+  await cleanDuplicateStudentSessions();
 }
 
 export async function seedDemoData() {
@@ -251,7 +259,8 @@ export async function seedDemoData() {
   const now = new Date().toISOString();
 
   // 1. School Year
-  const syId = await db.school_years.add({
+  const syId = await db.school_years.put({
+    id: 'sy_2025_2026',
     name: '2025-2026',
     is_active: true,
     is_demo: true,
@@ -365,7 +374,8 @@ export async function seedDemoData() {
     studentIds.push(id);
 
     // Assign to Class 1 (9A1)
-    await db.class_students.add({
+    await db.class_students.put({
+      id: `cs_${class1Id}_${id}`,
       class_id: class1Id,
       student_id: id,
       join_date: '2025-06-01',
@@ -534,7 +544,8 @@ export async function seedDemoData() {
         comments.push('Thái độ học tập ngoan, tiếp thu bài tốt');
       }
 
-      await db.student_sessions.add({
+      await db.student_sessions.put({
+        id: `ss_${sessId}_${stId}`,
         student_id: stId,
         session_id: sessId,
         attendance: attendance,
@@ -634,7 +645,8 @@ export async function seedDemoData() {
       enablePraiseAttendanceHw: true,
     };
 
-    await db.settings.add({
+    await db.settings.put({
+      id: 'system_settings',
       warning_rule_config: baseConfig,
       class_profile_configs: {
         standard: { ...baseConfig },

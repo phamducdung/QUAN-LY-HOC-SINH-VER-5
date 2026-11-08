@@ -7,6 +7,9 @@ interface AttendanceSessionInfo {
   test_score: number;
   session_date: string;
   lesson_title: string;
+  exempt?: boolean;
+  exempt_homework?: boolean;
+  exempt_test?: boolean;
 }
 
 interface CompiledStudent {
@@ -175,9 +178,9 @@ export const PrintableCycleReport: React.FC<PrintableCycleReportProps> = ({
           <tbody>
             <tr>
               <td className="p-2 border border-black font-bold font-mono">{compiledStudents.length} HS</td>
-              <td className="p-2 border border-black font-bold font-mono text-emerald-800">{classMetrics.avgAttendance}%</td>
-              <td className="p-2 border border-black font-bold font-mono text-emerald-700">{classMetrics.avgHomework}đ / 10đ</td>
-              <td className="p-2 border border-black font-bold font-mono text-sky-700">{classMetrics.avgTest}đ / 10đ</td>
+              <td className="p-2 border border-black font-bold font-mono text-emerald-800">{Number.isFinite(classMetrics.avgAttendance) ? classMetrics.avgAttendance : 0}%</td>
+              <td className="p-2 border border-black font-bold font-mono text-emerald-700">{Number.isFinite(classMetrics.avgHomework) ? classMetrics.avgHomework : 0}đ / 10đ</td>
+              <td className="p-2 border border-black font-bold font-mono text-sky-700">{Number.isFinite(classMetrics.avgTest) ? classMetrics.avgTest : 0}đ / 10đ</td>
               <td className="p-2 border border-black font-bold font-mono text-red-600">{classMetrics.totalP1} học sinh</td>
               <td className="p-2 border border-black font-bold font-mono text-amber-600">{classMetrics.totalP2} học sinh</td>
               <td className="p-2 border border-black font-bold font-mono text-green-600">{classMetrics.totalPraise} học sinh</td>
@@ -242,7 +245,7 @@ export const PrintableCycleReport: React.FC<PrintableCycleReportProps> = ({
                               <span className="text-[10px] block">{symbol}</span>
                               <span className="text-[8px] font-bold font-mono text-slate-600 block">{label}</span>
                               <span className="text-[7.5px] font-mono text-slate-500 block">
-                                B:{(att.exempt || att.exempt_homework) ? 'Miễn' : att.homework_score !== undefined && att.homework_score !== null ? att.homework_score : '-'} / K:{(att.exempt || att.exempt_test) ? 'Miễn' : att.test_score !== undefined && att.test_score !== null ? att.test_score : 'Chờ'}
+                                B:{(att.exempt || att.exempt_homework) ? 'Miễn' : (typeof att.homework_score === 'number' && !Number.isNaN(att.homework_score)) ? att.homework_score : '-'} / K:{(att.exempt || att.exempt_test) ? 'Miễn' : (typeof att.test_score === 'number' && !Number.isNaN(att.test_score)) ? att.test_score : 'Chờ'}
                               </span>
                             </div>
                           );
@@ -250,10 +253,10 @@ export const PrintableCycleReport: React.FC<PrintableCycleReportProps> = ({
                       </div>
                     </td>
                     <td className="p-2 border border-black text-center font-bold font-mono text-emerald-700">
-                      {typeof st.hwAvg === 'number' && st.hwAvg >= 0 ? `${st.hwAvg}đ` : '-'}
+                      {typeof st.hwAvg === 'number' && !Number.isNaN(st.hwAvg) && st.hwAvg >= 0 ? `${st.hwAvg}đ` : '-'}
                     </td>
                     <td className="p-2 border border-black text-center font-bold font-mono text-sky-700">
-                      {typeof st.testAvg === 'number' && st.testAvg >= 0 ? `${st.testAvg}đ` : '-'}
+                      {typeof st.testAvg === 'number' && !Number.isNaN(st.testAvg) && st.testAvg >= 0 ? `${st.testAvg}đ` : '-'}
                     </td>
                     <td className="p-2 border border-black">
                       <div className="space-y-0.5">

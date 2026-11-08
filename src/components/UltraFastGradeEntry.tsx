@@ -17,6 +17,8 @@ import { ClassItem, Session, Student, StudentSession, AttendanceStatus, Knowledg
 import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { logAudit } from '../utils/auditLogger';
+import { computeGradeDiffs, logDetailedGradeAudit } from '../utils/gradeHistoryLogger';
+import { SessionHistoryModal } from './audit/SessionHistoryModal';
 import { exportSessionReportPDF } from '../utils/pdfGenerator';
 import { recalculateKnowledgeResultsForClass } from '../utils/knowledgeEngine';
 import { runWarningScanForClass } from '../utils/warningEngine';
@@ -60,6 +62,7 @@ import {
   AlertCircle,
   RefreshCw,
   Clock,
+  History,
   Zap,
   Loader2,
   Wand2,
@@ -257,7 +260,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   }, [liveWarnings]);
 
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [selectedSessionId, setSelectedSessionId] = useState<number | undefined>(undefined);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | number | undefined>(undefined);
   const [students, setStudents] = useState<Student[]>([]);
   const [studentSessions, setStudentSessions] = useState<Record<string, StudentSession>>({});
   const initialStudentSessionsRef = useRef<Record<string, StudentSession>>({});
@@ -626,7 +629,10 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   const [currentKnowledgeTag, setCurrentKnowledgeTag] = useState<string>('');
 
   // Selected Student for Radar Chart in Knowledge Map
-  const [selectedRadarStudentId, setSelectedRadarStudentId] = useState<number | 'class_avg'>('class_avg');
+  const [selectedRadarStudentId, setSelectedRadarStudentId] = useState<string | number | 'class_avg'>('class_avg');
+
+  // History & Audit Rollback Modal
+  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
 
   // Add Session Modal
   const [isAddSessionOpen, setIsAddSessionOpen] = useState(false);
@@ -653,7 +659,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   const [editHasTest, setEditHasTest] = useState(true);
 
   // Helper renderer for Test Knowledge Tag options (combining Same, Past Sessions, and Standard Tags)
-  const renderTestKnowledgeTagOptions = (selectedValue?: string, excludeSessionId?: number) => {
+  const renderTestKnowledgeTagOptions = (selectedValue?: string, excludeSessionId?: string | number) => {
     const pastSessions = (liveSessions || [])
       .filter((s) => !excludeSessionId || String(s.id) !== String(excludeSessionId))
       .sort((a, b) => b.session_date.localeCompare(a.session_date));
@@ -808,8 +814,8 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
           recordMap[st.id!] = { ...found, custom_comment: comment };
         } else {
           recordMap[st.id!] = {
-            student_id: st.id!,
-            session_id: selectedSessionId,
+            student_id: String(st.id!),
+            session_id: String(selectedSessionId || ''),
             attendance: 'present',
             homework_score: undefined as any,
             test_score: undefined as any,
@@ -906,9 +912,9 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     const stIdStr = String(studentId);
 
     setPrevStudentSessions((prev) => {
-      const current = prev[stIdStr] || {
-        student_id: studentId,
-        session_id: previousSession.id,
+      const current: StudentSession = prev[stIdStr] || {
+        student_id: stIdStr,
+        session_id: String(previousSession.id),
         attendance: 'present',
         homework_score: undefined as any,
         test_score: undefined as any,
@@ -921,40 +927,22 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         updated_at: new Date().toISOString(),
       };
 
-      const updated = {
+      const updated: StudentSession = {
         ...current,
         [field]: value,
         updated_at: new Date().toISOString(),
       };
 
-      // Auto-save to Dexie & Firestore in background
+      // Auto-save to Dexie & Outbox Queue in background using deterministic ID
       (async () => {
         try {
-          const existing = await db.student_sessions
-            .where('session_id')
-            .equals(previousSession.id)
-            .toArray();
-          const found = existing.find((x) => String(x.student_id) === stIdStr);
-          let finalId = found?.id;
-          if (found?.id) {
-            await db.student_sessions.update(found.id, updated);
-          } else {
-            finalId = `ss_${previousSession.id}_${studentId}_${Date.now()}`;
-            await db.student_sessions.add({
-              ...updated,
-              id: finalId,
-              student_id: studentId,
-              session_id: previousSession.id,
-            });
-          }
-
-          // Realtime multi-device cloud sync
-          pushBatchDocsToFirestore('student_sessions', [{
+          const canonicalId = `ss_${String(previousSession.id)}_${stIdStr}`;
+          await db.student_sessions.put({
             ...updated,
-            id: finalId || found?.id,
-            student_id: studentId,
-            session_id: previousSession.id,
-          }]);
+            id: canonicalId,
+            student_id: stIdStr,
+            session_id: String(previousSession.id),
+          });
         } catch (err) {
           console.error('Auto-save prevStudentSession error:', err);
         }
@@ -1072,14 +1060,15 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   };
 
   const handleUpdateStudentSession = useCallback((
-    studentId: number,
+    studentId: string | number,
     field: keyof StudentSession,
     value: any
   ) => {
+    const stIdStr = String(studentId);
     setStudentSessions((prev) => {
-      const current = prev[studentId] || {
-        student_id: studentId,
-        session_id: selectedSessionId!,
+      const current: StudentSession = prev[stIdStr] || {
+        student_id: stIdStr,
+        session_id: String(selectedSessionId || ''),
         attendance: 'present',
         homework_score: undefined as any,
         test_score: undefined as any,
@@ -1087,12 +1076,14 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         late_submit: false,
         makeup_test: false,
         exempt: false,
+        exempt_homework: false,
+        exempt_test: false,
         quick_preset_comments: [],
         custom_comment: ensurePresentCommentFormat('', false, false),
         updated_at: new Date().toISOString(),
       };
 
-      const updated = {
+      const updated: StudentSession = {
         ...current,
         [field]: value,
       };
@@ -1155,7 +1146,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   }, [selectedSessionId]);
 
   // 1-Click Preset Comment Appender
-  const handleTogglePresetComment = useCallback((studentId: number, presetText: string) => {
+  const handleTogglePresetComment = useCallback((studentId: string | number, presetText: string) => {
     setStudentSessions((prev) => {
       const current = prev[studentId];
       if (!current) return prev;
@@ -1295,18 +1286,9 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       const docsToBulkPut: any[] = [];
 
       for (const rec of recordsToSave) {
-        let finalId = rec.id;
-
-        if (!finalId) {
-          const existing = existingMap.get(String(rec.student_id));
-          if (existing) {
-            finalId = existing.id;
-          }
-        }
-
-        if (!finalId) {
-          finalId = `ss_${rec.session_id}_${rec.student_id}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-        }
+        const canonicalId = `ss_${String(rec.session_id)}_${String(rec.student_id)}`;
+        const existing = existingMap.get(String(rec.student_id));
+        const finalId = existing?.id || rec.id || canonicalId;
 
         const payload = {
           ...rec,
@@ -1329,16 +1311,9 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         const existingPrevMap = new Map(existingPrevDbSessions.map((s) => [String(s.student_id), s]));
 
         for (const pRec of prevRecordsToSave) {
-          let finalId = pRec.id;
-          if (!finalId) {
-            const existing = existingPrevMap.get(String(pRec.student_id));
-            if (existing) {
-              finalId = existing.id;
-            }
-          }
-          if (!finalId) {
-            finalId = `ss_${pRec.session_id}_${pRec.student_id}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-          }
+          const canonicalId = `ss_${String(pRec.session_id)}_${String(pRec.student_id)}`;
+          const existing = existingPrevMap.get(String(pRec.student_id));
+          const finalId = existing?.id || pRec.id || canonicalId;
 
           const payload = {
             ...pRec,
@@ -1353,12 +1328,23 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         }
       }
 
-      // Bulk update IndexedDB
+      // Bulk update IndexedDB and flush Dirty-Diff Outbox once
       if (docsToBulkPut.length > 0) {
         await db.student_sessions.bulkPut(docsToBulkPut);
-        // Explicitly sync batch to Firestore for multi-device realtime visibility
         await pushBatchDocsToFirestore('student_sessions', docsToBulkPut);
       }
+
+      // Compute detailed grade diffs and snapshot before updating initial ref
+      const currentDiffs = computeGradeDiffs(
+        initialStudentSessionsRef.current,
+        updatedSessions,
+        students
+      );
+      const prevDiffs = previousSession?.id
+        ? computeGradeDiffs(initialPrevStudentSessionsRef.current, updatedPrevSessions, students)
+        : [];
+      const allDiffs = [...currentDiffs, ...prevDiffs];
+      const snapshotRecordsToSave = Object.values(initialStudentSessionsRef.current) as StudentSession[];
 
       setStudentSessions(updatedSessions);
       initialStudentSessionsRef.current = JSON.parse(JSON.stringify(updatedSessions));
@@ -1378,11 +1364,23 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       Promise.all([
         (async () => {
           const selectedSess = sessions.find((s) => s.id === selectedSessionId);
-          await logAudit(
-            'TA',
-            'Nhập điểm tốc độ cao',
-            `Lưu bảng điểm cho buổi học "${selectedSess?.lesson_title || selectedSessionId}" (Lớp ${currentClass.class_name}) - Cập nhật ${dirtyRecords.length + dirtyPrevRecords.length} học sinh`
-          );
+          if (allDiffs.length > 0) {
+            await logDetailedGradeAudit({
+              userRole: 'Teacher',
+              sessionId: selectedSessionId,
+              classId: currentClass.id,
+              className: currentClass.class_name,
+              sessionTitle: selectedSess?.lesson_title,
+              diffs: allDiffs,
+              snapshotRecords: snapshotRecordsToSave,
+            });
+          } else {
+            await logAudit(
+              'Teacher',
+              'Lưu bảng điểm',
+              `Lưu bảng điểm cho buổi học "${selectedSess?.lesson_title || selectedSessionId}" (Lớp ${currentClass.class_name}) - Không có điểm nào thay đổi`
+            );
+          }
         })(),
         recalculateKnowledgeResultsForClass(currentClass.id),
         runWarningScanForClass(String(currentClass.id)),
@@ -1505,17 +1503,19 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     const now = new Date().toISOString();
     const fullLessonTitle = `${editKnowledgeTag} - ${editLessonTitle}`;
 
-    await db.sessions.update(selectedSessionId, {
-      session_date: editSessionDate,
-      lesson_title: fullLessonTitle,
-      chapter: '',
-      knowledge_tag_id: matchedTag ? matchedTag.id : undefined,
-      homework_description: editHwDesc,
-      test_knowledge_tag: editTestKnowledgeTag,
-      has_homework: editHasHomework,
-      has_test: editHasTest,
-      updated_at: now,
-    });
+    if (selectedSessionId) {
+      await db.sessions.update(selectedSessionId as any, {
+        session_date: editSessionDate,
+        lesson_title: fullLessonTitle,
+        chapter: '',
+        knowledge_tag_id: matchedTag ? matchedTag.id : undefined,
+        homework_description: editHwDesc,
+        test_knowledge_tag: editTestKnowledgeTag,
+        has_homework: editHasHomework,
+        has_test: editHasTest,
+        updated_at: now,
+      });
+    }
 
     await logAudit(
       'Teacher',
@@ -1610,7 +1610,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       setIsGeneratingBatchAi(true);
 
       const studentsPayload = students.map((st) => {
-        const rec = studentSessions[st.id!] || {
+        const rec: Partial<StudentSession> = studentSessions[st.id!] || {
           attendance: 'present',
           homework_submitted: true,
         };
@@ -1738,7 +1738,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     if (!currentClass || !selectedSess) return;
 
     const exportData = students.map((st, idx) => {
-      const rec = studentSessions[st.id!] || {};
+      const rec: Partial<StudentSession> = studentSessions[st.id!] || {};
       let attText = 'Có mặt';
       if (rec.attendance === 'absent_excused') attText = 'Vắng (Có phép)';
       else if (rec.attendance === 'absent_unexcused') attText = 'Vắng (KHÔNG PHÉP)';
@@ -1825,7 +1825,17 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
           </div>
 
           {/* Action Buttons */}
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => setIsHistoryModalOpen(true)}
+              disabled={!selectedSessionId}
+              className="px-3 py-2 bg-purple-50 text-purple-700 dark:bg-purple-950/60 dark:text-purple-300 border border-purple-200 dark:border-purple-800 rounded-xl text-xs font-bold hover:bg-purple-100 transition-all flex items-center gap-1.5 shadow-xs disabled:opacity-50"
+              title="Xem nhật ký sửa điểm và khôi phục bảng điểm buổi học này"
+            >
+              <History className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+              <span>Lịch Sử Sửa Điểm</span>
+            </button>
+
             <button
               onClick={() => setIsPrintModalOpen(true)}
               disabled={!selectedSessionId}
@@ -2002,9 +2012,17 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                 <div className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">Nộp BTVN</div>
                 <div className="text-base font-black text-slate-900 dark:text-slate-100 mt-0.5">
                   {selectedSession?.has_homework !== false ? (
-                    `${sessionStats.hwDone} (${sessionStats.hwPct}%)`
+                    <div>
+                      <span>{sessionStats.hwDone}/{sessionStats.hwRequiredCount || sessionStats.present}</span>
+                      <span className="text-xs font-bold text-sky-600 dark:text-sky-400 ml-1.5">({sessionStats.hwPct}%)</span>
+                      {sessionStats.unsubmittedHwCount > 0 && (
+                        <span className="text-[10px] font-bold text-rose-600 dark:text-rose-400 block mt-0.5" title="Học sinh chưa nộp bài hoặc vắng không phép (tính 0đ)">
+                          ❌ Chưa nộp: {sessionStats.unsubmittedHwCount}
+                        </span>
+                      )}
+                    </div>
                   ) : (
-                    ''
+                    <span className="text-xs font-semibold text-slate-400">Không có BTVN</span>
                   )}
                 </div>
               </div>
@@ -2018,9 +2036,14 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                 <div className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">Điểm TB BTVN</div>
                 <div className="text-base font-black text-slate-900 dark:text-slate-100 mt-0.5">
                   {selectedSession?.has_homework !== false ? (
-                    <span>{sessionStats.avgHw} <span className="text-xs font-bold text-slate-400">/ 10</span></span>
+                    <div>
+                      <span>{sessionStats.avgHw} <span className="text-xs font-bold text-slate-400">/ 10</span></span>
+                      <span className="text-[10px] font-medium text-slate-400 block mt-0.5">
+                        Tính trên {sessionStats.hwCount} bài ({sessionStats.unsubmittedHwCount > 0 ? `${sessionStats.unsubmittedHwCount} bài 0đ` : 'đầy đủ'})
+                      </span>
+                    </div>
                   ) : (
-                    ''
+                    <span className="text-xs font-semibold text-slate-400">Không có BTVN</span>
                   )}
                 </div>
               </div>
@@ -2035,15 +2058,19 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                 <div className="text-base font-black text-slate-900 dark:text-slate-100 mt-0.5">
                   {selectedSession?.has_test !== false ? (
                     <div>
-                      <span>{sessionStats.avgTest > 0 ? sessionStats.avgTest : '-'} <span className="text-xs font-bold text-slate-400">/ 10</span></span>
-                      {sessionStats.pendingTestCount > 0 && (
+                      <span>{sessionStats.testCount > 0 ? sessionStats.avgTest : '-'} <span className="text-xs font-bold text-slate-400">/ 10</span></span>
+                      {sessionStats.pendingTestCount > 0 ? (
                         <span className="text-[10px] font-bold text-purple-600 dark:text-purple-400 block mt-0.5">
                           ⏳ Chờ chấm {sessionStats.pendingTestCount} bài
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-medium text-slate-400 block mt-0.5">
+                          Tính trên {sessionStats.testCount} bài
                         </span>
                       )}
                     </div>
                   ) : (
-                    ''
+                    <span className="text-xs font-semibold text-slate-400">Không có KT</span>
                   )}
                 </div>
               </div>
@@ -2457,9 +2484,9 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                     </tr>
                   ) : (
                     filteredStudents.map((st, rowIndex) => {
-                      const rec = studentSessions[st.id!] || {
-                        student_id: st.id!,
-                        session_id: selectedSessionId!,
+                      const rec: Partial<StudentSession> = studentSessions[st.id!] || {
+                        student_id: String(st.id!),
+                        session_id: String(selectedSessionId || ''),
                         attendance: 'present',
                         homework_score: undefined as any,
                         test_score: undefined as any,
@@ -3111,7 +3138,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                   </thead>
                   <tbody className="divide-y divide-slate-200">
                     {students.map((student, idx) => {
-                      const rec = studentSessions[student.id!] || {};
+                      const rec: Partial<StudentSession> = studentSessions[student.id!] || {};
                       const isAttended = !rec.attendance || rec.attendance === 'present' || rec.attendance === 'late';
                       let attLabel = 'Có mặt';
                       let attBadgeClass = 'bg-emerald-100 text-emerald-800 font-bold';
@@ -3348,6 +3375,19 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
           </div>
         </div>
       )}
+
+      {/* SESSION HISTORY & AUDIT ROLLBACK MODAL */}
+      <SessionHistoryModal
+        isOpen={isHistoryModalOpen}
+        onClose={() => setIsHistoryModalOpen(false)}
+        sessionId={selectedSessionId}
+        sessionTitle={selectedSession?.lesson_title}
+        classId={currentClass?.id}
+        classNameTitle={currentClass?.class_name}
+        onRollbackComplete={() => {
+          onRefreshData();
+        }}
+      />
     </div>
   );
 };

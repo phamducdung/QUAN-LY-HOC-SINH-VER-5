@@ -1,20 +1,23 @@
 import React, { useState, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { AuditLog, Student, UserRole } from '../types';
+import { AuditLog, Student } from '../types';
 import { db } from '../db/dexie';
 import { logAudit } from '../utils/auditLogger';
+import { rollbackSessionSnapshot } from '../utils/gradeHistoryLogger';
 import { sortStudentsByName } from '../utils/sortUtils';
 import {
   FileSpreadsheet,
   Download,
-  Database,
   History,
   CheckCircle2,
+  AlertCircle,
   Search,
-  Trash2,
   RefreshCw,
-  PlusCircle,
-  X,
+  RotateCcw,
+  Clock,
+  ArrowRight,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
 interface AuditAndReportsProps {
@@ -24,17 +27,10 @@ interface AuditAndReportsProps {
 
 export const AuditAndReports: React.FC<AuditAndReportsProps> = ({ students, onRefresh }) => {
   const [logs, setLogs] = useState<AuditLog[]>([]);
-  const [statusMsg, setStatusMsg] = useState<string | null>(null);
-
-  // Filters
-  const [roleFilter, setRoleFilter] = useState<'All' | 'Teacher' | 'TA'>('All');
+  const [statusMsg, setStatusMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-
-  // Custom Log Modal
-  const [isAddLogOpen, setIsAddLogOpen] = useState(false);
-  const [customRole, setCustomRole] = useState<UserRole>('Teacher');
-  const [customAction, setCustomAction] = useState('Ghi chú thủ công');
-  const [customDesc, setCustomDesc] = useState('');
+  const [expandedLogIds, setExpandedLogIds] = useState<Record<string, boolean>>({});
+  const [isRollbacking, setIsRollbacking] = useState(false);
 
   const fetchLogs = async () => {
     const res = await db.audit_logs.orderBy('timestamp').reverse().toArray();
@@ -45,14 +41,53 @@ export const AuditAndReports: React.FC<AuditAndReportsProps> = ({ students, onRe
     fetchLogs();
   }, []);
 
+  const toggleExpand = (id: string) => {
+    setExpandedLogIds((prev) => ({
+      ...prev,
+      [id]: !prev[id],
+    }));
+  };
+
+  const handleRollbackSnapshot = async (log: AuditLog) => {
+    if (!log.id || !log.snapshot) return;
+
+    const timeStr = new Date(log.timestamp).toLocaleString('vi-VN');
+    const confirmMsg = `Bạn có chắc chắn muốn KHÔI PHỤC toàn bộ bảng điểm buổi học này về bản snapshot trước phiên lưu lúc ${timeStr} không?\n\nThao tác sẽ hoàn tác điểm số của học sinh và đồng bộ ngay lên Cloud.`;
+
+    if (!window.confirm(confirmMsg)) return;
+
+    try {
+      setIsRollbacking(true);
+      const res = await rollbackSessionSnapshot(log.id, 'Teacher');
+      if (res.success) {
+        setStatusMsg({ text: res.message, type: 'success' });
+        await fetchLogs();
+        onRefresh();
+      } else {
+        setStatusMsg({ text: res.message, type: 'error' });
+      }
+    } catch (err: any) {
+      setStatusMsg({ text: `Lỗi khôi phục: ${err.message}`, type: 'error' });
+    } finally {
+      setIsRollbacking(false);
+      setTimeout(() => setStatusMsg(null), 4000);
+    }
+  };
+
   const filteredLogs = logs.filter((log) => {
-    if (roleFilter !== 'All' && log.user_role !== roleFilter) return false;
     if (searchTerm.trim() !== '') {
       const query = searchTerm.toLowerCase();
-      return (
-        log.action_type.toLowerCase().includes(query) ||
-        log.description.toLowerCase().includes(query)
+      const matchAction = (log.action_type || '').toLowerCase().includes(query);
+      const matchDesc = (log.description || '').toLowerCase().includes(query);
+      const matchRole = (log.user_role || '').toLowerCase().includes(query);
+      const matchDiffStudent = (log.diffs || []).some(
+        (d) =>
+          d.student_name.toLowerCase().includes(query) ||
+          d.field_label.toLowerCase().includes(query) ||
+          (d.new_display || '').toLowerCase().includes(query) ||
+          (d.old_display || '').toLowerCase().includes(query)
       );
+      return matchAction || matchDesc || matchRole || matchDiffStudent;
     }
     return true;
   });
@@ -63,8 +98,8 @@ export const AuditAndReports: React.FC<AuditAndReportsProps> = ({ students, onRe
       'STT': idx + 1,
       'Họ và tên': s.full_name,
       'Giới tính': s.gender,
-      'Phụ huynh': s.parent_name,
-      'SĐT Phụ huynh': s.parent_phone,
+      'Phụ huynh': s.parent_name || '',
+      'SĐT Phụ huynh': s.parent_phone || '',
       'Trạng thái': s.status === 'studying' ? 'Đang học' : s.status === 'paused' ? 'Tạm nghỉ' : 'Nghỉ hẳn',
       'Ghi chú': s.note || '',
     }));
@@ -77,57 +112,8 @@ export const AuditAndReports: React.FC<AuditAndReportsProps> = ({ students, onRe
     await logAudit('Teacher', 'Xuất Excel', 'Xuất tệp Excel danh sách toàn bộ học sinh');
     fetchLogs();
 
-    setStatusMsg('Xuất thành công tệp Excel Danh sách học sinh!');
+    setStatusMsg({ text: 'Xuất thành công tệp Excel Danh sách học sinh!', type: 'success' });
     setTimeout(() => setStatusMsg(null), 3000);
-  };
-
-  // Full Database JSON Backup
-  const handleExportJsonBackup = async () => {
-    const backupData = {
-      school_years: await db.school_years.toArray(),
-      classes: await db.classes.toArray(),
-      students: await db.students.toArray(),
-      class_students: await db.class_students.toArray(),
-      sessions: await db.sessions.toArray(),
-      student_sessions: await db.student_sessions.toArray(),
-      knowledge_tags: await db.knowledge_tags.toArray(),
-      warnings: await db.warnings.toArray(),
-      audit_logs: await db.audit_logs.toArray(),
-      settings: await db.settings.toArray(),
-      exported_at: new Date().toISOString(),
-    };
-
-    const jsonString = JSON.stringify(backupData, null, 2);
-    const blob = new Blob([jsonString], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `SmartEdu_Backup_${new Date().toISOString().split('T')[0]}.json`;
-    a.click();
-
-    await logAudit('Teacher', 'Sao lưu hệ thống', 'Tải bản sao lưu JSON toàn bộ cơ sở dữ liệu IndexedDB');
-    fetchLogs();
-
-    setStatusMsg('Đã tải xuống bản Sao lưu JSON thành công!');
-    setTimeout(() => setStatusMsg(null), 3000);
-  };
-
-  // Add Custom Log Entry
-  const handleCreateCustomLog = async () => {
-    if (!customDesc.trim()) return;
-    await logAudit(customRole, customAction, customDesc);
-    setCustomDesc('');
-    setIsAddLogOpen(false);
-    fetchLogs();
-  };
-
-  // Clear All Logs
-  const handleClearLogs = async () => {
-    if (window.confirm('Bạn có chắc chắn muốn xóa toàn bộ nhật ký Audit Log? Hành động này không thể hoàn tác.')) {
-      await db.audit_logs.clear();
-      await logAudit('Teacher', 'Xóa nhật ký', 'Đã dọn dẹp sạch nhật ký thao tác cũ');
-      fetchLogs();
-    }
   };
 
   return (
@@ -137,245 +123,205 @@ export const AuditAndReports: React.FC<AuditAndReportsProps> = ({ students, onRe
         <div>
           <h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
             <History className="w-5 h-5 text-emerald-600" />
-            <span>Nhật Ký Thao Tác (Audit Log) & Báo Cáo Hệ Thống</span>
+            <span>Nhật Ký Thao Tác (Audit Log) &amp; Lịch Sử Biến Động Điểm</span>
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Ghi nhận thời gian, tài khoản Giáo viên / Trợ giảng TA và lịch sử các thao tác (Thêm điểm, Xóa lớp, Giải quyết cảnh báo).
+            Lưu vết chi tiết người sửa, nội dung trước/sau khi sửa và hỗ trợ 1-click khôi phục bảng điểm về bản lưu cũ.
           </p>
         </div>
 
         <button
-          onClick={() => setIsAddLogOpen(true)}
-          className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-emerald-600/20 flex items-center gap-1.5 shrink-0"
+          onClick={fetchLogs}
+          className="px-3 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shrink-0"
+          title="Làm mới Nhật ký"
         >
-          <PlusCircle className="w-4 h-4" />
-          <span>Tạo Ghi Nhớ Thủ Công</span>
+          <RefreshCw className="w-3.5 h-3.5" />
+          <span>Làm Mới</span>
         </button>
       </div>
 
       {statusMsg && (
-        <div className="p-3 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-          <span>{statusMsg}</span>
+        <div
+          className={`p-3 border rounded-xl text-xs font-bold flex items-center gap-2 ${
+            statusMsg.type === 'success'
+              ? 'bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950 dark:text-emerald-200 dark:border-emerald-800'
+              : 'bg-rose-50 text-rose-800 border-rose-200 dark:bg-rose-950 dark:text-rose-200 dark:border-rose-800'
+          }`}
+        >
+          {statusMsg.type === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          ) : (
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+          )}
+          <span>{statusMsg.text}</span>
         </div>
       )}
 
-      {/* Action Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* Excel Export */}
-        <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-3">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-700 dark:bg-emerald-950/80 dark:text-emerald-300 flex items-center justify-center font-bold">
-              <FileSpreadsheet className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                Xuất Danh Sách Học Sinh Ra Excel
-              </h3>
-              <p className="text-xs text-slate-500">Định dạng .xlsx tiêu chuẩn cho nhà trường</p>
-            </div>
-          </div>
-
-          <button
-            onClick={handleExportRosterExcel}
-            className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-sm"
-          >
-            <Download className="w-4 h-4" />
-            <span>Xuất Tệp Excel Ngay</span>
-          </button>
+      {/* Action Card: Export */}
+      <div className="p-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-sm flex items-center justify-between">
+        <div>
+          <h4 className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+            <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+            <span>Xuất Danh Sách Học Sinh (Excel)</span>
+          </h4>
+          <p className="text-[11px] text-slate-500 mt-1">
+            Xuất tệp .xlsx chứa thông tin liên hệ và phụ huynh của toàn bộ {students.length} học sinh để in ấn, lưu trữ.
+          </p>
         </div>
-
-        {/* Database JSON Backup */}
-        <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-3">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-sky-100 text-sky-700 dark:bg-sky-950/80 dark:text-sky-300 flex items-center justify-center font-bold">
-              <Database className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                Sao Lưu Toàn Bộ Cơ Sở Dữ Liệu (JSON)
-              </h3>
-              <p className="text-xs text-slate-500">Bao gồm Lớp, Điểm số, Cảnh báo & Nhật ký</p>
-            </div>
-          </div>
-
-          <button
-            onClick={handleExportJsonBackup}
-            className="w-full py-2.5 bg-sky-600 hover:bg-sky-700 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-sm"
-          >
-            <Download className="w-4 h-4" />
-            <span>Tải Xuống Bản JSON Backup</span>
-          </button>
-        </div>
+        <button
+          onClick={handleExportRosterExcel}
+          className="px-3.5 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 transition-all flex items-center gap-1.5 shrink-0 ml-3 shadow-sm shadow-emerald-600/20"
+        >
+          <Download className="w-3.5 h-3.5" />
+          <span>Tải Excel</span>
+        </button>
       </div>
 
-      {/* Audit Log Table */}
-      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm p-5 space-y-4">
-        {/* Table Toolbar */}
-        <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center gap-2 w-full sm:w-auto">
-            <div className="relative flex-1 sm:w-64">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                placeholder="Tìm loại hành động, học sinh..."
-                className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl outline-none"
-              />
-            </div>
-
-            <select
-              value={roleFilter}
-              onChange={(e) => setRoleFilter(e.target.value as any)}
-              className="text-xs font-bold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-1.5 rounded-xl outline-none"
-            >
-              <option value="All">Tất cả Vai trò</option>
-              <option value="Teacher">Giáo viên chính</option>
-              <option value="TA">Trợ giảng (TA)</option>
-            </select>
+      {/* Main Audit Log Table Card */}
+      <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
+        {/* Search bar */}
+        <div className="flex items-center justify-between gap-3">
+          <div className="relative flex-1">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder="Tìm nhật ký nhanh theo tên học sinh, loại hành động, nội dung thay đổi..."
+              className="w-full pl-9 pr-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-medium"
+            />
           </div>
-
-          <div className="flex items-center gap-2">
+          {searchTerm && (
             <button
-              onClick={fetchLogs}
-              className="p-2 text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 bg-slate-100 dark:bg-slate-800 rounded-xl text-xs font-bold transition-all"
-              title="Làm mới Nhật ký"
+              onClick={() => setSearchTerm('')}
+              className="text-xs font-bold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
             >
-              <RefreshCw className="w-4 h-4" />
+              Xóa tìm
             </button>
-
-            <button
-              onClick={handleClearLogs}
-              className="px-3 py-1.5 bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded-xl text-xs font-bold transition-all hover:bg-rose-100 flex items-center gap-1"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Xóa Nhật Ký</span>
-            </button>
-          </div>
+          )}
         </div>
 
-        {/* Table Body */}
-        <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-xl">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="bg-slate-100 dark:bg-slate-800/80 text-slate-700 dark:text-slate-300 text-[11px] font-bold uppercase border-b border-slate-200 dark:border-slate-700">
-                <th className="p-3 w-40">Thời Gian</th>
-                <th className="p-3 w-32">Tài Khoản / Role</th>
-                <th className="p-3 w-44">Loại Hành Động</th>
-                <th className="p-3">Mô Tả Chi Tiết Hoạt Động</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
-              {filteredLogs.length === 0 ? (
-                <tr>
-                  <td colSpan={4} className="p-6 text-center text-slate-400">
-                    Chưa có nhật ký hoạt động nào phù hợp.
-                  </td>
-                </tr>
-              ) : (
-                filteredLogs.map((log) => (
-                  <tr key={log.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/40 transition-colors">
-                    <td className="p-3 text-slate-400 font-mono text-[11px]">
-                      {new Date(log.timestamp).toLocaleString('vi-VN')}
-                    </td>
-                    <td className="p-3 font-bold">
+        {/* Logs List & Visual Diffs (Scrollable Container) */}
+        <div className="space-y-3 max-h-[560px] overflow-y-auto pr-1.5 scrollbar-thin">
+          {filteredLogs.length === 0 ? (
+            <div className="py-12 text-center text-slate-400 space-y-2 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl">
+              <History className="w-10 h-10 mx-auto text-slate-300 dark:text-slate-600 stroke-[1.5]" />
+              <p className="text-xs font-semibold">Chưa có nhật ký hoạt động nào phù hợp.</p>
+            </div>
+          ) : (
+            filteredLogs.map((log) => {
+              const logId = log.id || `log_${log.timestamp}`;
+              const isExpanded = expandedLogIds[logId] ?? false;
+              const hasDiffs = log.diffs && log.diffs.length > 0;
+              const hasSnapshot = !!log.snapshot && Array.isArray(log.snapshot.records);
+
+              return (
+                <div
+                  key={logId}
+                  className={`rounded-xl border transition-all overflow-hidden ${
+                    log.is_rollback
+                      ? 'bg-amber-50/40 dark:bg-amber-950/20 border-amber-300 dark:border-amber-800'
+                      : 'bg-white dark:bg-slate-800/80 border-slate-200 dark:border-slate-700/80 shadow-xs'
+                  }`}
+                >
+                  {/* Log Header Row */}
+                  <div className="p-3.5 flex flex-wrap items-center justify-between gap-2.5 bg-slate-50/60 dark:bg-slate-800/60 border-b border-slate-100 dark:border-slate-700/50">
+                    <div className="flex items-center gap-2.5 flex-wrap">
                       <span
-                        className={`px-2 py-0.5 rounded text-[10px] ${
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider ${
                           log.user_role === 'Teacher'
-                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
-                            : 'bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300'
+                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-700'
+                            : 'bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300 border border-sky-300 dark:border-sky-700'
                         }`}
                       >
-                        {log.user_role === 'Teacher' ? 'Giáo viên chính' : 'Trợ giảng (TA)'}
+                        {log.user_role === 'Teacher' ? '👨‍🏫 Giáo viên' : '🧑‍💻 Trợ giảng'}
                       </span>
-                    </td>
-                    <td className="p-3 font-bold text-slate-800 dark:text-slate-200">
-                      {log.action_type}
-                    </td>
-                    <td className="p-3 text-slate-600 dark:text-slate-300 leading-relaxed">
-                      {log.description}
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+
+                      <span className="font-bold text-xs text-slate-800 dark:text-slate-200">
+                        {log.action_type}
+                      </span>
+
+                      <div className="flex items-center gap-1 text-[11px] text-slate-400 font-mono">
+                        <Clock className="w-3.5 h-3.5" />
+                        <span>{new Date(log.timestamp).toLocaleString('vi-VN')}</span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {hasSnapshot && (
+                        <button
+                          type="button"
+                          disabled={isRollbacking}
+                          onClick={() => handleRollbackSnapshot(log)}
+                          className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] transition-all flex items-center gap-1.5 shadow-xs shrink-0"
+                          title="Khôi phục toàn bộ bảng điểm về trạng thái trước phiên lưu này"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Khôi Phục Snapshot</span>
+                        </button>
+                      )}
+
+                      {hasDiffs && (
+                        <button
+                          type="button"
+                          onClick={() => toggleExpand(logId)}
+                          className="px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 text-xs font-bold flex items-center gap-1"
+                        >
+                          <span>{hasDiffs ? `${log.diffs!.length} thay đổi` : ''}</span>
+                          {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Log description */}
+                  <div className="px-3.5 py-2.5 text-xs text-slate-700 dark:text-slate-300 font-medium leading-relaxed">
+                    {log.description}
+                  </div>
+
+                  {/* Diffs List (Visual Diff) */}
+                  {hasDiffs && isExpanded && (
+                    <div className="px-3.5 pb-3.5 pt-1 space-y-2 border-t border-slate-100 dark:border-slate-700/50 bg-slate-50/30 dark:bg-slate-900/30">
+                      <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                        Chi tiết Before / After từng học sinh:
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                        {log.diffs!.map((diff, dIdx) => (
+                          <div
+                            key={`diff_${dIdx}`}
+                            className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs flex flex-col justify-between gap-1 shadow-xs"
+                          >
+                            <div className="min-w-0">
+                              <div className="font-bold text-slate-900 dark:text-slate-100 truncate">
+                                {diff.student_name}
+                              </div>
+                              <div className="text-[11px] text-slate-500 font-semibold mt-0.5">
+                                {diff.field_label}:
+                              </div>
+
+                              <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                                <span className="px-1.5 py-0.2 rounded bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 line-through text-[11px] font-bold">
+                                  {diff.old_display}
+                                </span>
+                                <ArrowRight className="w-3 h-3 text-slate-400 shrink-0" />
+                                <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 font-extrabold text-[11px]">
+                                  {diff.new_display}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
         </div>
       </div>
-
-      {/* CREATE MANUAL LOG MODAL */}
-      {isAddLogOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-md w-full p-6 border border-slate-200 dark:border-slate-800 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
-              <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                Thêm Ghi Nhớ Thủ Công Vào Nhật Ký
-              </h3>
-              <button onClick={() => setIsAddLogOpen(false)} className="p-1 text-slate-400 hover:text-slate-600">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  Tài Khoản Thực Hiện:
-                </label>
-                <select
-                  value={customRole}
-                  onChange={(e) => setCustomRole(e.target.value as UserRole)}
-                  className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none font-bold"
-                >
-                  <option value="Teacher">Giáo viên chính</option>
-                  <option value="TA">Trợ giảng (TA)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  Tên Hành Động:
-                </label>
-                <input
-                  type="text"
-                  value={customAction}
-                  onChange={(e) => setCustomAction(e.target.value)}
-                  placeholder="VD: Kiểm tra bài tập về nhà"
-                  className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  Mô Tả Chi Tiết Nội Dung:
-                </label>
-                <textarea
-                  rows={3}
-                  value={customDesc}
-                  onChange={(e) => setCustomDesc(e.target.value)}
-                  placeholder="VD: Đã hoàn tất kiểm tra vở bài tập và ghi nhận phản hồi từ phụ huynh..."
-                  className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none"
-                />
-              </div>
-
-              <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-2">
-                <button
-                  onClick={() => setIsAddLogOpen(false)}
-                  className="px-4 py-2 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded-xl font-bold"
-                >
-                  Hủy
-                </button>
-                <button
-                  onClick={handleCreateCustomLog}
-                  className="px-4 py-2 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700"
-                >
-                  Ghi Nhớ
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };
+

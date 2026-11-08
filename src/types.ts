@@ -157,11 +157,39 @@ export interface AIDiagnosis {
   created_at: string;
 }
 
+export interface GradeChangeDiff {
+  student_id: string | number;
+  student_name: string;
+  field: string;
+  field_label: string;
+  old_value: any;
+  new_value: any;
+  old_display: string;
+  new_display: string;
+}
+
+export interface SessionGradeSnapshot {
+  session_id: string | number;
+  class_id?: string | number;
+  session_date?: string;
+  lesson_title?: string;
+  records: StudentSession[];
+}
+
 export interface AuditLog {
   id?: string;
   user_role: UserRole;
   action_type: string;
   description: string;
+  session_id?: string | number;
+  class_id?: string | number;
+  class_name?: string;
+  student_id?: string | number;
+  student_name?: string;
+  diffs?: GradeChangeDiff[];
+  snapshot?: SessionGradeSnapshot;
+  is_rollback?: boolean;
+  rollback_of_log_id?: string;
   is_demo?: boolean;
   timestamp: string;
 }

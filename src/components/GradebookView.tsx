@@ -3,6 +3,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from '../db/dexie';
 import { Student, Session, StudentSession, ClassItem } from '../types';
 import { calculateStudentCycleGrades, formatScore } from '../lib/calculations';
+import { BatchReportModal } from './reports/BatchReportModal';
 import {
   FileSpreadsheet,
   Award,
@@ -15,6 +16,8 @@ import {
   HelpCircle as QuestionIcon,
   ChevronRight,
   Calculator,
+  Printer,
+  Download,
 } from 'lucide-react';
 
 interface GradebookViewProps {
@@ -31,8 +34,11 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
   studentSessions,
 }) => {
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
 
   const classStudents = useLiveQuery(() => db.class_students.toArray()) || [];
+  const knowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) || [];
+  const warnings = useLiveQuery(() => db.warnings.toArray()) || [];
 
   if (!currentClass) {
     return (
@@ -54,13 +60,13 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
   const selectedStudent = students.find((s) => s.id === selectedStudentId);
 
   // Class overall averages
-  const validHwAvgs = studentBreakdowns.map((b) => b.hwAverage).filter((v): v is number => v !== null);
+  const validHwAvgs = studentBreakdowns.map((b) => b.hwAverage).filter((v): v is number => typeof v === 'number' && !Number.isNaN(v) && v !== null);
   const classHwAvg = validHwAvgs.length > 0 ? (validHwAvgs.reduce((a, b) => a + b, 0) / validHwAvgs.length).toFixed(1) : '-';
 
-  const validTestAvgs = studentBreakdowns.map((b) => b.testAverage).filter((v): v is number => v !== null);
+  const validTestAvgs = studentBreakdowns.map((b) => b.testAverage).filter((v): v is number => typeof v === 'number' && !Number.isNaN(v) && v !== null);
   const classTestAvg = validTestAvgs.length > 0 ? (validTestAvgs.reduce((a, b) => a + b, 0) / validTestAvgs.length).toFixed(1) : '-';
 
-  const validWeightedAvgs = studentBreakdowns.map((b) => b.weightedAverage).filter((v): v is number => v !== null);
+  const validWeightedAvgs = studentBreakdowns.map((b) => b.weightedAverage).filter((v): v is number => typeof v === 'number' && !Number.isNaN(v) && v !== null);
   const classWeightedAvg = validWeightedAvgs.length > 0 ? (validWeightedAvgs.reduce((a, b) => a + b, 0) / validWeightedAvgs.length).toFixed(1) : '-';
 
   return (
@@ -113,14 +119,22 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
               Tự động bỏ qua bài miễn trừ/vắng có phép ra khỏi mẫu số. Vắng không phép tính 0 điểm.
             </p>
           </div>
-          <div className="flex items-center gap-3 text-[11px] font-bold">
-            <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/60 px-2 py-0.5 rounded-md border border-amber-200 dark:border-amber-800">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3 text-[11px] font-bold">
+            <button
+              onClick={() => setIsReportModalOpen(true)}
+              className="px-3.5 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl shadow-sm flex items-center gap-1.5 transition-all"
+              title="Xuất ma trận sổ điểm Excel cho lớp học"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              <span>📊 Xuất Ma Trận Excel</span>
+            </button>
+            <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/60 px-2 py-1 rounded-md border border-amber-200 dark:border-amber-800">
               🟡 Miễn trừ
             </span>
-            <span className="flex items-center gap-1 text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/60 px-2 py-0.5 rounded-md border border-rose-200 dark:border-rose-800">
+            <span className="flex items-center gap-1 text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/60 px-2 py-1 rounded-md border border-rose-200 dark:border-rose-800">
               🔴 Vắng KP (0Đ)
             </span>
-            <span className="flex items-center gap-1 text-sky-600 dark:text-sky-400 bg-sky-50 dark:bg-sky-950/60 px-2 py-0.5 rounded-md border border-sky-200 dark:border-sky-800">
+            <span className="flex items-center gap-1 text-sky-600 dark:text-sky-400 bg-sky-50 dark:bg-sky-950/60 px-2 py-1 rounded-md border border-sky-200 dark:border-sky-800">
               🔵 Thi bù
             </span>
           </div>
@@ -211,7 +225,7 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
                                     )}
                                     {detail.hwStatus === 'graded' && (
                                       <span className="font-semibold text-slate-700 dark:text-slate-300">
-                                        BT: <strong className="font-bold">{detail.hwScore}</strong>
+                                        BT: <strong className="font-bold">{typeof detail.hwScore === 'number' && !Number.isNaN(detail.hwScore) ? detail.hwScore : '-'}</strong>
                                       </span>
                                     )}
                                   </div>
@@ -237,12 +251,12 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
                                     )}
                                     {detail.testStatus === 'makeup_graded' && (
                                       <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-sky-50 text-sky-800 dark:bg-sky-950 dark:text-sky-200 border border-sky-200 dark:border-sky-800" title="Đã có điểm thi bù">
-                                        🔵 KT: <strong className="font-black">{detail.testScore}</strong>
+                                        🔵 KT: <strong className="font-black">{typeof detail.testScore === 'number' && !Number.isNaN(detail.testScore) ? detail.testScore : 'Chờ'}</strong>
                                       </span>
                                     )}
                                     {detail.testStatus === 'graded' && (
                                       <span className="font-semibold text-purple-700 dark:text-purple-300">
-                                        KT: <strong className="font-bold">{detail.testScore}</strong>
+                                        KT: <strong className="font-bold">{typeof detail.testScore === 'number' && !Number.isNaN(detail.testScore) ? detail.testScore : '-'}</strong>
                                       </span>
                                     )}
                                   </div>
@@ -360,6 +374,19 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* Batch Report & Excel Matrix Modal */}
+      <BatchReportModal
+        isOpen={isReportModalOpen}
+        onClose={() => setIsReportModalOpen(false)}
+        currentClass={currentClass}
+        sessions={sessions}
+        students={students}
+        studentSessions={studentSessions}
+        knowledgeTags={knowledgeTags}
+        warnings={warnings}
+        classStudents={classStudents}
+      />
     </div>
   );
 };
