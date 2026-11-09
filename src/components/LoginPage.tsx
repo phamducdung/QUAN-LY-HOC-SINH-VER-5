@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 
 export const LoginPage: React.FC = () => {
-  const { loginWithEmail } = useAuth();
+  const { loginWithEmail, loginWithGoogle } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -34,6 +34,19 @@ export const LoginPage: React.FC = () => {
     setEmail('trogiang@tct.com');
     setPassword('123456789');
     setErrorMsg(null);
+  };
+
+  const handleGoogleLogin = async () => {
+    setIsLoading(true);
+    setErrorMsg(null);
+    try {
+      await loginWithGoogle();
+    } catch (err: any) {
+      console.error('Google login error:', err);
+      setErrorMsg(err.message || 'Đăng nhập Google thất bại. Vui lòng thử lại hoặc dùng tài khoản Email.');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -175,14 +188,24 @@ export const LoginPage: React.FC = () => {
               {isLoading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Đang xác thực Firebase Auth...</span>
+                  <span>Đang xác thực tài khoản...</span>
                 </>
               ) : (
                 <>
-                  <span>Đăng Nhập Firebase Auth</span>
+                  <span>Đăng Nhập Hệ Thống</span>
                   <ArrowRight className="w-4 h-4" />
                 </>
               )}
+            </button>
+
+            <button
+              type="button"
+              disabled={isLoading}
+              onClick={handleGoogleLogin}
+              className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 border border-slate-700 hover:border-slate-500 text-slate-200 font-semibold text-xs rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+            >
+              <ShieldCheck className="w-4 h-4 text-emerald-400" />
+              <span>Đăng nhập nhanh bằng Google</span>
             </button>
           </form>
 

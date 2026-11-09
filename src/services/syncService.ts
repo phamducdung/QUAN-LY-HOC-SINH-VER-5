@@ -16,6 +16,8 @@ import {
   tryReconnectFirestore,
 } from '../firebase';
 import { db as dexieDb, setRemoteSyncing } from '../db/dexie';
+import { getActiveAuthToken } from '../lib/AuthContext';
+import { supabase } from '../lib/supabase';
 
 export interface SyncStatus {
   isOnline: boolean;
@@ -25,6 +27,8 @@ export interface SyncStatus {
   quotaExceeded?: boolean;
   pendingOutboxCount: number;
   lastKaizenSummary?: string | null;
+  supabaseConnected?: boolean;
+  supabaseNeedsSetup?: boolean;
 }
 
 export interface TombstoneRecord {
@@ -204,14 +208,32 @@ let currentSyncStatus: SyncStatus = {
   lastKaizenSummary: null,
 };
 
+let sqlBackendAvailable: boolean | null = null;
+let sqlPollTimer: ReturnType<typeof setInterval> | null = null;
+let supabaseReady: boolean | null = null;
+let supabaseNeedsSchemaSetup = false;
+
+export function getSupabaseSyncState() {
+  return {
+    supabaseReady,
+    supabaseNeedsSchemaSetup,
+  };
+}
+
 subscribeQuotaStatus((exceeded) => {
   updateSyncStatus({
-    quotaExceeded: exceeded,
+    quotaExceeded:
+      supabaseReady === true || sqlBackendAvailable === true ? false : exceeded,
     isSyncing: false,
     pendingOutboxCount: outboxMap.size,
   });
   if (exceeded) {
-    stopRealtimeSync();
+    unsubscribers.forEach((unsub) => {
+      try {
+        unsub();
+      } catch (e) {}
+    });
+    unsubscribers = [];
   }
 });
 
@@ -372,7 +394,14 @@ export function enqueueSyncOperation(
   persistOutbox();
   updateSyncStatus({ pendingOutboxCount: outboxMap.size });
 
-  if (getIsQuotaExceeded() || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return;
+  }
+  if (
+    supabaseReady === false &&
+    sqlBackendAvailable === false &&
+    getIsQuotaExceeded()
+  ) {
     return;
   }
 
@@ -414,7 +443,6 @@ function withFirestoreTimeout<T>(
 
 export async function flushSyncOutbox(): Promise<void> {
   if (isFlushingOutbox || outboxMap.size === 0) return;
-  if (getIsQuotaExceeded() || !firestoreDb) return;
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
 
   isFlushingOutbox = true;
@@ -422,6 +450,120 @@ export async function flushSyncOutbox(): Promise<void> {
 
   try {
     const entries = Array.from(outboxMap.values());
+
+    // 0. Top Priority: Direct Supabase PostgreSQL (works on Vercel SPA & AI Studio, unlimited writes)
+    if (supabaseReady !== false) {
+      const supaOk = await flushOutboxToSupabase(entries);
+      if (supaOk) {
+        // Also mirror to local Cloud SQL backend if available in background
+        if (sqlBackendAvailable === true) {
+          flushOutboxToCloudSql(entries).catch(() => {});
+        }
+        updateSyncStatus({
+          lastSyncedAt: new Date(),
+          isSyncing: false,
+          quotaExceeded: false,
+          supabaseConnected: true,
+          supabaseNeedsSetup: false,
+          pendingOutboxCount: outboxMap.size,
+        });
+        return;
+      }
+    }
+
+    // 1. Secondary path: Cloud SQL PostgreSQL via /api/sql-sync/push (unlimited writes)
+    if (sqlBackendAvailable !== false) {
+      try {
+        const mutations: Array<{ tableName: TableName; docId: string; data: any }> = [];
+        const deletions: Array<{ tableName: TableName; docId: string; deletedAt: string }> = [];
+        const committedKeys: Array<{ key: string; sig?: string }> = [];
+
+        for (const entry of entries) {
+          if (entry.isDelete) {
+            recordLocalTombstone(entry.tableName, entry.docId, entry.queuedAt);
+            deletions.push({
+              tableName: entry.tableName,
+              docId: entry.docId,
+              deletedAt: entry.queuedAt,
+            });
+            committedKeys.push({ key: entry.key });
+          } else if (entry.data) {
+            if (entry.data.is_demo === true) {
+              outboxMap.delete(entry.key);
+              continue;
+            }
+            const sig = computePayloadSignature(entry.data);
+            if (syncedSignatures.get(entry.key) === sig) {
+              outboxMap.delete(entry.key);
+              continue;
+            }
+            mutations.push({
+              tableName: entry.tableName,
+              docId: entry.docId,
+              data: entry.data,
+            });
+            committedKeys.push({ key: entry.key, sig });
+          }
+        }
+
+        if (mutations.length === 0 && deletions.length === 0) {
+          persistOutbox();
+          updateSyncStatus({
+            lastSyncedAt: new Date(),
+            isSyncing: false,
+            pendingOutboxCount: outboxMap.size,
+          });
+          return;
+        }
+
+        const token = await getActiveAuthToken();
+        const res = await withFirestoreTimeout(
+          fetch('/api/sql-sync/push', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ mutations, deletions }),
+          }),
+          10000,
+          'sqlSyncPush'
+        );
+
+        const contentType = res.headers.get('content-type') || '';
+        if (res.status === 404 || !contentType.includes('application/json')) {
+          sqlBackendAvailable = false;
+        } else if (res.ok) {
+          sqlBackendAvailable = true;
+          for (const item of committedKeys) {
+            outboxMap.delete(item.key);
+            if (item.sig) {
+              syncedSignatures.set(item.key, item.sig);
+            } else {
+              syncedSignatures.delete(item.key);
+            }
+          }
+          persistOutbox();
+          persistSignatures();
+          updateSyncStatus({
+            lastSyncedAt: new Date(),
+            isSyncing: false,
+            quotaExceeded: false,
+            pendingOutboxCount: outboxMap.size,
+          });
+          return;
+        }
+      } catch (sqlErr) {
+        // Fall through to Firestore if SQL endpoint is unreachable
+      }
+    }
+
+    // 2. Fallback path: Firestore batch commit (when hosted on static SPA without Node SQL backend)
+    if (getIsQuotaExceeded() || !firestoreDb) {
+      updateSyncStatus({ isSyncing: false, pendingOutboxCount: outboxMap.size });
+      return;
+    }
+
     const BATCH_LIMIT = 200; // Each delete writes 1 delete + 1 tombstone = max 400 ops
 
     for (let i = 0; i < entries.length; i += BATCH_LIMIT) {
@@ -496,7 +638,7 @@ export async function pushDocsBatchToFirestore(tableName: TableName, items: any[
     const docId = getCanonicalDocId(tableName, item, item.id);
     enqueueSyncOperation(tableName, docId, { ...item, id: docId }, false);
   }
-  if (!getIsQuotaExceeded()) {
+  if (sqlBackendAvailable !== false || !getIsQuotaExceeded()) {
     flushSyncOutbox().catch(() => {});
   }
 }
@@ -574,20 +716,10 @@ let isPullingAll = false;
 let isRunningKaizen = false;
 let onlineListenersAttached = false;
 
-// Real-time listener setup for all Firestore collections -> Dexie (idempotent singleton)
+// Real-time listener setup for Cloud SQL + Firestore -> Dexie (idempotent singleton)
 export function initRealtimeSync(): () => void {
-  if (getIsQuotaExceeded()) {
-    updateSyncStatus({ isSyncing: false, quotaExceeded: true });
-    return () => {};
-  }
-
-  if (!firestoreDb) {
-    updateSyncStatus({ isSyncing: false });
-    return () => {};
-  }
-
-  // If realtime listeners are already active, do not tear down or re-pull
-  if (unsubscribers.length > 0) {
+  // If realtime listeners or SQL poll timer are already active, do not tear down or re-pull
+  if (unsubscribers.length > 0 || sqlPollTimer !== null) {
     return () => {};
   }
 
@@ -602,13 +734,40 @@ export function initRealtimeSync(): () => void {
     });
   }
 
-  // Kick off initial background pull & deduplication
+  // Kick off initial background pull & deduplication (Cloud SQL primary -> Firestore fallback)
   pullAllFromFirestore()
     .then(() => flushSyncOutbox())
     .catch((err) => {
       handleFirestoreError(err, 'InitialSync');
       updateSyncStatus({ isSyncing: false });
     });
+
+  // Periodic background Supabase / Cloud SQL sync every 15s when tab is active
+  if (typeof window !== 'undefined' && !sqlPollTimer) {
+    sqlPollTimer = setInterval(() => {
+      if (
+        (supabaseReady === true || sqlBackendAvailable === true) &&
+        typeof document !== 'undefined' &&
+        document.visibilityState === 'visible' &&
+        !isPullingAll &&
+        !isFlushingOutbox
+      ) {
+        if (supabaseReady === true) {
+          pullAllFromSupabase()
+            .then(() => flushSyncOutbox())
+            .catch(() => {});
+        } else if (sqlBackendAvailable === true) {
+          pullAllFromSqlCloud()
+            .then(() => flushSyncOutbox())
+            .catch(() => {});
+        }
+      }
+    }, 15000);
+  }
+
+  if (getIsQuotaExceeded() || !firestoreDb) {
+    return stopRealtimeSync;
+  }
 
   // Listen to remote tombstones in real time
   try {
@@ -810,6 +969,10 @@ export function stopRealtimeSync() {
     } catch (e) {}
   });
   unsubscribers = [];
+  if (sqlPollTimer) {
+    clearInterval(sqlPollTimer);
+    sqlPollTimer = null;
+  }
 }
 
 // Pull an entire collection from Firestore into Dexie with Tombstone & Canonical ID reconciliation
@@ -1611,31 +1774,641 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
     isRunningKaizen = false;
   }
 
-  if (!getIsQuotaExceeded()) {
+  if (sqlBackendAvailable !== false || !getIsQuotaExceeded()) {
     flushSyncOutbox().catch(() => {});
   }
 
   return report;
 }
 
-// Pull all collections from Firestore into Dexie
-export async function pullAllFromFirestore() {
-  if (getIsQuotaExceeded() || !firestoreDb) {
-    updateSyncStatus({ isSyncing: false });
-    return;
+/**
+ * Pulls all 12 domain tables + deleted_records tombstones from Cloud SQL PostgreSQL
+ * in a single round-trip and reconciles with local IndexedDB (Dexie).
+ */
+export async function pullAllFromSqlCloud(): Promise<{
+  ok: boolean;
+  totalRemoteRecords: number;
+}> {
+  if (sqlBackendAvailable === false) {
+    return { ok: false, totalRemoteRecords: 0 };
   }
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return { ok: false, totalRemoteRecords: 0 };
+  }
+
+  try {
+    const token = await getActiveAuthToken();
+    const res = await withFirestoreTimeout(
+      fetch('/api/sql-sync/pull', {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }),
+      8000,
+      'pullAllFromSqlCloud'
+    );
+
+    const contentType = res.headers.get('content-type') || '';
+    if (res.status === 404 || !contentType.includes('application/json')) {
+      sqlBackendAvailable = false;
+      return { ok: false, totalRemoteRecords: 0 };
+    }
+    if (!res.ok) {
+      return { ok: false, totalRemoteRecords: 0 };
+    }
+
+    const payload = await res.json();
+    if (!payload?.tables) {
+      return { ok: false, totalRemoteRecords: 0 };
+    }
+
+    sqlBackendAvailable = true;
+    let totalRemoteRecords = 0;
+
+    // 1. Apply remote tombstones
+    const deletionsByTable = new Map<string, string[]>();
+    if (Array.isArray(payload.tombstones)) {
+      payload.tombstones.forEach((t: TombstoneRecord) => {
+        if (t?.table_name && t?.record_id) {
+          const key = `${t.table_name}_${t.record_id}`;
+          tombstoneMap.set(key, {
+            id: key,
+            table_name: t.table_name,
+            record_id: String(t.record_id),
+            deleted_at: t.deleted_at || new Date().toISOString(),
+          });
+          if (!deletionsByTable.has(t.table_name)) {
+            deletionsByTable.set(t.table_name, []);
+          }
+          deletionsByTable.get(t.table_name)!.push(String(t.record_id));
+        }
+      });
+      persistTombstones();
+    }
+
+    setRemoteSyncing(true);
+    try {
+      for (const [tName, ids] of deletionsByTable.entries()) {
+        const dexieTable = (dexieDb as any)[tName];
+        if (!dexieTable || ids.length === 0) continue;
+        const existingRecords = await dexieTable.bulkGet(ids);
+        const confirmedDeleteIds: (string | number)[] = [];
+        existingRecords.forEach((rec: any, idx: number) => {
+          const targetId = ids[idx];
+          if (rec && isRecordTombstoned(tName, targetId, rec.updated_at)) {
+            confirmedDeleteIds.push(targetId);
+            const numId = Number(targetId);
+            if (!isNaN(numId)) confirmedDeleteIds.push(numId);
+          }
+        });
+        if (confirmedDeleteIds.length > 0) {
+          await dexieTable.bulkDelete(confirmedDeleteIds);
+        }
+      }
+
+      // 2. Reconcile all 12 domain tables
+      for (const tableName of ALL_TABLES) {
+        const remoteRows: any[] = Array.isArray(payload.tables[tableName])
+          ? payload.tables[tableName]
+          : [];
+        totalRemoteRecords += remoteRows.length;
+
+        const dexieTable = (dexieDb as any)[tableName];
+        if (!dexieTable) continue;
+
+        const existingList = await dexieTable.toArray();
+        const existingMap = new Map<string, any>();
+        existingList.forEach((item: any) => {
+          if (item?.id !== undefined && item?.id !== null) {
+            existingMap.set(String(item.id), item);
+          }
+        });
+
+        const docsToDelete: (string | number)[] = [];
+        const docsToPut: any[] = [];
+        const remoteCanonicalIds = new Set<string>();
+
+        for (const docData of remoteRows) {
+          if (!docData) continue;
+          const rawDocId = String(docData.id || '');
+          const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
+
+          if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
+            continue;
+          }
+
+          remoteCanonicalIds.add(canonicalId);
+
+          if (rawDocId === canonicalId) {
+            const sig = computePayloadSignature({ ...docData, id: canonicalId });
+            syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+          } else {
+            syncedSignatures.delete(`${tableName}/${canonicalId}`);
+          }
+
+          if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
+            docsToDelete.push(rawDocId);
+          }
+
+          const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
+          let mergedRecord: any;
+          if (existing) {
+            const localTime = new Date(
+              existing.updated_at || existing.last_updated || 0
+            ).getTime();
+            const remoteTime = new Date(
+              docData.updated_at || docData.last_updated || 0
+            ).getTime();
+
+            if (remoteTime >= localTime) {
+              mergedRecord = {
+                ...existing,
+                ...docData,
+                id: canonicalId,
+                updated_at: docData.updated_at || new Date().toISOString(),
+              };
+            } else {
+              mergedRecord = {
+                ...docData,
+                ...existing,
+                id: canonicalId,
+                updated_at: existing.updated_at || new Date().toISOString(),
+              };
+            }
+          } else {
+            mergedRecord = {
+              ...docData,
+              id: canonicalId,
+              updated_at: docData.updated_at || new Date().toISOString(),
+            };
+          }
+
+          docsToPut.push(mergedRecord);
+        }
+
+        // Queue any non-demo local records missing from Cloud SQL so they automatically migrate up
+        existingList.forEach((localItem: any) => {
+          if (!localItem?.id || localItem.is_demo === true) return;
+          const localIdStr = String(localItem.id);
+          const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
+
+          if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
+            docsToDelete.push(localItem.id);
+          } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
+            enqueueSyncOperation(
+              tableName,
+              canonicalLocalId,
+              { ...localItem, id: canonicalLocalId },
+              false,
+              true
+            );
+          }
+        });
+
+        if (docsToDelete.length > 0 || docsToPut.length > 0) {
+          await dexieDb.transaction('rw', dexieTable, async () => {
+            if (docsToDelete.length > 0) {
+              await dexieTable.bulkDelete(docsToDelete);
+            }
+            if (docsToPut.length > 0) {
+              await dexieTable.bulkPut(docsToPut);
+            }
+          });
+        }
+      }
+      persistSignatures();
+    } finally {
+      setRemoteSyncing(false);
+    }
+
+    return { ok: true, totalRemoteRecords };
+  } catch (err) {
+    return { ok: false, totalRemoteRecords: 0 };
+  }
+}
+
+async function flushOutboxToCloudSql(entries: OutboxEntry[]): Promise<boolean> {
+  try {
+    const mutations: Array<{ tableName: TableName; docId: string; data: any }> = [];
+    const deletions: Array<{ tableName: TableName; docId: string; deletedAt: string }> = [];
+    for (const entry of entries) {
+      if (entry.isDelete) {
+        deletions.push({
+          tableName: entry.tableName,
+          docId: entry.docId,
+          deletedAt: entry.queuedAt,
+        });
+      } else if (entry.data && entry.data.is_demo !== true) {
+        mutations.push({
+          tableName: entry.tableName,
+          docId: entry.docId,
+          data: entry.data,
+        });
+      }
+    }
+    if (mutations.length === 0 && deletions.length === 0) return true;
+    const token = await getActiveAuthToken();
+    const res = await fetch('/api/sql-sync/push', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ mutations, deletions }),
+    });
+    return res.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Flushes pending Outbox mutations and deletions directly to Supabase PostgreSQL
+ */
+export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boolean> {
+  if (!supabase || entries.length === 0) return false;
+  try {
+    const mutationsByTable = new Map<
+      TableName,
+      Array<{ id: string; updated_at: string; payload: any }>
+    >();
+    const deletionsByTable = new Map<TableName, string[]>();
+    const tombstonesToUpsert: TombstoneRecord[] = [];
+    const committedKeys: Array<{ key: string; sig?: string }> = [];
+
+    for (const entry of entries) {
+      if (entry.isDelete) {
+        const tomb = recordLocalTombstone(entry.tableName, entry.docId, entry.queuedAt);
+        if (!deletionsByTable.has(entry.tableName)) {
+          deletionsByTable.set(entry.tableName, []);
+        }
+        deletionsByTable.get(entry.tableName)!.push(entry.docId);
+        tombstonesToUpsert.push(tomb);
+        committedKeys.push({ key: entry.key });
+      } else if (entry.data) {
+        if (entry.data.is_demo === true) {
+          outboxMap.delete(entry.key);
+          continue;
+        }
+        const sig = computePayloadSignature(entry.data);
+        if (syncedSignatures.get(entry.key) === sig) {
+          outboxMap.delete(entry.key);
+          continue;
+        }
+        if (!mutationsByTable.has(entry.tableName)) {
+          mutationsByTable.set(entry.tableName, []);
+        }
+        const updatedAt = String(
+          entry.data.updated_at || entry.data.last_updated || new Date().toISOString()
+        );
+        mutationsByTable.get(entry.tableName)!.push({
+          id: entry.docId,
+          updated_at: updatedAt,
+          payload: {
+            ...entry.data,
+            id: entry.docId,
+            updated_at: updatedAt,
+          },
+        });
+        committedKeys.push({ key: entry.key, sig });
+      }
+    }
+
+    if (mutationsByTable.size === 0 && deletionsByTable.size === 0) {
+      persistOutbox();
+      return true;
+    }
+
+    // Upsert changed records per table
+    for (const [tName, rows] of mutationsByTable.entries()) {
+      const { error } = await supabase.from(tName).upsert(rows, { onConflict: 'id' });
+      if (error) {
+        if (error.code === 'PGRST205' || error.code === '42P01') {
+          supabaseReady = false;
+          supabaseNeedsSchemaSetup = true;
+          updateSyncStatus({ supabaseConnected: false, supabaseNeedsSetup: true });
+        }
+        return false;
+      }
+      // Remove any old tombstones for upserted rows
+      const tombIds = rows.map((r) => `${tName}_${r.id}`);
+      if (tombIds.length > 0) {
+        await supabase.from(TOMBSTONE_COLLECTION).delete().in('id', tombIds);
+      }
+    }
+
+    // Apply deletions & tombstones
+    for (const [tName, ids] of deletionsByTable.entries()) {
+      if (ids.length > 0) {
+        await supabase.from(tName).delete().in('id', ids);
+      }
+    }
+    if (tombstonesToUpsert.length > 0) {
+      await supabase
+        .from(TOMBSTONE_COLLECTION)
+        .upsert(tombstonesToUpsert, { onConflict: 'id' });
+    }
+
+    supabaseReady = true;
+    supabaseNeedsSchemaSetup = false;
+
+    for (const item of committedKeys) {
+      outboxMap.delete(item.key);
+      if (item.sig) {
+        syncedSignatures.set(item.key, item.sig);
+      } else {
+        syncedSignatures.delete(item.key);
+      }
+    }
+    persistOutbox();
+    persistSignatures();
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Pulls all 12 domain tables + deleted_records tombstones from Supabase PostgreSQL
+ */
+export async function pullAllFromSupabase(): Promise<{
+  ok: boolean;
+  totalRemoteRecords: number;
+}> {
+  if (!supabase) return { ok: false, totalRemoteRecords: 0 };
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return { ok: false, totalRemoteRecords: 0 };
+  }
+
+  try {
+    // Quick probe on deleted_records to check if schema exists on Supabase
+    const tombRes = await supabase.from(TOMBSTONE_COLLECTION).select('*');
+    if (tombRes.error) {
+      if (tombRes.error.code === 'PGRST205' || tombRes.error.code === '42P01') {
+        supabaseReady = false;
+        supabaseNeedsSchemaSetup = true;
+        updateSyncStatus({ supabaseConnected: false, supabaseNeedsSetup: true });
+      }
+      return { ok: false, totalRemoteRecords: 0 };
+    }
+
+    supabaseReady = true;
+    supabaseNeedsSchemaSetup = false;
+    updateSyncStatus({
+      supabaseConnected: true,
+      supabaseNeedsSetup: false,
+      quotaExceeded: false,
+    });
+
+    let totalRemoteRecords = 0;
+
+    // 1. Apply remote tombstones
+    const deletionsByTable = new Map<string, string[]>();
+    if (Array.isArray(tombRes.data)) {
+      tombRes.data.forEach((t: any) => {
+        if (t?.table_name && t?.record_id) {
+          const key = `${t.table_name}_${t.record_id}`;
+          tombstoneMap.set(key, {
+            id: key,
+            table_name: t.table_name,
+            record_id: String(t.record_id),
+            deleted_at: t.deleted_at || new Date().toISOString(),
+          });
+          if (!deletionsByTable.has(t.table_name)) {
+            deletionsByTable.set(t.table_name, []);
+          }
+          deletionsByTable.get(t.table_name)!.push(String(t.record_id));
+        }
+      });
+      persistTombstones();
+    }
+
+    // 2. Fetch all 12 domain tables in parallel from Supabase
+    const tableResponses = await Promise.all(
+      ALL_TABLES.map((tName) =>
+        tName === 'audit_logs'
+          ? supabase
+              .from(tName)
+              .select('*')
+              .order('updated_at', { ascending: false })
+              .limit(100)
+          : supabase.from(tName).select('*')
+      )
+    );
+
+    setRemoteSyncing(true);
+    try {
+      for (const [tName, ids] of deletionsByTable.entries()) {
+        const dexieTable = (dexieDb as any)[tName];
+        if (!dexieTable || ids.length === 0) continue;
+        const existingRecords = await dexieTable.bulkGet(ids);
+        const confirmedDeleteIds: (string | number)[] = [];
+        existingRecords.forEach((rec: any, idx: number) => {
+          const targetId = ids[idx];
+          if (rec && isRecordTombstoned(tName, targetId, rec.updated_at)) {
+            confirmedDeleteIds.push(targetId);
+            const numId = Number(targetId);
+            if (!isNaN(numId)) confirmedDeleteIds.push(numId);
+          }
+        });
+        if (confirmedDeleteIds.length > 0) {
+          await dexieTable.bulkDelete(confirmedDeleteIds);
+        }
+      }
+
+      for (let idx = 0; idx < ALL_TABLES.length; idx++) {
+        const tableName = ALL_TABLES[idx];
+        const res = tableResponses[idx];
+        if (res.error || !Array.isArray(res.data)) continue;
+
+        const remoteRows = res.data.map((r: any) => ({
+          ...(typeof r.payload === 'object' && r.payload !== null ? r.payload : r),
+          id: r.id,
+          updated_at: r.updated_at,
+        }));
+        totalRemoteRecords += remoteRows.length;
+
+        const dexieTable = (dexieDb as any)[tableName];
+        if (!dexieTable) continue;
+
+        const existingList = await dexieTable.toArray();
+        const existingMap = new Map<string, any>();
+        existingList.forEach((item: any) => {
+          if (item?.id !== undefined && item?.id !== null) {
+            existingMap.set(String(item.id), item);
+          }
+        });
+
+        const docsToDelete: (string | number)[] = [];
+        const docsToPut: any[] = [];
+        const remoteCanonicalIds = new Set<string>();
+
+        for (const docData of remoteRows) {
+          if (!docData) continue;
+          const rawDocId = String(docData.id || '');
+          const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
+
+          if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
+            continue;
+          }
+
+          remoteCanonicalIds.add(canonicalId);
+
+          if (rawDocId === canonicalId) {
+            const sig = computePayloadSignature({ ...docData, id: canonicalId });
+            syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+          } else {
+            syncedSignatures.delete(`${tableName}/${canonicalId}`);
+          }
+
+          if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
+            docsToDelete.push(rawDocId);
+          }
+
+          const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
+          let mergedRecord: any;
+          if (existing) {
+            const localTime = new Date(
+              existing.updated_at || existing.last_updated || 0
+            ).getTime();
+            const remoteTime = new Date(
+              docData.updated_at || docData.last_updated || 0
+            ).getTime();
+
+            if (remoteTime >= localTime) {
+              mergedRecord = {
+                ...existing,
+                ...docData,
+                id: canonicalId,
+                updated_at: docData.updated_at || new Date().toISOString(),
+              };
+            } else {
+              mergedRecord = {
+                ...docData,
+                ...existing,
+                id: canonicalId,
+                updated_at: existing.updated_at || new Date().toISOString(),
+              };
+            }
+          } else {
+            mergedRecord = {
+              ...docData,
+              id: canonicalId,
+              updated_at: docData.updated_at || new Date().toISOString(),
+            };
+          }
+
+          docsToPut.push(mergedRecord);
+        }
+
+        // Queue any non-demo local records missing from Supabase so they migrate automatically
+        existingList.forEach((localItem: any) => {
+          if (!localItem?.id || localItem.is_demo === true) return;
+          const localIdStr = String(localItem.id);
+          const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
+
+          if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
+            docsToDelete.push(localItem.id);
+          } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
+            enqueueSyncOperation(
+              tableName,
+              canonicalLocalId,
+              { ...localItem, id: canonicalLocalId },
+              false,
+              true
+            );
+          }
+        });
+
+        if (docsToDelete.length > 0 || docsToPut.length > 0) {
+          await dexieDb.transaction('rw', dexieTable, async () => {
+            if (docsToDelete.length > 0) {
+              await dexieTable.bulkDelete(docsToDelete);
+            }
+            if (docsToPut.length > 0) {
+              await dexieTable.bulkPut(docsToPut);
+            }
+          });
+        }
+      }
+      persistSignatures();
+    } finally {
+      setRemoteSyncing(false);
+    }
+
+    return { ok: true, totalRemoteRecords };
+  } catch (err) {
+    return { ok: false, totalRemoteRecords: 0 };
+  }
+}
+
+// Pull all collections from Supabase (primary) -> Cloud SQL -> Firestore into Dexie
+export async function pullAllFromFirestore() {
   if (isPullingAll) return;
   isPullingAll = true;
   updateSyncStatus({ isSyncing: true });
 
   try {
-    await pullTombstonesFromFirestore();
-    for (const tableName of ALL_TABLES) {
-      if (getIsQuotaExceeded()) break;
-      await pullCollectionFromFirestore(tableName);
+    // 1. Try pulling from Supabase PostgreSQL first (works on both Vercel & AI Studio)
+    const supaResult = await pullAllFromSupabase();
+
+    // 2. Also pull from Cloud SQL if Supabase is not set up yet or has 0 records
+    let sqlResult = { ok: false, totalRemoteRecords: 0 };
+    if (!supaResult.ok || supaResult.totalRemoteRecords === 0) {
+      sqlResult = await pullAllFromSqlCloud();
     }
+
+    // 3. Pull from Firestore if both SQL stores are brand-new (0 records) or unavailable
+    // so existing Firestore data automatically migrates into IndexedDB, Supabase & Cloud SQL
+    const totalSqlRecords = supaResult.totalRemoteRecords + sqlResult.totalRemoteRecords;
+    const shouldAlsoPullFirestore =
+      ((!supaResult.ok && !sqlResult.ok) || totalSqlRecords === 0) &&
+      !getIsQuotaExceeded() &&
+      !!firestoreDb;
+
+    if (shouldAlsoPullFirestore) {
+      await pullTombstonesFromFirestore();
+      for (const tableName of ALL_TABLES) {
+        if (getIsQuotaExceeded()) break;
+        await pullCollectionFromFirestore(tableName);
+      }
+    }
+
+    // If Supabase or Cloud SQL is active and was empty, queue all local/Firestore records to migrate up
+    if (
+      (supaResult.ok && supaResult.totalRemoteRecords === 0) ||
+      (sqlResult.ok && sqlResult.totalRemoteRecords === 0)
+    ) {
+      for (const tableName of ALL_TABLES) {
+        const dexieTable = (dexieDb as any)[tableName];
+        if (!dexieTable) continue;
+        const allLocal = await dexieTable.toArray();
+        for (const item of allLocal) {
+          if (!item || item.is_demo === true) continue;
+          const canonicalId = getCanonicalDocId(tableName, item, item.id);
+          if (!isRecordTombstoned(tableName, canonicalId, item.updated_at)) {
+            enqueueSyncOperation(
+              tableName,
+              canonicalId,
+              { ...item, id: canonicalId },
+              false,
+              true
+            );
+          }
+        }
+      }
+    }
+
     await kaizenDeduplicateAndMerge();
-    updateSyncStatus({ lastSyncedAt: new Date(), isSyncing: false });
+    updateSyncStatus({
+      lastSyncedAt: new Date(),
+      isSyncing: false,
+      quotaExceeded:
+        supabaseReady === true || sqlBackendAvailable === true
+          ? false
+          : getIsQuotaExceeded(),
+    });
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
@@ -1654,9 +2427,13 @@ export async function pullAllFromFirestore() {
   }
 }
 
-// Push all changed non-demo local records from Dexie to Firestore
+// Push all changed non-demo local records from Dexie to Supabase / Cloud SQL / Firestore
 export async function pushAllToFirestore() {
-  if (getIsQuotaExceeded() || !firestoreDb) {
+  if (
+    supabaseReady === false &&
+    sqlBackendAvailable === false &&
+    (getIsQuotaExceeded() || !firestoreDb)
+  ) {
     updateSyncStatus({ isSyncing: false });
     return;
   }
@@ -1692,7 +2469,12 @@ export async function pushAllToFirestore() {
 
 // Complete 2-way sync: Pull latest cloud updates & tombstones, deduplicate, then push dirty local items
 export async function syncAll() {
-  if (getIsQuotaExceeded() || !firestoreDb) return;
+  if (
+    supabaseReady === false &&
+    sqlBackendAvailable === false &&
+    (getIsQuotaExceeded() || !firestoreDb)
+  )
+    return;
   updateSyncStatus({ isSyncing: true });
 
   try {
@@ -1715,38 +2497,73 @@ export async function syncAll() {
 }
 
 export async function forceFullSync() {
+  supabaseReady = null;
   await syncAll();
 }
 
 export async function reconnectAndSyncCloud(): Promise<boolean> {
+  supabaseReady = null;
+  if (sqlBackendAvailable === false) {
+    sqlBackendAvailable = null;
+  }
+  const supaRes = await pullAllFromSupabase();
+  if (supaRes.ok) {
+    await pushAllToFirestore();
+    return true;
+  }
+  const sqlRes = await pullAllFromSqlCloud();
+  if (sqlRes.ok) {
+    await pushAllToFirestore();
+    return true;
+  }
   const ok = await tryReconnectFirestore();
   if (!ok) return false;
   await syncAll();
   return !getIsQuotaExceeded();
 }
 
-// Clear all Firestore collections for real-world blank slate deployment using writeBatch
+// Clear all Supabase, Cloud SQL & Firestore collections for real-world blank slate deployment
 export async function clearFirestoreDatabase() {
-  if (getIsQuotaExceeded() || !firestoreDb) return;
   try {
-    for (const tableName of ALL_TABLES) {
-      if (tableName === 'knowledge_tags' || tableName === 'settings') continue;
-      const colRef = collection(firestoreDb, tableName);
-      const snap = await getDocs(colRef);
-      if (snap.empty) continue;
+    if (supabaseReady !== false && supabase) {
+      try {
+        for (const tableName of ALL_TABLES) {
+          if (tableName === 'knowledge_tags' || tableName === 'settings') continue;
+          await supabase.from(tableName).delete().neq('id', '');
+        }
+      } catch (e) {}
+    }
 
-      const docs = snap.docs;
-      const BATCH_SIZE = 200;
-      for (let i = 0; i < docs.length; i += BATCH_SIZE) {
-        const chunk = docs.slice(i, i + BATCH_SIZE);
-        const batch = writeBatch(firestoreDb);
-        chunk.forEach((docSnapshot) => {
-          batch.delete(docSnapshot.ref);
-          const tomb = recordLocalTombstone(tableName, docSnapshot.id);
-          const tombRef = doc(firestoreDb, TOMBSTONE_COLLECTION, tomb.id);
-          batch.set(tombRef, tomb, { merge: true });
+    if (sqlBackendAvailable !== false) {
+      try {
+        const token = await getActiveAuthToken();
+        await fetch('/api/sql-sync/clear', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
         });
-        await batch.commit();
+      } catch (e) {}
+    }
+
+    if (!getIsQuotaExceeded() && firestoreDb) {
+      for (const tableName of ALL_TABLES) {
+        if (tableName === 'knowledge_tags' || tableName === 'settings') continue;
+        const colRef = collection(firestoreDb, tableName);
+        const snap = await getDocs(colRef);
+        if (snap.empty) continue;
+
+        const docs = snap.docs;
+        const BATCH_SIZE = 200;
+        for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+          const chunk = docs.slice(i, i + BATCH_SIZE);
+          const batch = writeBatch(firestoreDb);
+          chunk.forEach((docSnapshot) => {
+            batch.delete(docSnapshot.ref);
+            const tomb = recordLocalTombstone(tableName, docSnapshot.id);
+            const tombRef = doc(firestoreDb, TOMBSTONE_COLLECTION, tomb.id);
+            batch.set(tombRef, tomb, { merge: true });
+          });
+          await batch.commit();
+        }
       }
     }
     outboxMap.clear();

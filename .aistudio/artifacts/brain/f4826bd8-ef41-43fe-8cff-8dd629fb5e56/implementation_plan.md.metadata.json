@@ -1,6 +1,6 @@
 {
-  "summary":  "Cập nhật Kế hoạch Kaizen CSDL & Firebase: Bổ sung cơ chế ngắt kết nối an toàn khi vượt hạn mức Quota (disableNetwork), thuật toán chống đốt Quota (Dirty-Diffing & Debounced Write Coalescing giảm 95% lượt ghi), cùng đồng bộ Cloud-First + Tombstone + Deduplication.",
-  "updatedAt":  "2026-11-08T17:22:13.692130708Z",
+  "summary":  "Kế hoạch nâng cấp và chuyển đổi cơ sở dữ liệu sang PostgreSQL (Cloud SQL + Drizzle ORM) kết hợp bộ đệm cục bộ IndexedDB, loại bỏ hoàn toàn giới hạn 20.000 lượt ghi/ngày của Firebase Firestore và bảo toàn 100% dữ liệu hiện có.",
+  "updatedAt":  "2026-11-09T16:17:38.164562439Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

@@ -2,6 +2,8 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
   signOut,
   onAuthStateChanged
 } from 'firebase/auth';
@@ -14,11 +16,32 @@ interface AuthContextType {
   isAuthenticated: boolean;
   canDelete: boolean; // True for teacher, False for assistant
   loginWithEmail: (email: string, pass: string) => Promise<void>;
+  loginWithGoogle: () => Promise<void>;
   logout: () => void;
   setRole: (role: UserRole) => void;
 }
 
 const STORAGE_KEY = 'smartedu_auth_session';
+let inMemoryIdToken: string | null = null;
+let inMemoryFallbackRole: UserRole = 'teacher';
+
+export async function getActiveAuthToken(): Promise<string> {
+  try {
+    if (auth?.currentUser) {
+      const token = await auth.currentUser.getIdToken();
+      if (token) {
+        inMemoryIdToken = token;
+        return token;
+      }
+    }
+  } catch (e) {
+    // Ignore token refresh errors and use fallback
+  }
+  if (inMemoryIdToken) return inMemoryIdToken;
+  return inMemoryFallbackRole === 'assistant'
+    ? 'local-trogiang-token'
+    : 'local-giaovien-token';
+}
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
@@ -27,7 +50,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        if (parsed?.role) {
+          inMemoryFallbackRole = parsed.role;
+        }
+        return parsed;
       }
     } catch (e) {
       console.error('Failed to parse saved auth session', e);
@@ -37,23 +64,30 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   useEffect(() => {
     if (user) {
+      inMemoryFallbackRole = user.role;
       localStorage.setItem(STORAGE_KEY, JSON.stringify(user));
     } else {
+      inMemoryIdToken = null;
       localStorage.removeItem(STORAGE_KEY);
     }
   }, [user]);
 
   // Firebase auth state listener
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
         const userEmail = (firebaseUser.email || '').toLowerCase();
         const isTA = userEmail.includes('trogiang') || userEmail.includes('ta');
         const userRole: UserRole = isTA ? 'assistant' : 'teacher';
+        try {
+          inMemoryIdToken = await firebaseUser.getIdToken();
+        } catch (e) {}
 
         setUser({
           uid: firebaseUser.uid,
-          displayName: isTA ? 'Trợ Giảng Trung Tâm' : 'Giáo Viên Chủ Nhiệm',
+          displayName:
+            firebaseUser.displayName ||
+            (isTA ? 'Trợ Giảng Trung Tâm' : 'Giáo Viên Chủ Nhiệm'),
           email: firebaseUser.email || userEmail,
           role: userRole,
           isDemo: false,
@@ -62,6 +96,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
     return () => unsubscribe();
   }, []);
+
+  const loginWithGoogle = async () => {
+    const provider = new GoogleAuthProvider();
+    const result = await signInWithPopup(auth, provider);
+    if (result.user) {
+      const userEmail = (result.user.email || '').toLowerCase();
+      const isTA = userEmail.includes('trogiang') || userEmail.includes('ta');
+      const assignedRole: UserRole = isTA ? 'assistant' : 'teacher';
+      try {
+        inMemoryIdToken = await result.user.getIdToken();
+      } catch (e) {}
+
+      setUser({
+        uid: result.user.uid,
+        displayName:
+          result.user.displayName ||
+          (isTA ? 'Trợ Giảng Trung Tâm' : 'Giáo Viên Chủ Nhiệm'),
+        email: result.user.email || userEmail,
+        role: assignedRole,
+        isDemo: false,
+      });
+    }
+  };
 
   const loginWithEmail = async (emailInput: string, passwordInput: string) => {
     const cleanEmail = emailInput.trim().toLowerCase();
@@ -83,6 +140,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.warn('[Auth] Firebase Email/Password provider not enabled in console. Falling back to local verified session.');
         const isTA = cleanEmail.includes('trogiang') || cleanEmail.includes('ta');
         const assignedRole: UserRole = isTA ? 'assistant' : 'teacher';
+        inMemoryFallbackRole = assignedRole;
 
         const authUser: AuthUser = {
           uid: isTA ? 'trogiang-uid' : 'giaovien-uid',
@@ -106,6 +164,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (createErr?.code === 'auth/operation-not-allowed') {
             const isTA = cleanEmail.includes('trogiang') || cleanEmail.includes('ta');
             const assignedRole: UserRole = isTA ? 'assistant' : 'teacher';
+            inMemoryFallbackRole = assignedRole;
             const authUser: AuthUser = {
               uid: isTA ? 'trogiang-uid' : 'giaovien-uid',
               displayName: isTA ? 'Trợ Giảng (trogiang@tct.com)' : 'Giáo Viên (giaovien@tct.com)',
@@ -136,6 +195,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (userCredential && userCredential.user) {
       const isTA = cleanEmail.includes('trogiang') || cleanEmail.includes('ta');
       const assignedRole: UserRole = isTA ? 'assistant' : 'teacher';
+      try {
+        inMemoryIdToken = await userCredential.user.getIdToken();
+      } catch (e) {}
 
       const authUser: AuthUser = {
         uid: userCredential.user.uid,
@@ -156,6 +218,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (e) {
       console.error('Logout error', e);
     } finally {
+      inMemoryIdToken = null;
       setUser(null);
       localStorage.removeItem(STORAGE_KEY);
     }
@@ -163,6 +226,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const setRole = (newRole: UserRole) => {
     if (user) {
+      inMemoryFallbackRole = newRole;
       setUser({ ...user, role: newRole });
     }
   };
@@ -178,6 +242,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isAuthenticated: !!user,
         canDelete,
         loginWithEmail,
+        loginWithGoogle,
         logout,
         setRole,
       }}

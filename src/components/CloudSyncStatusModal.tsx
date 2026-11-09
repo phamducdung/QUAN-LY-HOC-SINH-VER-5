@@ -18,6 +18,8 @@ import { db } from '../db/dexie';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { useCloudSync } from '../hooks/useCloudSync';
 import { getIsQuotaExceeded } from '../firebase';
+import { SUPABASE_SETUP_SQL } from '../lib/supabase';
+import { getSupabaseSyncState } from '../services/syncService';
 
 interface CloudSyncStatusModalProps {
   isOpen: boolean;
@@ -58,16 +60,22 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
 
   if (!isOpen) return null;
 
-  const quotaExceeded = getIsQuotaExceeded();
+  const { supabaseReady, supabaseNeedsSchemaSetup } = getSupabaseSyncState();
+  const quotaExceeded = supabaseReady === true ? false : getIsQuotaExceeded();
+
+  const handleCopySupabaseSql = async () => {
+    try {
+      await navigator.clipboard.writeText(SUPABASE_SETUP_SQL);
+      setActionMessage(
+        'Đã sao chép mã SQL tạo 13 bảng! Hãy dán vào mục SQL Editor trên Supabase rồi bấm Run.'
+      );
+      setTimeout(() => setActionMessage(null), 5000);
+    } catch (e) {
+      setActionMessage('Vui lòng sao chép đoạn mã SQL trong khung bên dưới.');
+    }
+  };
 
   const handleFullSync = async () => {
-    if (quotaExceeded) {
-      setActionMessage(
-        'Đang bật chế độ Bảo vệ Hạn mức (Circuit Breaker). Mọi thay đổi được xếp vào Hàng đợi Outbox và sẽ đẩy lên khi hạn mức ngày reset!'
-      );
-      setTimeout(() => setActionMessage(null), 4500);
-      return;
-    }
     try {
       setIsManualSyncing(true);
       setActionMessage('Đang đối soát Tombstone, gộp trùng lặp & đồng bộ 2 chiều...');
@@ -80,13 +88,6 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
   };
 
   const handlePullOnly = async () => {
-    if (quotaExceeded) {
-      setActionMessage(
-        'Hạn mức đám mây hôm nay đã đạt giới hạn. Đang giữ an toàn dữ liệu ở Hàng đợi Outbox cục bộ!'
-      );
-      setTimeout(() => setActionMessage(null), 4000);
-      return;
-    }
     try {
       setIsManualSyncing(true);
       setActionMessage('Đang đối soát xóa (Tombstone) & kéo dữ liệu từ Cloud...');
@@ -99,13 +100,6 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
   };
 
   const handlePushOnly = async () => {
-    if (quotaExceeded) {
-      setActionMessage(
-        'Hạn mức đám mây hôm nay đã đạt giới hạn. Các thay đổi đã nằm trong Hàng đợi Outbox chờ đẩy!'
-      );
-      setTimeout(() => setActionMessage(null), 4000);
-      return;
-    }
     try {
       setIsManualSyncing(true);
       setActionMessage('Đang lọc bản ghi thay đổi (Dirty-Diff) & đẩy lên Cloud...');
@@ -138,12 +132,12 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
   const handleReconnect = async () => {
     try {
       setIsManualSyncing(true);
-      setActionMessage('Đang kiểm tra kết nối & hạn mức Firestore...');
+      setActionMessage('Đang kiểm tra kết nối Supabase & Cloud SQL...');
       const ok = await reconnectCloud();
       setActionMessage(
         ok
-          ? 'Đã khôi phục kết nối Cloud & đẩy hàng đợi Outbox thành công!'
-          : 'Hạn mức miễn phí trong ngày chưa reset. Tiếp tục bảo vệ dữ liệu qua Outbox.'
+          ? 'Đã kết nối cơ sở dữ liệu Cloud & đẩy hàng đợi Outbox thành công!'
+          : 'Đang giữ an toàn dữ liệu qua Outbox.'
       );
     } finally {
       setIsManualSyncing(false);
@@ -179,10 +173,10 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                Trung Tâm Đồng Bộ Cloud-First & Kaizen CSDL
+                Trung Tâm Đồng Bộ Supabase PostgreSQL & Kaizen CSDL
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Khóa định danh tất định · Đối soát xóa Tombstone · Lọc thay đổi tiết kiệm 95% Quota
+                Đồng bộ không giới hạn lượt ghi trên cả Vercel & AI Studio · Khóa định danh tất định
               </p>
             </div>
           </div>
@@ -196,12 +190,40 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
 
         {/* Content */}
         <div className="p-6 overflow-y-auto space-y-5 flex-1">
+          {/* Supabase Quick SQL Initialization Banner if tables are not created yet */}
+          {supabaseNeedsSchemaSetup && (
+            <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 space-y-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h4 className="text-xs font-bold text-amber-900 dark:text-amber-200">
+                    Bước cuối: Khởi tạo 13 bảng dữ liệu trên Supabase (Chỉ làm 1 lần)
+                  </h4>
+                  <p className="text-[11px] text-amber-800 dark:text-amber-300 mt-0.5">
+                    Đã kết nối thành công tới <strong>duupbswparlpzsdcgcme.supabase.co</strong>. Nhấn nút sao chép mã SQL bên dưới, dán vào mục <strong>SQL Editor</strong> của Supabase và bấm <strong>Run</strong>.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopySupabaseSql}
+                  className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold shrink-0 cursor-pointer"
+                >
+                  Sao chép mã SQL
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Status & Action Toolbar */}
           <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 flex flex-col gap-3">
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div>
                 <div className="text-xs font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
-                  {quotaExceeded ? (
+                  {supabaseReady ? (
+                    <span className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-300">
+                      <Wifi className="w-4 h-4" />
+                      Đã kết nối Supabase PostgreSQL (Không giới hạn lượt ghi)
+                    </span>
+                  ) : quotaExceeded ? (
                     <span className="flex items-center gap-1.5 text-amber-700 dark:text-amber-300">
                       <AlertTriangle className="w-4 h-4" />
                       Chế độ Bảo vệ Hạn mức (Đã ngắt retry ngầm · Lưu qua Outbox)
@@ -209,7 +231,7 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
                   ) : isOnline ? (
                     <span className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-300">
                       <Wifi className="w-4 h-4" />
-                      Kết nối Firebase Cloud-First Trực tuyến
+                      Kết nối Cloud-First Trực tuyến
                     </span>
                   ) : (
                     <span className="flex items-center gap-1.5 text-amber-700 dark:text-amber-300">
@@ -226,17 +248,13 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
               </div>
 
               <div className="flex items-center flex-wrap gap-2">
-                {quotaExceeded && (
-                  <button
-                    type="button"
-                    onClick={handleReconnect}
-                    disabled={isManualSyncing || isSyncing}
-                    className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap shrink-0"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isManualSyncing ? 'animate-spin' : ''}`} />
-                    <span>Thử kết nối lại Cloud</span>
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={handleCopySupabaseSql}
+                  className="px-3 py-1.5 rounded-lg bg-indigo-100 dark:bg-indigo-900/60 hover:bg-indigo-200 text-indigo-800 dark:text-indigo-200 text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  Copy SQL tạo bảng Supabase
+                </button>
                 <button
                   type="button"
                   onClick={handleFullSync}

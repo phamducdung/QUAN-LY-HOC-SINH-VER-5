@@ -3,6 +3,12 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import { requireAuth } from "./src/middleware/auth.ts";
+import {
+  pullAllSqlData,
+  pushSqlBatch,
+  clearAllSqlData,
+} from "./src/db/sqlSyncRepo.ts";
 
 dotenv.config();
 
@@ -10,11 +16,52 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: "25mb" }));
 
   // Health check endpoint
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", app: "Smart Edu Manager - Toán THCS" });
+  });
+
+  // Cloud SQL PostgreSQL Synchronization Endpoints
+  app.get("/api/sql-sync/pull", requireAuth, async (req, res) => {
+    try {
+      const data = await pullAllSqlData();
+      res.json({ success: true, ...data });
+    } catch (error: any) {
+      console.error("[SQL Sync Pull Error]:", error);
+      res.status(500).json({
+        error: error.message || "Lỗi khi tải dữ liệu đồng bộ từ Cloud SQL.",
+      });
+    }
+  });
+
+  app.post("/api/sql-sync/push", requireAuth, async (req, res) => {
+    try {
+      const { mutations, deletions } = req.body || {};
+      const result = await pushSqlBatch(
+        Array.isArray(mutations) ? mutations : [],
+        Array.isArray(deletions) ? deletions : []
+      );
+      res.json({ success: true, ...result });
+    } catch (error: any) {
+      console.error("[SQL Sync Push Error]:", error);
+      res.status(500).json({
+        error: error.message || "Lỗi khi đẩy dữ liệu đồng bộ lên Cloud SQL.",
+      });
+    }
+  });
+
+  app.post("/api/sql-sync/clear", requireAuth, async (req, res) => {
+    try {
+      const result = await clearAllSqlData();
+      res.json({ success: true, ...result });
+    } catch (error: any) {
+      console.error("[SQL Sync Clear Error]:", error);
+      res.status(500).json({
+        error: error.message || "Lỗi khi làm sạch dữ liệu Cloud SQL.",
+      });
+    }
   });
 
   // Module 4: Server-side Gemini AI Engine - AI Personalized Comments for Math Sessions
