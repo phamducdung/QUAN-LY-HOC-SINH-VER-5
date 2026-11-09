@@ -382,6 +382,36 @@ export function enqueueSyncOperation(
   }, 600);
 }
 
+/**
+ * Prevents Firebase Firestore SDK calls (like `batch.commit()` or `getDocs()`)
+ * from hanging indefinitely when Firestore enters exponential backoff on `resource-exhausted`.
+ */
+function withFirestoreTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs = 6000,
+  opName = 'FirestoreOp'
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new Error(
+          `[code=resource-exhausted]: Firestore timeout / maximum backoff delay in ${opName}`
+        )
+      );
+    }, timeoutMs);
+
+    promise
+      .then((res) => {
+        clearTimeout(timer);
+        resolve(res);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 export async function flushSyncOutbox(): Promise<void> {
   if (isFlushingOutbox || outboxMap.size === 0) return;
   if (getIsQuotaExceeded() || !firestoreDb) return;
@@ -427,7 +457,7 @@ export async function flushSyncOutbox(): Promise<void> {
       }
 
       if (opsCount > 0) {
-        await batch.commit();
+        await withFirestoreTimeout(batch.commit(), 6000, 'flushSyncOutbox');
         for (const item of committedKeys) {
           outboxMap.delete(item.key);
           if (item.sig) {
@@ -467,7 +497,7 @@ export async function pushDocsBatchToFirestore(tableName: TableName, items: any[
     enqueueSyncOperation(tableName, docId, { ...item, id: docId }, false);
   }
   if (!getIsQuotaExceeded()) {
-    await flushSyncOutbox();
+    flushSyncOutbox().catch(() => {});
   }
 }
 
@@ -486,7 +516,11 @@ export async function pullTombstonesFromFirestore() {
   if (getIsQuotaExceeded() || !firestoreDb) return;
   try {
     const colRef = collection(firestoreDb, TOMBSTONE_COLLECTION);
-    const snap = await getDocs(colRef);
+    const snap = await withFirestoreTimeout(
+      getDocs(colRef),
+      6000,
+      'pullTombstonesFromFirestore'
+    );
     if (snap.empty) return;
 
     const deletionsByTable = new Map<string, string[]>();
@@ -536,37 +570,44 @@ export async function pullTombstonesFromFirestore() {
   }
 }
 
-// Real-time listener setup for all Firestore collections -> Dexie
-export function initRealtimeSync(): () => void {
-  stopRealtimeSync();
+let isPullingAll = false;
+let isRunningKaizen = false;
+let onlineListenersAttached = false;
 
+// Real-time listener setup for all Firestore collections -> Dexie (idempotent singleton)
+export function initRealtimeSync(): () => void {
   if (getIsQuotaExceeded()) {
     updateSyncStatus({ isSyncing: false, quotaExceeded: true });
     return () => {};
   }
 
   if (!firestoreDb) {
+    updateSyncStatus({ isSyncing: false });
     return () => {};
   }
 
-  const handleOnline = () => {
-    updateSyncStatus({ isOnline: true });
-    flushSyncOutbox().catch(() => {});
-  };
-  const handleOffline = () => updateSyncStatus({ isOnline: false });
-
-  if (typeof window !== 'undefined') {
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
+  // If realtime listeners are already active, do not tear down or re-pull
+  if (unsubscribers.length > 0) {
+    return () => {};
   }
 
-  updateSyncStatus({ isSyncing: true });
+  if (typeof window !== 'undefined' && !onlineListenersAttached) {
+    onlineListenersAttached = true;
+    window.addEventListener('online', () => {
+      updateSyncStatus({ isOnline: true });
+      flushSyncOutbox().catch(() => {});
+    });
+    window.addEventListener('offline', () => {
+      updateSyncStatus({ isOnline: false, isSyncing: false });
+    });
+  }
 
   // Kick off initial background pull & deduplication
   pullAllFromFirestore()
     .then(() => flushSyncOutbox())
     .catch((err) => {
       handleFirestoreError(err, 'InitialSync');
+      updateSyncStatus({ isSyncing: false });
     });
 
   // Listen to remote tombstones in real time
@@ -775,7 +816,11 @@ export function stopRealtimeSync() {
 export async function pullCollectionFromFirestore(tableName: TableName) {
   if (getIsQuotaExceeded() || !firestoreDb) return;
   const colRef = collection(firestoreDb, tableName);
-  const snap = await getDocs(colRef);
+  const snap = await withFirestoreTimeout(
+    getDocs(colRef),
+    7000,
+    `pullCollection:${tableName}`
+  );
 
   const dexieTable = (dexieDb as any)[tableName];
   if (!dexieTable) return;
@@ -1280,6 +1325,8 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
     tablesCleaned: [],
   };
 
+  if (isRunningKaizen) return report;
+  isRunningKaizen = true;
   setRemoteSyncing(true);
   try {
     // 1. Deduplicate Settings -> 'system_settings'
@@ -1561,10 +1608,11 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
     updateSyncStatus({ lastKaizenSummary: summaryText });
   } finally {
     setRemoteSyncing(false);
+    isRunningKaizen = false;
   }
 
   if (!getIsQuotaExceeded()) {
-    await flushSyncOutbox();
+    flushSyncOutbox().catch(() => {});
   }
 
   return report;
@@ -1572,7 +1620,12 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
 
 // Pull all collections from Firestore into Dexie
 export async function pullAllFromFirestore() {
-  if (getIsQuotaExceeded() || !firestoreDb) return;
+  if (getIsQuotaExceeded() || !firestoreDb) {
+    updateSyncStatus({ isSyncing: false });
+    return;
+  }
+  if (isPullingAll) return;
+  isPullingAll = true;
   updateSyncStatus({ isSyncing: true });
 
   try {
@@ -1595,12 +1648,18 @@ export async function pullAllFromFirestore() {
       syncErrors: currentSyncStatus.syncErrors + 1,
       isSyncing: false,
     });
+  } finally {
+    isPullingAll = false;
+    updateSyncStatus({ isSyncing: false });
   }
 }
 
 // Push all changed non-demo local records from Dexie to Firestore
 export async function pushAllToFirestore() {
-  if (getIsQuotaExceeded() || !firestoreDb) return;
+  if (getIsQuotaExceeded() || !firestoreDb) {
+    updateSyncStatus({ isSyncing: false });
+    return;
+  }
   updateSyncStatus({ isSyncing: true });
 
   try {
@@ -1626,6 +1685,8 @@ export async function pushAllToFirestore() {
       syncErrors: currentSyncStatus.syncErrors + 1,
       isSyncing: false,
     });
+  } finally {
+    updateSyncStatus({ isSyncing: false });
   }
 }
 

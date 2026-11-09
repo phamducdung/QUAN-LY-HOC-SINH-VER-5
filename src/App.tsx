@@ -55,16 +55,27 @@ export default function App() {
 
   // Initialize default system tables on load (Clean Slate - No auto demo seed)
   useEffect(() => {
+    let mounted = true;
+    const safetyTimer = setTimeout(() => {
+      if (mounted) setIsInitializing(false);
+    }, 1500);
+
     async function init() {
       try {
         await initializeDefaultSystemData();
       } catch (err) {
         console.error('Dexie system initialization error:', err);
       } finally {
-        setIsInitializing(false);
+        clearTimeout(safetyTimer);
+        if (mounted) setIsInitializing(false);
       }
     }
     init();
+
+    return () => {
+      mounted = false;
+      clearTimeout(safetyTimer);
+    };
   }, []);
 
   // Sync theme to root class and localStorage

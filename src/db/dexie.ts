@@ -98,6 +98,11 @@ export class SmartEduDatabase extends Dexie {
       knowledge_results: 'id, student_id, knowledge_tag_id, [student_id+knowledge_tag_id]',
     });
 
+    this.on('versionchange', () => {
+      this.close();
+      return false;
+    });
+
     this.tables.forEach((table) => {
       const tableName = table.name as TableName;
       table.hook('creating', function (primKey, obj) {
@@ -228,8 +233,8 @@ export async function initializeDefaultSystemData() {
     setRemoteSyncing(false);
   }
 
-  // Always run Kaizen deduplication on init to merge any legacy duplicate IDs
-  await cleanDuplicateStudentSessions();
+  // Run Kaizen deduplication & recovery asynchronously in background so UI boots immediately
+  cleanDuplicateStudentSessions().catch(() => {});
 }
 
 export async function seedDemoData() {
