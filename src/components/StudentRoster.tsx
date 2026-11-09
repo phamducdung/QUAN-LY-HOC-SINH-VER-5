@@ -315,6 +315,10 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
     setStatusInput(st.status);
     setLeaveReason(st.leave_reason || '');
     setNote(st.note || '');
+    const currentEnrolledIds = classStudents
+      .filter((cs) => String(cs.student_id) === String(st.id) && !cs.leave_date)
+      .map((cs) => String(cs.class_id));
+    setEnrollClassIds(currentEnrolledIds);
     setIsModalOpen(true);
   };
 
@@ -337,6 +341,34 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
         updated_at: now,
       };
       await db.students.update(editingStudent.id!, updatePayload);
+
+      // Đồng bộ danh sách lớp được chọn trong modal sửa học sinh
+      const studentIdStr = String(editingStudent.id!);
+      const todayStr = now.split('T')[0];
+      const existingActiveLinks = classStudents.filter(
+        (cs) => String(cs.student_id) === studentIdStr && !cs.leave_date
+      );
+      const existingClassIdSet = new Set<string>(existingActiveLinks.map((cs) => String(cs.class_id)));
+      const selectedClassIdSet = new Set<string>(enrollClassIds.map((id) => String(id)));
+
+      for (const classId of Array.from(selectedClassIdSet)) {
+        if (!existingClassIdSet.has(classId)) {
+          await db.class_students.put({
+            id: `cs_${classId}_${studentIdStr}`,
+            class_id: classId,
+            student_id: studentIdStr,
+            join_date: todayStr,
+            leave_date: undefined,
+            created_at: now,
+          });
+        }
+      }
+
+      for (const link of existingActiveLinks) {
+        if (!selectedClassIdSet.has(String(link.class_id)) && link.id) {
+          await db.class_students.delete(link.id);
+        }
+      }
     } else {
       const addPayload = {
         full_name: fullName,
@@ -764,8 +796,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                       <span className="text-slate-500 dark:text-slate-400">Lớp:</span>
                       {(() => {
                         const enrolled = classStudents
-                          .filter((cs) => cs.student_id === st.id)
-                          .map((cs) => classes.find((c) => c.id === cs.class_id))
+                          .filter((cs) => String(cs.student_id) === String(st.id) && !cs.leave_date)
+                          .map((cs) => classes.find((c) => String(c.id) === String(cs.class_id)))
                           .filter((c): c is ClassItem => !!c);
                         if (enrolled.length === 0) {
                           return <span className="text-rose-600 dark:text-rose-400 font-bold text-[10px]">Chưa xếp lớp</span>;
@@ -958,51 +990,49 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                 />
               </div>
 
-              {!editingStudent && (
-                <div className="pt-2">
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">
-                    Xếp Vào Lớp Học (Có thể chọn nhiều)
-                  </label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-40 overflow-y-auto p-2 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
-                    {classes.filter(c => c.status === 'active').length === 0 ? (
-                      <p className="text-xs text-slate-500 italic col-span-2">Chưa có lớp học nào đang hoạt động. Vui lòng tạo lớp học trước.</p>
-                    ) : (
-                      classes.filter(c => c.status === 'active').map((cls, idx) => {
-                        const isSelected = enrollClassIds.includes(cls.id!);
-                        return (
-                          <label
-                            key={cls.id ? `${cls.id}-${idx}` : idx}
-                            className={`flex items-center gap-2.5 p-2 rounded-lg border cursor-pointer transition-colors ${
-                              isSelected 
-                                ? 'bg-emerald-50 border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-800/50' 
-                                : 'bg-white border-slate-200 hover:border-emerald-200 dark:bg-slate-900 dark:border-slate-700'
-                            }`}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={isSelected}
-                              onChange={(e) => {
-                                if (e.target.checked) {
-                                  setEnrollClassIds(prev => [...prev, cls.id!]);
-                                } else {
-                                  setEnrollClassIds(prev => prev.filter(id => id !== cls.id!));
-                                }
-                              }}
-                              className="w-4 h-4 text-emerald-600 rounded border-slate-300 focus:ring-emerald-500"
-                            />
-                            <div className="flex flex-col">
-                              <span className={`text-xs font-bold ${isSelected ? 'text-emerald-700 dark:text-emerald-400' : 'text-slate-700 dark:text-slate-300'}`}>
-                                {cls.class_name}
-                              </span>
-                              <span className="text-[10px] text-slate-500 font-medium">Khối {cls.grade_level}</span>
-                            </div>
-                          </label>
-                        );
-                      })
-                    )}
-                  </div>
+              <div className="pt-2">
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2">
+                  Xếp Vào Lớp Học (Có thể chọn nhiều)
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-40 overflow-y-auto p-2 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+                  {classes.filter(c => c.status === 'active').length === 0 ? (
+                    <p className="text-xs text-slate-500 italic col-span-2">Chưa có lớp học nào đang hoạt động. Vui lòng tạo lớp học trước.</p>
+                  ) : (
+                    classes.filter(c => c.status === 'active').map((cls, idx) => {
+                      const isSelected = enrollClassIds.some(id => String(id) === String(cls.id));
+                      return (
+                        <label
+                          key={cls.id ? `${cls.id}-${idx}` : idx}
+                          className={`flex items-center gap-2.5 p-2 rounded-lg border cursor-pointer transition-colors ${
+                            isSelected 
+                              ? 'bg-emerald-50 border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-800/50' 
+                              : 'bg-white border-slate-200 hover:border-emerald-200 dark:bg-slate-900 dark:border-slate-700'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setEnrollClassIds(prev => [...prev, String(cls.id!)]);
+                              } else {
+                                setEnrollClassIds(prev => prev.filter(id => String(id) !== String(cls.id!)));
+                              }
+                            }}
+                            className="w-4 h-4 text-emerald-600 rounded border-slate-300 focus:ring-emerald-500"
+                          />
+                          <div className="flex flex-col">
+                            <span className={`text-xs font-bold ${isSelected ? 'text-emerald-700 dark:text-emerald-400' : 'text-slate-700 dark:text-slate-300'}`}>
+                              {cls.class_name}
+                            </span>
+                            <span className="text-[10px] text-slate-500 font-medium">Khối {cls.grade_level}</span>
+                          </div>
+                        </label>
+                      );
+                    })
+                  )}
                 </div>
-              )}
+              </div>
 
               <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-2">
                 <button
@@ -1067,9 +1097,9 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
             {/* Class Filter if they have multiple classes */}
             {(() => {
               const enrolledClassIds = classStudents
-                .filter((cs) => cs.student_id === viewingStudent.id)
-                .map((cs) => cs.class_id);
-              const enrolledClasses = classes.filter((c) => enrolledClassIds.includes(c.id!));
+                .filter((cs) => String(cs.student_id) === String(viewingStudent.id))
+                .map((cs) => String(cs.class_id));
+              const enrolledClasses = classes.filter((c) => enrolledClassIds.includes(String(c.id!)));
               
               if (enrolledClasses.length <= 1) return null;
               
@@ -1128,7 +1158,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                 }`}
               >
                 <Users className="w-4 h-4" />
-                <span>Xếp Lớp & Chuyển Lớp ({classStudents.filter(cs => cs.student_id === viewingStudent.id).length})</span>
+                <span>Xếp Lớp & Chuyển Lớp ({classStudents.filter(cs => String(cs.student_id) === String(viewingStudent.id)).length})</span>
               </button>
               <button
                 onClick={() => setActiveTab('warnings')}

@@ -312,7 +312,8 @@ export function enqueueSyncOperation(
   tableName: TableName,
   rawDocId: string | number,
   data?: any,
-  isDelete = false
+  isDelete = false,
+  forceWrite = false
 ) {
   // Never sync demo records to Firestore to protect daily Spark write quota
   if (!isDelete && data?.is_demo === true) {
@@ -344,14 +345,19 @@ export function enqueueSyncOperation(
       if (cleanData[k] === undefined) delete cleanData[k];
     });
 
+    if (forceWrite) {
+      syncedSignatures.delete(key);
+    }
+
     // Dirty-diff check: skip if signature is identical to already-synced state
     const sig = computePayloadSignature(cleanData);
-    if (syncedSignatures.get(key) === sig && !outboxMap.has(key)) {
+    if (!forceWrite && syncedSignatures.get(key) === sig && !outboxMap.has(key)) {
       return;
     }
 
     // Clear any older tombstone if re-created/updated intentionally
     tombstoneMap.delete(`${tableName}_${docId}`);
+    persistTombstones();
 
     outboxMap.set(key, {
       key,
@@ -637,9 +643,9 @@ export function initRealtimeSync(): () => void {
               const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
 
               if (change.type === 'removed') {
+                // IMPORTANT: Only delete rawDocId, NEVER delete canonicalId when a legacy duplicate UUID is removed!
                 recordLocalTombstone(tableName, rawDocId);
                 docsToDelete.push(rawDocId);
-                if (canonicalId !== rawDocId) docsToDelete.push(canonicalId);
                 const numId = Number(rawDocId);
                 if (!isNaN(numId)) docsToDelete.push(numId);
               } else if (change.type === 'added' || change.type === 'modified') {
@@ -647,15 +653,20 @@ export function initRealtimeSync(): () => void {
                   continue;
                 }
 
-                // Record remote signature so we never re-push identical data back
-                const sig = computePayloadSignature({ ...docData, id: canonicalId });
-                syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+                // Only cache signature under canonicalId if the Firestore document ALREADY has canonicalId as its doc ID
+                if (rawDocId === canonicalId) {
+                  const sig = computePayloadSignature({ ...docData, id: canonicalId });
+                  syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+                } else {
+                  syncedSignatures.delete(`${tableName}/${canonicalId}`);
+                }
 
                 const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
                 if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
                   docsToDelete.push(rawDocId);
                 }
 
+                let mergedRecord: any;
                 if (existing) {
                   const localTime = new Date(
                     existing.updated_at || existing.last_updated || 0
@@ -673,26 +684,34 @@ export function initRealtimeSync(): () => void {
                   }
 
                   if (remoteTime >= localTime) {
-                    docsToPut.push({
+                    mergedRecord = {
                       ...existing,
                       ...docData,
                       id: canonicalId,
                       updated_at: docData.updated_at || new Date().toISOString(),
-                    });
+                    };
                   } else {
-                    docsToPut.push({
+                    mergedRecord = {
                       ...docData,
                       ...existing,
                       id: canonicalId,
                       updated_at: existing.updated_at || new Date().toISOString(),
-                    });
+                    };
                   }
                 } else {
-                  docsToPut.push({
+                  mergedRecord = {
                     ...docData,
                     id: canonicalId,
                     updated_at: docData.updated_at || new Date().toISOString(),
-                  });
+                  };
+                }
+
+                docsToPut.push(mergedRecord);
+
+                // If remote doc was using a legacy non-canonical ID, migrate it to canonicalId on Firestore
+                if (rawDocId !== canonicalId) {
+                  enqueueSyncOperation(tableName, canonicalId, mergedRecord, false, true);
+                  enqueueSyncOperation(tableName, rawDocId, null, true);
                 }
               }
             }
@@ -785,14 +804,21 @@ export async function pullCollectionFromFirestore(tableName: TableName) {
       }
 
       remoteCanonicalIds.add(canonicalId);
-      const sig = computePayloadSignature({ ...docData, id: canonicalId });
-      syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+
+      // Only mark canonicalId as synced if the Firestore doc actually lives at canonicalId
+      if (rawDocId === canonicalId) {
+        const sig = computePayloadSignature({ ...docData, id: canonicalId });
+        syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+      } else {
+        syncedSignatures.delete(`${tableName}/${canonicalId}`);
+      }
 
       if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
         docsToDelete.push(rawDocId);
       }
 
       const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
+      let mergedRecord: any;
       if (existing) {
         const localTime = new Date(
           existing.updated_at || existing.last_updated || 0
@@ -810,45 +836,55 @@ export async function pullCollectionFromFirestore(tableName: TableName) {
         }
 
         if (remoteTime >= localTime) {
-          docsToPut.push({
+          mergedRecord = {
             ...existing,
             ...docData,
             id: canonicalId,
             updated_at: docData.updated_at || new Date().toISOString(),
-          });
+          };
         } else {
-          docsToPut.push({
+          mergedRecord = {
             ...docData,
             ...existing,
             id: canonicalId,
             updated_at: existing.updated_at || new Date().toISOString(),
-          });
+          };
         }
       } else {
-        docsToPut.push({
+        mergedRecord = {
           ...docData,
           id: canonicalId,
           updated_at: docData.updated_at || new Date().toISOString(),
-        });
+        };
+      }
+
+      docsToPut.push(mergedRecord);
+
+      // If Firestore document was stored under a legacy UUID instead of canonicalId,
+      // force-write the canonical document and delete the legacy UUID document
+      if (rawDocId !== canonicalId) {
+        enqueueSyncOperation(tableName, canonicalId, mergedRecord, false, true);
+        enqueueSyncOperation(tableName, rawDocId, null, true);
       }
     }
 
-    // Reconcile local records that were deleted remotely (prevent Zombie Data resurrection)
+    // Reconcile local records: only delete locally if explicitly tombstoned.
+    // If a local record is NOT tombstoned and missing from remote, re-push it to Firestore so no data is lost!
     existingList.forEach((localItem: any) => {
       if (!localItem?.id || localItem.is_demo === true) return;
       const localIdStr = String(localItem.id);
-      const outboxKey = `${tableName}/${localIdStr}`;
+      const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
 
-      if (isRecordTombstoned(tableName, localIdStr, localItem.updated_at)) {
+      if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
         docsToDelete.push(localItem.id);
-      } else if (
-        !remoteCanonicalIds.has(localIdStr) &&
-        syncedSignatures.has(outboxKey) &&
-        !outboxMap.has(outboxKey)
-      ) {
-        // Record was previously synced to Cloud, is not in local Outbox, and is now missing from Cloud -> deleted remotely
-        docsToDelete.push(localItem.id);
-        syncedSignatures.delete(outboxKey);
+      } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
+        enqueueSyncOperation(
+          tableName,
+          canonicalLocalId,
+          { ...localItem, id: canonicalLocalId },
+          false,
+          true
+        );
       }
     });
 
@@ -866,6 +902,370 @@ export async function pullCollectionFromFirestore(tableName: TableName) {
   } finally {
     setRemoteSyncing(false);
   }
+}
+
+/**
+ * Automatically recovers any missing `class_students` enrollments that were accidentally
+ * lost during legacy UUID -> Canonical ID migration, using evidence from:
+ * 1. `student_sessions` + `sessions`
+ * 2. `warnings`
+ * 3. `audit_logs` (snapshots, diffs, class_id/student_id, and enrollment/transfer descriptions)
+ * 4. False tombstones in `deleted_records` (`cs_${class_id}_${student_id}`)
+ * 5. Unassigned student creation logs (`Thêm mới học sinh ... và ghi danh vào N lớp`)
+ */
+export async function recoverMissingClassEnrollments(): Promise<number> {
+  let recoveredCount = 0;
+  try {
+    const [
+      allClasses,
+      allStudents,
+      allClassStudents,
+      allSessions,
+      allStudentSessions,
+      allWarnings,
+      allAuditLogs,
+    ] = await Promise.all([
+      dexieDb.classes.toArray(),
+      dexieDb.students.toArray(),
+      dexieDb.class_students.toArray(),
+      dexieDb.sessions.toArray(),
+      dexieDb.student_sessions.toArray(),
+      dexieDb.warnings.toArray(),
+      dexieDb.audit_logs.toArray(),
+    ]);
+
+    const realClasses = allClasses.filter((c) => c && c.id && c.is_demo !== true);
+    const realStudents = allStudents.filter((s) => s && s.id && s.is_demo !== true);
+    if (realClasses.length === 0 || realStudents.length === 0) return 0;
+
+    const classById = new Map<string, any>();
+    const classByNameNorm = new Map<string, any>();
+    realClasses.forEach((c) => {
+      classById.set(String(c.id), c);
+      if (c.class_name) {
+        classByNameNorm.set(c.class_name.trim().toLowerCase(), c);
+      }
+    });
+
+    const studentById = new Map<string, any>();
+    const studentsByNameNorm = new Map<string, any[]>();
+    realStudents.forEach((s) => {
+      studentById.set(String(s.id), s);
+      if (s.full_name) {
+        const key = s.full_name.trim().toLowerCase();
+        if (!studentsByNameNorm.has(key)) studentsByNameNorm.set(key, []);
+        studentsByNameNorm.get(key)!.push(s);
+      }
+    });
+
+    const sessionById = new Map<string, any>();
+    allSessions.forEach((sess) => {
+      if (sess?.id) sessionById.set(String(sess.id), sess);
+    });
+
+    const existingLinks = new Set<string>();
+    const studentEnrolledCount = new Map<string, number>();
+    allClassStudents.forEach((cs) => {
+      if (cs?.class_id && cs?.student_id) {
+        const key = `cs_${String(cs.class_id)}_${String(cs.student_id)}`;
+        existingLinks.add(key);
+        studentEnrolledCount.set(
+          String(cs.student_id),
+          (studentEnrolledCount.get(String(cs.student_id)) || 0) + 1
+        );
+      }
+    });
+
+    // Sort audit logs chronologically (oldest -> newest)
+    const sortedLogs = [...allAuditLogs].sort((a, b) =>
+      String(a.timestamp || '').localeCompare(String(b.timestamp || ''))
+    );
+
+    // Track explicit teacher removals vs enrollments
+    const explicitlyRemoved = new Set<string>();
+    const recoveredMap = new Map<
+      string,
+      {
+        id: string;
+        class_id: string;
+        student_id: string;
+        join_date: string;
+        leave_date?: string;
+        created_at: string;
+        updated_at: string;
+      }
+    >();
+
+    const addCandidate = (
+      classIdRaw: string | number,
+      studentIdRaw: string | number,
+      joinDate?: string,
+      leaveDate?: string
+    ) => {
+      const classId = String(classIdRaw);
+      const studentId = String(studentIdRaw);
+      if (!classById.has(classId) || !studentById.has(studentId)) return;
+      const canonicalId = `cs_${classId}_${studentId}`;
+      if (existingLinks.has(canonicalId)) return;
+
+      const st = studentById.get(studentId);
+      const now = new Date().toISOString();
+      const defaultJoin =
+        joinDate ||
+        (st?.created_at ? String(st.created_at).split('T')[0] : now.split('T')[0]);
+
+      const prev = recoveredMap.get(canonicalId);
+      recoveredMap.set(canonicalId, {
+        id: canonicalId,
+        class_id: classId,
+        student_id: studentId,
+        join_date: prev?.join_date || defaultJoin,
+        leave_date: leaveDate !== undefined ? leaveDate : prev?.leave_date,
+        created_at: st?.created_at || now,
+        updated_at: now,
+      });
+    };
+
+    // 1. Check tombstones for any `cs_${classId}_${studentId}` that were created by migration
+    tombstoneMap.forEach((tomb) => {
+      if (tomb.table_name === 'class_students' && tomb.record_id?.startsWith('cs_')) {
+        for (const cls of realClasses) {
+          const cid = String(cls.id);
+          const prefix = `cs_${cid}_`;
+          if (tomb.record_id.startsWith(prefix)) {
+            const sid = tomb.record_id.slice(prefix.length);
+            if (studentById.has(sid)) {
+              addCandidate(cid, sid);
+            }
+          }
+        }
+      }
+    });
+
+    // 2. Evidence from `student_sessions` + `sessions`
+    allStudentSessions.forEach((ss) => {
+      if (!ss?.session_id || !ss?.student_id) return;
+      const sess = sessionById.get(String(ss.session_id));
+      if (sess?.class_id) {
+        addCandidate(sess.class_id, ss.student_id, sess.session_date);
+      }
+    });
+
+    // 3. Evidence from `warnings`
+    allWarnings.forEach((w) => {
+      if (w?.class_id && w?.student_id) {
+        const joinDate = w.created_at ? String(w.created_at).split('T')[0] : undefined;
+        addCandidate(w.class_id, w.student_id, joinDate);
+      }
+    });
+
+    // 4. Evidence from `audit_logs` (snapshots, diffs, and text descriptions)
+    for (const log of sortedLogs) {
+      const logDate = log.timestamp ? String(log.timestamp).split('T')[0] : undefined;
+      const resolvedClassId =
+        log.class_id ||
+        log.snapshot?.class_id ||
+        (log.session_id ? sessionById.get(String(log.session_id))?.class_id : undefined);
+
+      if (resolvedClassId && log.student_id) {
+        addCandidate(resolvedClassId, log.student_id, logDate);
+      }
+
+      if (resolvedClassId && Array.isArray(log.diffs)) {
+        log.diffs.forEach((d) => {
+          if (d?.student_id) addCandidate(resolvedClassId, d.student_id, logDate);
+        });
+      }
+
+      if (resolvedClassId && Array.isArray(log.snapshot?.records)) {
+        log.snapshot!.records.forEach((r) => {
+          if (r?.student_id) addCandidate(resolvedClassId, r.student_id, logDate);
+        });
+      }
+
+      const desc = (log.description || '').trim();
+      if (!desc) continue;
+
+      // Match explicit removal:
+      // "Xóa vĩnh viễn học sinh ${name} khỏi lớp ${class}" or "Xóa ${name} khỏi lớp ${class}"
+      if (
+        log.action_type === 'Xóa học sinh khỏi lớp' ||
+        desc.startsWith('Xóa vĩnh viễn học sinh ') ||
+        desc.startsWith('Xóa ')
+      ) {
+        for (const [cNameNorm, cls] of classByNameNorm.entries()) {
+          const suffix = ` khỏi lớp ${cNameNorm}`;
+          if (desc.toLowerCase().endsWith(suffix)) {
+            for (const [sNameNorm, stList] of studentsByNameNorm.entries()) {
+              if (desc.toLowerCase().includes(sNameNorm)) {
+                stList.forEach((st) => {
+                  explicitlyRemoved.add(`cs_${String(cls.id)}_${String(st.id)}`);
+                });
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      // Match enrollments, transfers, withdrawals, and restorations by class name & student name
+      for (const [cNameNorm, cls] of classByNameNorm.entries()) {
+        if (!desc.toLowerCase().includes(cNameNorm)) continue;
+        for (const [sNameNorm, stList] of studentsByNameNorm.entries()) {
+          if (!desc.toLowerCase().includes(sNameNorm)) continue;
+          stList.forEach((st) => {
+            const cKey = `cs_${String(cls.id)}_${String(st.id)}`;
+            if (
+              desc.startsWith('Xếp học sinh ') ||
+              desc.startsWith('Khôi phục ')
+            ) {
+              explicitlyRemoved.delete(cKey);
+              addCandidate(cls.id, st.id, logDate, undefined);
+            } else if (desc.startsWith('Cho học sinh ') && desc.includes('rút lui an toàn')) {
+              addCandidate(cls.id, st.id, undefined, logDate);
+            } else if (desc.startsWith('Chuyển học sinh ')) {
+              const lower = desc.toLowerCase();
+              const fromIdx = lower.indexOf(`từ lớp ${cNameNorm}`);
+              const toIdx = lower.indexOf(`sang lớp ${cNameNorm}`);
+              if (fromIdx !== -1) {
+                addCandidate(cls.id, st.id, undefined, logDate);
+              } else if (toIdx !== -1) {
+                explicitlyRemoved.delete(cKey);
+                addCandidate(cls.id, st.id, logDate, undefined);
+              }
+            }
+          });
+        }
+      }
+    }
+
+    // 5. Check students who still have 0 classes (neither in existingLinks nor recoveredMap)
+    const activeRealClasses = realClasses.filter((c) => c.status === 'active');
+
+    // Map each student's known/recovered classes so we can also use batch-creation proximity
+    const studentClassesKnown = new Map<string, string[]>();
+    allClassStudents.forEach((cs) => {
+      if (cs?.student_id && cs?.class_id) {
+        const sid = String(cs.student_id);
+        if (!studentClassesKnown.has(sid)) studentClassesKnown.set(sid, []);
+        studentClassesKnown.get(sid)!.push(String(cs.class_id));
+      }
+    });
+    recoveredMap.forEach((rec) => {
+      if (!explicitlyRemoved.has(rec.id)) {
+        const sid = String(rec.student_id);
+        if (!studentClassesKnown.has(sid)) studentClassesKnown.set(sid, []);
+        studentClassesKnown.get(sid)!.push(String(rec.class_id));
+      }
+    });
+
+    for (const st of realStudents) {
+      const sid = String(st.id);
+      if ((studentClassesKnown.get(sid)?.length || 0) > 0) continue;
+
+      // Check if audit log says this student was enrolled in >= 1 class upon creation
+      const creationLog = sortedLogs.find(
+        (l) =>
+          l.description &&
+          l.description.toLowerCase().includes(st.full_name.trim().toLowerCase()) &&
+          l.description.includes('và ghi danh vào ')
+      );
+      const matchCount = creationLog?.description?.match(/ghi danh vào (\d+) lớp/);
+      const intendedClassCount = matchCount ? Number(matchCount[1]) : st.status === 'studying' ? 1 : 0;
+
+      if (intendedClassCount <= 0) continue;
+
+      // Case 5a: Only 1 active class exists in the system (or activeRealClasses.length === intendedClassCount)
+      if (activeRealClasses.length > 0 && activeRealClasses.length === intendedClassCount) {
+        activeRealClasses.forEach((cls) => {
+          const cKey = `cs_${String(cls.id)}_${sid}`;
+          if (!explicitlyRemoved.has(cKey)) {
+            addCandidate(cls.id, sid);
+          }
+        });
+        continue;
+      }
+
+      // Case 5b: Match class name or grade level mentioned in student's note
+      const noteNorm = (st.note || '').trim().toLowerCase();
+      if (noteNorm) {
+        const matchedByNote = activeRealClasses.filter((cls) => {
+          const cName = (cls.class_name || '').trim().toLowerCase();
+          const shortCode = cName.split(' - ')[0].trim();
+          return (
+            (shortCode && noteNorm.includes(shortCode)) ||
+            noteNorm.includes(`khối ${cls.grade_level}`) ||
+            noteNorm.includes(`lớp ${cls.grade_level}`)
+          );
+        });
+        if (matchedByNote.length === 1) {
+          const cKey = `cs_${String(matchedByNote[0].id)}_${sid}`;
+          if (!explicitlyRemoved.has(cKey)) {
+            addCandidate(matchedByNote[0].id, sid);
+            continue;
+          }
+        }
+      }
+
+      // Case 5c: Batch-creation temporal proximity (student created near another student whose class is known, or right after a class was created)
+      const stTime = new Date(st.created_at || creationLog?.timestamp || 0).getTime();
+      if (stTime > 0) {
+        let bestClassId: string | null = null;
+        let minDiff = 45 * 60 * 1000; // 45 minutes window
+
+        for (const otherSt of realStudents) {
+          if (String(otherSt.id) === sid) continue;
+          const knownCids = studentClassesKnown.get(String(otherSt.id));
+          if (!knownCids || knownCids.length === 0) continue;
+          const otherTime = new Date(otherSt.created_at || 0).getTime();
+          const diff = Math.abs(stTime - otherTime);
+          if (diff < minDiff) {
+            minDiff = diff;
+            bestClassId = knownCids[0];
+          }
+        }
+
+        if (!bestClassId) {
+          for (const cls of activeRealClasses) {
+            const clsTime = new Date(cls.created_at || 0).getTime();
+            const diff = stTime - clsTime;
+            if (diff >= -60000 && diff < 60 * 60 * 1000) {
+              bestClassId = String(cls.id);
+            }
+          }
+        }
+
+        if (bestClassId && !explicitlyRemoved.has(`cs_${bestClassId}_${sid}`)) {
+          addCandidate(bestClassId, sid);
+        }
+      }
+    }
+
+    // Filter out any explicitly removed relationships
+    const finalRecordsToRestore = Array.from(recoveredMap.values()).filter(
+      (rec) => !explicitlyRemoved.has(rec.id) && !existingLinks.has(rec.id)
+    );
+
+    if (finalRecordsToRestore.length > 0) {
+      await dexieDb.transaction('rw', dexieDb.class_students, async () => {
+        await dexieDb.class_students.bulkPut(finalRecordsToRestore as any);
+      });
+
+      for (const rec of finalRecordsToRestore) {
+        const tombKey = `class_students_${rec.id}`;
+        tombstoneMap.delete(tombKey);
+        if (firestoreDb && !getIsQuotaExceeded()) {
+          deleteDoc(doc(firestoreDb, TOMBSTONE_COLLECTION, tombKey)).catch(() => {});
+        }
+        enqueueSyncOperation('class_students', rec.id, rec, false, true);
+      }
+      persistTombstones();
+      recoveredCount = finalRecordsToRestore.length;
+    }
+  } catch (err) {
+    console.warn('[SyncService] Error in recoverMissingClassEnrollments:', err);
+  }
+  return recoveredCount;
 }
 
 /**
@@ -911,7 +1311,7 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
           await dexieDb.settings.put(mergedSetting);
         });
         oldSettingIds.forEach((oldId) => enqueueSyncOperation('settings', oldId, null, true));
-        enqueueSyncOperation('settings', 'system_settings', mergedSetting, false);
+        enqueueSyncOperation('settings', 'system_settings', mergedSetting, false, true);
         report.mergedRecords += 1;
         report.deletedDuplicates += oldSettingIds.length;
         report.tablesCleaned.push('settings');
@@ -969,12 +1369,15 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
             });
             if (classesToUpdate.length > 0) {
               await dexieDb.classes.bulkPut(classesToUpdate);
+              classesToUpdate.forEach((c) =>
+                enqueueSyncOperation('classes', c.id, c, false, true)
+              );
               report.remappedForeignKeys += classesToUpdate.length;
             }
           }
         });
         yearIdsToDelete.forEach((id) => enqueueSyncOperation('school_years', id, null, true));
-        yearsToPut.forEach((y) => enqueueSyncOperation('school_years', y.id, y, false));
+        yearsToPut.forEach((y) => enqueueSyncOperation('school_years', y.id, y, false, true));
         report.mergedRecords += yearsToPut.length;
         report.deletedDuplicates += yearIdsToDelete.length;
         report.tablesCleaned.push('school_years');
@@ -1033,7 +1436,9 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
           }
         });
         ssIdsToDelete.forEach((id) => enqueueSyncOperation('student_sessions', id, null, true));
-        ssToPut.forEach((rec) => enqueueSyncOperation('student_sessions', rec.id, rec, false));
+        ssToPut.forEach((rec) =>
+          enqueueSyncOperation('student_sessions', rec.id, rec, false, true)
+        );
         report.mergedRecords += ssToPut.length;
         report.deletedDuplicates += ssIdsToDelete.length;
         report.tablesCleaned.push('student_sessions');
@@ -1081,7 +1486,9 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
           }
         });
         csIdsToDelete.forEach((id) => enqueueSyncOperation('class_students', id, null, true));
-        csToPut.forEach((rec) => enqueueSyncOperation('class_students', rec.id, rec, false));
+        csToPut.forEach((rec) =>
+          enqueueSyncOperation('class_students', rec.id, rec, false, true)
+        );
         report.mergedRecords += csToPut.length;
         report.deletedDuplicates += csIdsToDelete.length;
         report.tablesCleaned.push('class_students');
@@ -1129,16 +1536,27 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
           }
         });
         krIdsToDelete.forEach((id) => enqueueSyncOperation('knowledge_results', id, null, true));
-        krToPut.forEach((rec) => enqueueSyncOperation('knowledge_results', rec.id, rec, false));
+        krToPut.forEach((rec) =>
+          enqueueSyncOperation('knowledge_results', rec.id, rec, false, true)
+        );
         report.mergedRecords += krToPut.length;
         report.deletedDuplicates += krIdsToDelete.length;
         report.tablesCleaned.push('knowledge_results');
       }
     }
 
+    // 6. Auto-recover any missing class_students relationships from sessions, warnings, audit logs & tombstones
+    const recoveredEnrollments = await recoverMissingClassEnrollments();
+    if (recoveredEnrollments > 0) {
+      report.mergedRecords += recoveredEnrollments;
+      if (!report.tablesCleaned.includes('class_students')) {
+        report.tablesCleaned.push('class_students');
+      }
+    }
+
     const summaryText =
       report.deletedDuplicates > 0 || report.mergedRecords > 0
-        ? `Đã chuẩn hóa ${report.mergedRecords} bản ghi & dọn sạch ${report.deletedDuplicates} bản sao trùng lặp.`
+        ? `Đã chuẩn hóa & khôi phục ${report.mergedRecords} bản ghi, dọn sạch ${report.deletedDuplicates} bản sao trùng lặp.`
         : 'Cơ sở dữ liệu đã chuẩn hóa 100% (0 bản ghi trùng lặp).';
     updateSyncStatus({ lastKaizenSummary: summaryText });
   } finally {

@@ -1065,9 +1065,9 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
             {/* Sub-tab 1 Content: Class Roster */}
             {detailSubTab === 'roster' && (
               <div className="space-y-3">
-                {/* Roster Filter Status */}
-                <div className="flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+                {/* Roster Filter Status & Quick Enroll */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
+                  <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl shrink-0">
                     <button
                       onClick={() => setRosterFilterStatus('active')}
                       className={`px-3 py-1 rounded-lg font-bold text-[11px] ${
@@ -1112,6 +1112,112 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                       })
                     </button>
                   </div>
+
+                  {isAdmin && (() => {
+                    const activeClassIdStr = String(viewingClassDetails.id);
+                    const enrolledInThisClass = new Set(
+                      classStudents
+                        .filter((cs) => String(cs.class_id) === activeClassIdStr && !cs.leave_date)
+                        .map((cs) => String(cs.student_id))
+                    );
+                    const enrolledAnywhere = new Set(
+                      classStudents
+                        .filter((cs) => !cs.leave_date)
+                        .map((cs) => String(cs.student_id))
+                    );
+                    const availableToEnroll = students
+                      .filter((s) => s.status !== 'stopped' && !enrolledInThisClass.has(String(s.id)))
+                      .sort((a, b) => compareVietnameseNames(a.full_name || '', b.full_name || ''));
+                    const unassignedStudents = availableToEnroll.filter(
+                      (s) => !enrolledAnywhere.has(String(s.id))
+                    );
+
+                    if (availableToEnroll.length === 0) return null;
+
+                    return (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <select
+                          id="quick-enroll-student-select"
+                          defaultValue=""
+                          className="text-[11px] bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 rounded-xl outline-none font-bold text-slate-700 dark:text-slate-200 max-w-[210px]"
+                        >
+                          <option value="">+ Chọn học sinh thêm vào lớp...</option>
+                          {availableToEnroll.map((s) => {
+                            const hasNoClass = !enrolledAnywhere.has(String(s.id));
+                            return (
+                              <option key={s.id} value={s.id}>
+                                {s.full_name} {hasNoClass ? '(Chưa xếp lớp)' : ''}
+                              </option>
+                            );
+                          })}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const sel = document.getElementById('quick-enroll-student-select') as HTMLSelectElement;
+                            if (!sel || !sel.value) return;
+                            const stId = String(sel.value);
+                            const stObj = students.find((s) => String(s.id) === stId);
+                            const now = new Date().toISOString();
+                            await db.class_students.put({
+                              id: `cs_${activeClassIdStr}_${stId}`,
+                              class_id: activeClassIdStr,
+                              student_id: stId,
+                              join_date: now.split('T')[0],
+                              leave_date: undefined,
+                              created_at: now,
+                            });
+                            if (stObj) {
+                              await logAudit(
+                                currentRole as UserRole,
+                                'Xếp học sinh vào lớp',
+                                `Xếp học sinh ${stObj.full_name} học thêm lớp ${viewingClassDetails.class_name}`
+                              );
+                            }
+                            sel.value = '';
+                            onRefresh();
+                          }}
+                          className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-[11px] transition-colors cursor-pointer shrink-0"
+                        >
+                          Thêm vào lớp
+                        </button>
+                        {unassignedStudents.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (
+                                confirm(
+                                  `Xác nhận xếp toàn bộ ${unassignedStudents.length} học sinh đang ở trạng thái "Chưa xếp lớp" vào lớp ${viewingClassDetails.class_name}?`
+                                )
+                              ) {
+                                const now = new Date().toISOString();
+                                const todayStr = now.split('T')[0];
+                                const records = unassignedStudents.map((s) => ({
+                                  id: `cs_${activeClassIdStr}_${String(s.id)}`,
+                                  class_id: activeClassIdStr,
+                                  student_id: String(s.id!),
+                                  join_date: todayStr,
+                                  leave_date: undefined,
+                                  created_at: now,
+                                }));
+                                await db.class_students.bulkPut(records);
+                                await logAudit(
+                                  currentRole as UserRole,
+                                  'Xếp lớp hàng loạt',
+                                  `Xếp ${unassignedStudents.length} học sinh chưa phân lớp vào lớp ${viewingClassDetails.class_name}`
+                                );
+                                onRefresh();
+                              }
+                            }}
+                            className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-[11px] transition-colors cursor-pointer shrink-0"
+                            title="Tự động thêm tất cả học sinh chưa có lớp vào lớp học này"
+                          >
+                            + Xếp {unassignedStudents.length} HS chưa có lớp
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 <div className="overflow-x-auto">
