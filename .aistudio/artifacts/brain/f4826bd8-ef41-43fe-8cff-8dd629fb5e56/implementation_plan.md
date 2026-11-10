@@ -1,41 +1,63 @@
-# Kế Hoạch Chuyển Đổi Cơ Sở Dữ Liệu Sang SQL (PostgreSQL) — Không Giới Hạn Lượt Đọc/Ghi
+# Kế Hoạch Chia Nhỏ Kiểm Tra & Khắc Phục Triệt Để Từng Tính Năng (6 Module)
 
-## 1. Mục Tiêu Nâng Cấp
-Chuyển đổi tầng lưu trữ đám mây từ **Firebase Firestore (giới hạn 20.000 lượt ghi/ngày)** sang **Cơ sở dữ liệu quan hệ PostgreSQL (Cloud SQL + Drizzle ORM)** kết hợp **IndexedDB (Dexie.js)** tại trình duyệt:
-- **Không giới hạn số lượt đọc/ghi mỗi ngày**: Cơ sở dữ liệu SQL tính theo dung lượng lưu trữ thay vì đếm từng dòng điểm số (`student_sessions`), giúp Thầy/Cô thoải mái nhập điểm cho hàng chục lớp, hàng nghìn buổi học mà không bao giờ gặp lỗi `Quota limit exceeded`.
-- **Chuẩn quan hệ khóa ngoại (Foreign Keys) chặt chẽ**: Đảm bảo liên kết giữa Lớp học (`classes`) – Học sinh (`students`) – Phân lớp (`class_students`) – Buổi học (`sessions`) – Điểm số (`student_sessions`) không bao giờ bị lệch hoặc mất liên kết khi triển khai lại.
-- **Tối ưu hóa bảng Nhật ký thao tác (`audit_logs`)**: Chỉ lưu các bản chụp khôi phục điểm (Snapshot) gần nhất để giữ cơ sở dữ liệu luôn nhẹ và tốc độ đồng bộ tức thì.
+## 1. Chẩn Đoán Nguyên Nhân Gốc Rễ Gây Treo Đơ Toàn Hệ Thống
 
----
+Qua việc rà soát trực tiếp mã nguồn của từng tính năng và đối chiếu với hiện tượng Thầy/Cô gặp phải trên cả **AI Studio** và **Vercel (`quan-ly-hoc-sinh-ver-5.vercel.app`)**, có **4 nguyên nhân kỹ thuật trực tiếp** làm đơ luồng xử lý chính (Main Thread) của trình duyệt:
 
-## 2. Kiến Trúc Cơ Sở Dữ Liệu SQL (PostgreSQL + Drizzle ORM)
-
-### 2.1. Sơ đồ bảng quan hệ (`src/db/schema.ts`)
-Thiết kế 12 bảng chuẩn hóa trên PostgreSQL đồng bộ 1-1 với cấu trúc ứng dụng:
-1. **`users`**: Lưu tài khoản Giáo viên & Trợ giảng (`uid`, `email`, `role`, `created_at`).
-2. **`school_years`**: Năm học (`id` khóa chuẩn `sy_...`, `name`, `is_active`).
-3. **`classes`**: Lớp học (`id`, `school_year_id`, `class_name`, `class_type`, `grade_level`, `target_description`, `schedule`, `assistant_name`, `assistant_phone`, `status`).
-4. **`students`**: Hồ sơ học sinh (`id`, `full_name`, `gender`, `parent_name`, `parent_phone`, `status`, `leave_reason`, `note`).
-5. **`class_students`**: Bảng nối Phân lớp học sinh (`id` khóa chuẩn `cs_${class_id}_${student_id}`, `class_id`, `student_id`, `join_date`, `leave_date`).
-6. **`sessions`**: Buổi dạy học (`id`, `class_id`, `session_date`, `lesson_title`, `knowledge_tag_id`, `test_max_score`).
-7. **`student_sessions`**: Điểm danh & Điểm số từng buổi (`id` khóa chuẩn `ss_${session_id}_${student_id}`, `session_id`, `student_id`, `attendance`, `homework_score`, `test_score`, `custom_comment`, các cờ miễn/nộp muộn).
-8. **`knowledge_tags`** & **`knowledge_results`**: Chuyên đề Toán THCS & Độ thành thạo (`kr_${student_id}_${knowledge_tag_id}`).
-9. **`warnings`** & **`ai_diagnoses`**: Cảnh báo học tập P1/P2/P3 & Kết quả chẩn đoán AI.
-10. **`audit_logs`** & **`deleted_records`**: Nhật ký thao tác (tự động giữ 100 bản ghi mới nhất có kèm Snapshot hoàn tác điểm) và bảng đối soát xóa (Tombstone).
+1. **Bão đồng bộ ngược từ bộ nhớ đệm IndexedDB cũ trên trình duyệt (`syncService.ts`)**:
+   - Trình duyệt của Thầy/Cô vẫn đang lưu khoảng **2.500 bản ghi cũ/trùng lặp** trong IndexedDB (`SmartEduMathDatabase`) và `localStorage` (`smart_edu_sync_outbox_v2`, `smart_edu_tombstones_v2`).
+   - Khi hàm `pullAllFromSupabase()` chạy, đoạn mã `existingList.forEach` phát hiện hàng nghìn bản ghi cũ dưới máy không khớp với dữ liệu chuẩn trên Supabase và gọi `enqueueSyncOperation()` lặp lại hàng nghìn lần.
+   - Mỗi lần gọi `enqueueSyncOperation()` lại ghi đồng bộ `localStorage.setItem` (`persistOutbox()`) và phát sự kiện cập nhật React (`updateSyncStatus()`) ngay trong vòng lặp, đồng thời kích hoạt ngược kênh `postgres_changes` của Supabase, làm **treo cứng toàn bộ trình duyệt (`Page Unresponsive`)** và khiến việc bấm chuyển menu bên trái không phản hồi.
+2. **Xung đột chạy kép lúc khởi động (`dexie.ts` & `syncService.ts`)**:
+   - Khi mở ứng dụng, `initializeDefaultSystemData()` gọi `cleanDuplicateStudentSessions()` (`kaizenDeduplicateAndMerge()`) cùng lúc với `initRealtimeSync()` gọi `pullAllFromSupabase()`, gây khóa chéo (deadlock/race condition) các bảng IndexedDB khi Thầy/Cô thao tác.
+3. **Lỗi tham chiếu mảng mới liên tục `useLiveQuery(...) || []` ở các tab menu**:
+   - Trong `Dashboard.tsx`, `ClassManagement.tsx`, `StudentRoster.tsx`, `GradebookView.tsx` và `SessionHistoryModal.tsx`, cú pháp `useLiveQuery(...) || []` tạo ra một mảng `[]` mới ở mỗi chu kỳ render khi IndexedDB đang bận, ép các hook `useMemo` tính toán lại liên tục khi bấm chuyển tab.
+4. **Lệch kiểu dữ liệu ID (`string` vs `number`) và bất đồng bộ khi Thêm/Sửa/Xóa ở Quản lý Lớp, Học sinh & Nhập điểm**:
+   - Một số truy vấn `.where('class_id').equals(...)` hoặc `.find(c => c.id === selectedClassId)` so sánh tuyệt đối mà không ép kiểu `String(...)`, khiến việc chọn lớp/buổi học hoặc xóa/sửa dữ liệu bị trượt ID hoặc không cập nhật tức thì lên Supabase.
 
 ---
 
-## 3. Lộ Trình Triển Khai Kỹ Thuật
+## 2. Phương Án Kiểm Tra & Khắc Phục Chia Nhỏ Theo 6 Module
 
-### Bước 1: Khởi tạo PostgreSQL (Cloud SQL) & Xác thực
-- Kiểm tra điều kiện & cấp phát thực thể **Cloud SQL for PostgreSQL** qua công cụ tích hợp của hệ thống.
-- Cấu hình kết nối `pg.Pool` (`src/db/index.ts`) và `src/db/drizzle.config.ts` với Drizzle ORM.
+### Module 1: Khởi Tạo Hệ Thống, Dọn Sạch Cache Cũ & Đồng Bộ Supabase (`src/services/syncService.ts`, `src/db/dexie.ts`)
+- **Cơ chế Tự động Làm sạch Cache một lần (`SMART_EDU_SUPABASE_SYNC_VERSION = 'v5_supabase_clean_reset'`)**:
+  - Ngay khi khởi động ứng dụng trên trình duyệt (cả AI Studio và Vercel), nếu phát hiện trình duyệt chưa chạy cờ `v5_supabase_clean_reset`, hệ thống tự động xóa sạch `outboxMap`, `tombstoneMap`, `syncedSignatures` cũ trong `localStorage`/`sessionStorage` và làm sạch các bảng cục bộ trong IndexedDB trước khi tải 100% bộ dữ liệu chuẩn từ Supabase về.
+- **Loại bỏ nghẽn `persistOutbox()` và `updateSyncStatus()` trong vòng lặp**:
+  - Chuyển `persistOutbox()` và `persistTombstones()` sang cơ chế gom nhóm (debounce), tuyệt đối không gọi `localStorage.setItem` hàng nghìn lần trong vòng lặp.
+  - Khi Supabase đã có dữ liệu chuẩn (`totalRemoteRecords > 0`), chặn việc tự động đẩy ngược các bản ghi rác/cũ không chuẩn từ máy lên lại Supabase; đồng thời kiểm tra và dọn sạch lại các bản ghi rác nếu trình duyệt cũ vừa đẩy nhầm lên Supabase.
+- **Tắt chạy kép `cleanDuplicateStudentSessions()` trong `initializeDefaultSystemData()`**:
+  - Để luồng khởi tạo diễn ra tuần tự, nhẹ nhàng, không khóa IndexedDB.
 
-### Bước 2: Xây dựng API Đồng bộ Hàng loạt (`server.ts`)
-- Tạo các cổng API RESTful tốc độ cao trên Express server:
-  - `GET /api/sql-sync/pull`: Kéo toàn bộ dữ liệu mới nhất và danh sách xóa (`deleted_records`) từ PostgreSQL về trình duyệt trong **1 yêu cầu HTTP duy nhất**.
-  - `POST /api/sql-sync/push`: Nhận toàn bộ thay đổi từ Hàng đợi Outbox và thực hiện lệnh `INSERT ... ON CONFLICT DO UPDATE (Upsert)` theo lô (Batch Transaction) vào PostgreSQL chỉ trong vài chục mili-giây.
+### Module 2: Menu Điều Hành & Tổng Quan Dashboard (`src/App.tsx`, `src/components/Dashboard.tsx`)
+- Thay thế toàn bộ `useLiveQuery(...) || []` trong `Dashboard.tsx` bằng hằng số tham chiếu tĩnh `EMPTY_ARRAY`.
+- Đảm bảo khi bấm chuyển giữa 7 mục trên thanh Menu bên trái, giao diện phản hồi tức thì (<16ms), không bị khựng hay tính toán lại toàn bộ cây dữ liệu.
 
-### Bước 3: Di trú tự động 100% dữ liệu hiện có sang SQL
-- Ngay lần đầu tiên kết nối SQL, hệ thống tự động đọc toàn bộ dữ liệu Lớp học, Học sinh, Phân lớp (`class_students`), Điểm số (`student_sessions`) đang có trên máy và trên Firebase cũ để **đổ tự động sang PostgreSQL** mà Thầy/Cô không phải nhập lại bất kỳ dữ liệu nào.
-- Chạy bộ đối soát `recoverMissingClassEnrollments()` để khôi phục đầy đủ danh sách học sinh trong từng lớp.
+### Module 3: Quản Lý Lớp Học (`src/components/ClassManagement.tsx`)
+- Thay thế toàn bộ 5 câu lệnh `useLiveQuery(...) || []` (dòng 50–54) bằng tham chiếu tĩnh `EMPTY_ARRAY`.
+- Chuẩn hóa các thao tác **Thêm lớp mới**, **Sửa thông tin lớp**, **Lưu trữ/Khôi phục lớp**, **Lên lớp (Promote)** và **Xóa lớp**:
+  - Ép kiểu `String(id)` đồng nhất cho mọi truy vấn `class_id`.
+  - Đảm bảo khi Thêm/Sửa/Xóa lớp, dữ liệu được cập nhật ngay vào IndexedDB và đẩy đồng bộ tức thì lên Supabase (`flushSyncOutbox()`).
+
+### Module 4: Hồ Sơ & Danh Sách Học Sinh (`src/components/StudentRoster.tsx`)
+- Thay thế `useLiveQuery(...) || []` (dòng 67–68) bằng tham chiếu tĩnh `EMPTY_ARRAY`.
+- Chuẩn hóa thao tác **Thêm học sinh mới & Ghi danh lớp**, **Sửa thông tin & Chuyển lớp**, **Xóa học sinh (`deleteStudent`)**:
+  - Sử dụng khóa chính chuẩn `String(studentId)` và `cs_${classId}_${studentId}`.
+  - Khi xóa hoặc chuyển lớp học sinh, ghi nhận đúng `deleted_records` trên Supabase để không bao giờ bị phục hồi ngược.
+
+### Module 5: Nhập Điểm Tốc Độ Cao & Bảng Điểm Tổng Hợp (`src/components/UltraFastGradeEntry.tsx`, `src/components/GradebookView.tsx`)
+- Chuẩn hóa toàn bộ phép tìm kiếm Lớp và Buổi học sang so sánh chuỗi an toàn: `String(c.id) === String(selectedClassId)` và `String(s.id) === String(selectedSessionId)`.
+- Tối ưu hóa `useEffect` đồng bộ bảng điểm học sinh khi đổi Lớp hoặc đổi Buổi học:
+  - Ngắt triệt để việc tạo object mới không cần thiết gây re-render liên hoàn.
+  - Chuẩn hóa các chức năng **Thêm buổi học**, **Sửa buổi học**, **Xóa buổi học** và **Lưu Điểm** để hoạt động mượt mà, không giật lag hay treo tab.
+- Sửa `useLiveQuery(...) || []` trong `GradebookView.tsx` và `SessionHistoryModal.tsx`.
+
+### Module 6: Cảnh Báo Học Tập, Bản Đồ Kiến Thức AI & Báo Cáo/Cài Đặt (`src/components/WarningCenter.tsx`, `src/components/KnowledgeMap.tsx`, `src/components/AuditAndReports.tsx`)
+- Chuẩn hóa truy vấn theo `String(reportClassId)` trong `WarningCenter.tsx` (tránh lỗi không tải được Chu kỳ báo cáo 4 buổi khi `class_id` lệch kiểu dữ liệu).
+- Kiểm tra và đảm bảo tính năng Quét cảnh báo học tập (`runWarningScanForClass`), tính điểm thông thạo chuyên đề (`recalculateKnowledgeResultsForClass`), và Xuất Excel/PDF hoạt động trơn tru trên bộ dữ liệu chuẩn của Supabase.
+
+---
+
+## 3. Kiểm Chứng Toàn Diện Sau Khi Khắc Phục
+1. Kiểm tra lại dữ liệu trực tiếp trên Supabase (đảm bảo giữ nguyên vẹn 9 lớp học thật, danh sách học sinh, các buổi học và điểm số chuẩn xác, không có bản ghi rác).
+2. Biên dịch và kiểm tra lỗi mã nguồn bằng `compile_applet` và `lint_applet` đạt 0 lỗi.
+3. Khởi động lại máy chủ để Thầy/Cô trải nghiệm trực tiếp trên AI Studio và đẩy bản cập nhật lên Vercel.

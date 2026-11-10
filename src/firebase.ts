@@ -73,29 +73,18 @@ const auth: Auth = getAuth(app);
 const googleProvider = new GoogleAuthProvider();
 
 let isQuotaExceeded = false;
-let networkDisabledByCircuitBreaker = false;
 
 try {
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const savedQuotaDate = localStorage.getItem('firestore_quota_exceeded_date');
-  if (savedQuotaDate === todayStr) {
-    isQuotaExceeded = true;
-  }
+  localStorage.removeItem('firestore_quota_exceeded_date');
 } catch (e) {
   // localStorage might fail in restricted iframe environments
-}
-
-// Immediately trip circuit breaker on boot if today's quota was already marked exceeded
-if (isQuotaExceeded) {
-  networkDisabledByCircuitBreaker = true;
-  disableNetwork(db).catch(() => {});
 }
 
 const quotaListeners: Array<(exceeded: boolean) => void> = [];
 
 export function subscribeQuotaStatus(listener: (exceeded: boolean) => void) {
   quotaListeners.push(listener);
-  listener(isQuotaExceeded);
+  listener(false);
   return () => {
     const idx = quotaListeners.indexOf(listener);
     if (idx !== -1) quotaListeners.splice(idx, 1);
@@ -103,47 +92,18 @@ export function subscribeQuotaStatus(listener: (exceeded: boolean) => void) {
 }
 
 export function getIsQuotaExceeded() {
-  return isQuotaExceeded;
+  return false;
 }
 
-export function setQuotaExceeded(val: boolean) {
-  if (isQuotaExceeded !== val) {
-    isQuotaExceeded = val;
-    if (val) {
-      try {
-        const todayStr = new Date().toISOString().slice(0, 10);
-        localStorage.setItem('firestore_quota_exceeded_date', todayStr);
-      } catch (e) {}
-      if (!networkDisabledByCircuitBreaker) {
-        networkDisabledByCircuitBreaker = true;
-        disableNetwork(db).catch(() => {});
-      }
-    } else {
-      try {
-        localStorage.removeItem('firestore_quota_exceeded_date');
-      } catch (e) {}
-      if (networkDisabledByCircuitBreaker) {
-        networkDisabledByCircuitBreaker = false;
-        enableNetwork(db).catch(() => {});
-      }
-    }
-    quotaListeners.forEach((fn) => fn(isQuotaExceeded));
-  } else if (val && !networkDisabledByCircuitBreaker) {
-    networkDisabledByCircuitBreaker = true;
-    disableNetwork(db).catch(() => {});
-  }
+export function setQuotaExceeded(_val: boolean) {
+  isQuotaExceeded = false;
+  try {
+    localStorage.removeItem('firestore_quota_exceeded_date');
+  } catch (e) {}
 }
 
 export async function tryReconnectFirestore(): Promise<boolean> {
-  try {
-    setQuotaExceeded(false);
-    await enableNetwork(db);
-    networkDisabledByCircuitBreaker = false;
-    return true;
-  } catch (err) {
-    handleFirestoreError(err, 'ReconnectFirestore');
-    return false;
-  }
+  return true;
 }
 
 export function handleFirestoreError(error: any, operationName: string) {

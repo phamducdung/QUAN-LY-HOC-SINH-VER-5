@@ -1,20 +1,3 @@
-import {
-  collection,
-  doc,
-  setDoc,
-  deleteDoc,
-  getDocs,
-  onSnapshot,
-  Unsubscribe,
-  writeBatch,
-} from 'firebase/firestore';
-import {
-  db as firestoreDb,
-  handleFirestoreError,
-  getIsQuotaExceeded,
-  subscribeQuotaStatus,
-  tryReconnectFirestore,
-} from '../firebase';
 import { db as dexieDb, setRemoteSyncing } from '../db/dexie';
 import { getActiveAuthToken } from '../lib/AuthContext';
 import { supabase } from '../lib/supabase';
@@ -76,16 +59,59 @@ const LOCAL_TOMBSTONE_KEY = 'smart_edu_tombstones_v2';
 const LOCAL_OUTBOX_KEY = 'smart_edu_sync_outbox_v2';
 const LOCAL_SIGNATURES_KEY = 'smart_edu_synced_signatures_v2';
 
-let unsubscribers: Unsubscribe[] = [];
 let statusListeners: Array<(status: SyncStatus) => void> = [];
+
+// Track user typing & active input focus so background sync never interrupts or resets forms
+let lastUserActivityAt = 0;
+let activityListenersAttached = false;
+
+export function markUserActivity() {
+  lastUserActivityAt = Date.now();
+}
+
+export function isUserActivelyEditing(): boolean {
+  if (Date.now() - lastUserActivityAt < 4500) {
+    return true;
+  }
+  if (typeof document !== 'undefined' && document.activeElement) {
+    const tag = document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      const inputEl = document.activeElement as HTMLInputElement;
+      if (!inputEl.readOnly && !inputEl.disabled) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function attachUserActivityListeners() {
+  if (typeof window === 'undefined' || activityListenersAttached) return;
+  activityListenersAttached = true;
+  window.addEventListener('keydown', markUserActivity, { passive: true, capture: true });
+  window.addEventListener('input', markUserActivity, { passive: true, capture: true });
+}
 
 // Memory + persisted caches for Tombstones, Outbox, and Content Signatures
 const tombstoneMap = new Map<string, TombstoneRecord>();
 const outboxMap = new Map<string, OutboxEntry>();
 const syncedSignatures = new Map<string, string>();
 
+const SUPABASE_CLEAN_SYNC_VERSION_KEY = 'smart_edu_supabase_sync_version';
+const SUPABASE_CLEAN_SYNC_VERSION = 'v5_supabase_clean_reset_2';
+
 function loadPersistedSyncState() {
   if (typeof window === 'undefined') return;
+  try {
+    // If browser has not run the v5 clean reset yet, do not load stale outbox/tombstones from localStorage
+    if (localStorage.getItem(SUPABASE_CLEAN_SYNC_VERSION_KEY) !== SUPABASE_CLEAN_SYNC_VERSION) {
+      localStorage.removeItem(LOCAL_TOMBSTONE_KEY);
+      localStorage.removeItem(LOCAL_OUTBOX_KEY);
+      sessionStorage.removeItem(LOCAL_SIGNATURES_KEY);
+      return;
+    }
+  } catch (e) {}
+
   try {
     const rawTombstones = localStorage.getItem(LOCAL_TOMBSTONE_KEY);
     if (rawTombstones) {
@@ -117,34 +143,49 @@ function loadPersistedSyncState() {
 
 loadPersistedSyncState();
 
+let persistTombstonesTimer: ReturnType<typeof setTimeout> | null = null;
+let persistOutboxTimer: ReturnType<typeof setTimeout> | null = null;
+let persistSignaturesTimer: ReturnType<typeof setTimeout> | null = null;
+
 function persistTombstones() {
   if (typeof window === 'undefined') return;
-  try {
-    // Keep up to 2000 recent tombstones
-    const list = Array.from(tombstoneMap.values())
-      .sort((a, b) => b.deleted_at.localeCompare(a.deleted_at))
-      .slice(0, 2000);
-    localStorage.setItem(LOCAL_TOMBSTONE_KEY, JSON.stringify(list));
-  } catch (e) {}
+  if (persistTombstonesTimer) return;
+  persistTombstonesTimer = setTimeout(() => {
+    persistTombstonesTimer = null;
+    try {
+      const list = Array.from(tombstoneMap.values())
+        .sort((a, b) => b.deleted_at.localeCompare(a.deleted_at))
+        .slice(0, 1000);
+      localStorage.setItem(LOCAL_TOMBSTONE_KEY, JSON.stringify(list));
+    } catch (e) {}
+  }, 150);
 }
 
 function persistOutbox() {
   if (typeof window === 'undefined') return;
-  try {
-    const list = Array.from(outboxMap.values());
-    localStorage.setItem(LOCAL_OUTBOX_KEY, JSON.stringify(list));
-  } catch (e) {}
+  if (persistOutboxTimer) return;
+  persistOutboxTimer = setTimeout(() => {
+    persistOutboxTimer = null;
+    try {
+      const list = Array.from(outboxMap.values());
+      localStorage.setItem(LOCAL_OUTBOX_KEY, JSON.stringify(list));
+    } catch (e) {}
+  }, 150);
 }
 
 function persistSignatures() {
   if (typeof window === 'undefined') return;
-  try {
-    const obj: Record<string, string> = {};
-    syncedSignatures.forEach((v, k) => {
-      obj[k] = v;
-    });
-    sessionStorage.setItem(LOCAL_SIGNATURES_KEY, JSON.stringify(obj));
-  } catch (e) {}
+  if (persistSignaturesTimer) return;
+  persistSignaturesTimer = setTimeout(() => {
+    persistSignaturesTimer = null;
+    try {
+      const obj: Record<string, string> = {};
+      syncedSignatures.forEach((v, k) => {
+        obj[k] = v;
+      });
+      sessionStorage.setItem(LOCAL_SIGNATURES_KEY, JSON.stringify(obj));
+    } catch (e) {}
+  }, 200);
 }
 
 /**
@@ -184,7 +225,7 @@ export function getCanonicalDocId(tableName: string, data: any, fallbackId?: str
 
 /**
  * Computes a deterministic content fingerprint ignoring volatile timestamp fields
- * so unchanged records never burn Firestore write quota.
+ * so unchanged records never trigger redundant writes or UI re-renders.
  */
 export function computePayloadSignature(data: any): string {
   if (!data || typeof data !== 'object') return '';
@@ -203,15 +244,18 @@ let currentSyncStatus: SyncStatus = {
   isSyncing: false,
   lastSyncedAt: null,
   syncErrors: 0,
-  quotaExceeded: getIsQuotaExceeded(),
+  quotaExceeded: false,
   pendingOutboxCount: outboxMap.size,
   lastKaizenSummary: null,
+  supabaseConnected: true,
+  supabaseNeedsSetup: false,
 };
 
 let sqlBackendAvailable: boolean | null = null;
 let sqlPollTimer: ReturnType<typeof setInterval> | null = null;
-let supabaseReady: boolean | null = null;
+let supabaseReady: boolean | null = true;
 let supabaseNeedsSchemaSetup = false;
+let hasRunInitialKaizen = false;
 
 export function getSupabaseSyncState() {
   return {
@@ -220,30 +264,20 @@ export function getSupabaseSyncState() {
   };
 }
 
-subscribeQuotaStatus((exceeded) => {
-  updateSyncStatus({
-    quotaExceeded:
-      supabaseReady === true || sqlBackendAvailable === true ? false : exceeded,
-    isSyncing: false,
-    pendingOutboxCount: outboxMap.size,
-  });
-  if (exceeded) {
-    unsubscribers.forEach((unsub) => {
-      try {
-        unsub();
-      } catch (e) {}
-    });
-    unsubscribers = [];
-  }
-});
+let notifyStatusTimer: ReturnType<typeof setTimeout> | null = null;
 
 function updateSyncStatus(patch: Partial<SyncStatus>) {
   currentSyncStatus = {
     ...currentSyncStatus,
     ...patch,
+    quotaExceeded: false,
     pendingOutboxCount: outboxMap.size,
   };
-  statusListeners.forEach((fn) => fn(currentSyncStatus));
+  if (notifyStatusTimer) return;
+  notifyStatusTimer = setTimeout(() => {
+    notifyStatusTimer = null;
+    statusListeners.forEach((fn) => fn(currentSyncStatus));
+  }, 80);
 }
 
 export function subscribeSyncStatus(listener: (status: SyncStatus) => void) {
@@ -326,7 +360,7 @@ export function recordLocalTombstone(
   return tomb;
 }
 
-// Debounced Outbox Flush Timer (coalesces rapid changes within 600ms into 1 Firestore batch)
+// Debounced Outbox Flush Timer (coalesces rapid changes within 600ms into 1 Supabase batch)
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let isFlushingOutbox = false;
 
@@ -337,10 +371,11 @@ export function enqueueSyncOperation(
   isDelete = false,
   forceWrite = false
 ) {
-  // Never sync demo records to Firestore to protect daily Spark write quota
   if (!isDelete && data?.is_demo === true) {
     return;
   }
+
+  markUserActivity();
 
   const docId = isDelete
     ? String(rawDocId)
@@ -397,13 +432,6 @@ export function enqueueSyncOperation(
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     return;
   }
-  if (
-    supabaseReady === false &&
-    sqlBackendAvailable === false &&
-    getIsQuotaExceeded()
-  ) {
-    return;
-  }
 
   if (flushTimer) clearTimeout(flushTimer);
   flushTimer = setTimeout(() => {
@@ -411,22 +439,14 @@ export function enqueueSyncOperation(
   }, 600);
 }
 
-/**
- * Prevents Firebase Firestore SDK calls (like `batch.commit()` or `getDocs()`)
- * from hanging indefinitely when Firestore enters exponential backoff on `resource-exhausted`.
- */
-function withFirestoreTimeout<T>(
+function withNetworkTimeout<T>(
   promise: Promise<T>,
-  timeoutMs = 6000,
-  opName = 'FirestoreOp'
+  timeoutMs = 8000,
+  opName = 'NetworkOp'
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(
-        new Error(
-          `[code=resource-exhausted]: Firestore timeout / maximum backoff delay in ${opName}`
-        )
-      );
+      reject(new Error(`Timeout in ${opName}`));
     }, timeoutMs);
 
     promise
@@ -451,11 +471,10 @@ export async function flushSyncOutbox(): Promise<void> {
   try {
     const entries = Array.from(outboxMap.values());
 
-    // 0. Top Priority: Direct Supabase PostgreSQL (works on Vercel SPA & AI Studio, unlimited writes)
+    // 1. Primary Cloud Engine: Supabase PostgreSQL (works on Vercel SPA & AI Studio, unlimited writes)
     if (supabaseReady !== false) {
       const supaOk = await flushOutboxToSupabase(entries);
       if (supaOk) {
-        // Also mirror to local Cloud SQL backend if available in background
         if (sqlBackendAvailable === true) {
           flushOutboxToCloudSql(entries).catch(() => {});
         }
@@ -471,76 +490,18 @@ export async function flushSyncOutbox(): Promise<void> {
       }
     }
 
-    // 1. Secondary path: Cloud SQL PostgreSQL via /api/sql-sync/push (unlimited writes)
+    // 2. Optional Local Cloud SQL mirror via /api/sql-sync/push
     if (sqlBackendAvailable !== false) {
       try {
-        const mutations: Array<{ tableName: TableName; docId: string; data: any }> = [];
-        const deletions: Array<{ tableName: TableName; docId: string; deletedAt: string }> = [];
-        const committedKeys: Array<{ key: string; sig?: string }> = [];
-
-        for (const entry of entries) {
-          if (entry.isDelete) {
-            recordLocalTombstone(entry.tableName, entry.docId, entry.queuedAt);
-            deletions.push({
-              tableName: entry.tableName,
-              docId: entry.docId,
-              deletedAt: entry.queuedAt,
-            });
-            committedKeys.push({ key: entry.key });
-          } else if (entry.data) {
-            if (entry.data.is_demo === true) {
-              outboxMap.delete(entry.key);
-              continue;
-            }
-            const sig = computePayloadSignature(entry.data);
-            if (syncedSignatures.get(entry.key) === sig) {
-              outboxMap.delete(entry.key);
-              continue;
-            }
-            mutations.push({
-              tableName: entry.tableName,
-              docId: entry.docId,
-              data: entry.data,
-            });
-            committedKeys.push({ key: entry.key, sig });
-          }
-        }
-
-        if (mutations.length === 0 && deletions.length === 0) {
-          persistOutbox();
-          updateSyncStatus({
-            lastSyncedAt: new Date(),
-            isSyncing: false,
-            pendingOutboxCount: outboxMap.size,
-          });
-          return;
-        }
-
-        const token = await getActiveAuthToken();
-        const res = await withFirestoreTimeout(
-          fetch('/api/sql-sync/push', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({ mutations, deletions }),
-          }),
-          10000,
-          'sqlSyncPush'
-        );
-
-        const contentType = res.headers.get('content-type') || '';
-        if (res.status === 404 || !contentType.includes('application/json')) {
-          sqlBackendAvailable = false;
-        } else if (res.ok) {
+        const ok = await flushOutboxToCloudSql(entries);
+        if (ok) {
           sqlBackendAvailable = true;
-          for (const item of committedKeys) {
-            outboxMap.delete(item.key);
-            if (item.sig) {
-              syncedSignatures.set(item.key, item.sig);
+          for (const entry of entries) {
+            outboxMap.delete(entry.key);
+            if (!entry.isDelete && entry.data) {
+              syncedSignatures.set(entry.key, computePayloadSignature(entry.data));
             } else {
-              syncedSignatures.delete(item.key);
+              syncedSignatures.delete(entry.key);
             }
           }
           persistOutbox();
@@ -553,73 +514,14 @@ export async function flushSyncOutbox(): Promise<void> {
           });
           return;
         }
-      } catch (sqlErr) {
-        // Fall through to Firestore if SQL endpoint is unreachable
-      }
-    }
-
-    // 2. Fallback path: Firestore batch commit (when hosted on static SPA without Node SQL backend)
-    if (getIsQuotaExceeded() || !firestoreDb) {
-      updateSyncStatus({ isSyncing: false, pendingOutboxCount: outboxMap.size });
-      return;
-    }
-
-    const BATCH_LIMIT = 200; // Each delete writes 1 delete + 1 tombstone = max 400 ops
-
-    for (let i = 0; i < entries.length; i += BATCH_LIMIT) {
-      if (getIsQuotaExceeded()) break;
-      const chunk = entries.slice(i, i + BATCH_LIMIT);
-      const batch = writeBatch(firestoreDb);
-      let opsCount = 0;
-      const committedKeys: Array<{ key: string; sig?: string }> = [];
-
-      for (const entry of chunk) {
-        const docRef = doc(firestoreDb, entry.tableName, entry.docId);
-        if (entry.isDelete) {
-          batch.delete(docRef);
-          const tomb = recordLocalTombstone(entry.tableName, entry.docId, entry.queuedAt);
-          const tombRef = doc(firestoreDb, TOMBSTONE_COLLECTION, tomb.id);
-          batch.set(tombRef, tomb, { merge: true });
-          opsCount += 2;
-          committedKeys.push({ key: entry.key });
-        } else if (entry.data) {
-          if (entry.data.is_demo === true) {
-            outboxMap.delete(entry.key);
-            continue;
-          }
-          const sig = computePayloadSignature(entry.data);
-          if (syncedSignatures.get(entry.key) === sig) {
-            outboxMap.delete(entry.key);
-            continue;
-          }
-          batch.set(docRef, entry.data, { merge: true });
-          opsCount += 1;
-          committedKeys.push({ key: entry.key, sig });
-        }
-      }
-
-      if (opsCount > 0) {
-        await withFirestoreTimeout(batch.commit(), 6000, 'flushSyncOutbox');
-        for (const item of committedKeys) {
-          outboxMap.delete(item.key);
-          if (item.sig) {
-            syncedSignatures.set(item.key, item.sig);
-          } else {
-            syncedSignatures.delete(item.key);
-          }
-        }
-        persistOutbox();
-        persistSignatures();
-      }
+      } catch (e) {}
     }
 
     updateSyncStatus({
-      lastSyncedAt: new Date(),
       isSyncing: false,
       pendingOutboxCount: outboxMap.size,
     });
   } catch (err: any) {
-    handleFirestoreError(err, 'flushSyncOutbox');
     updateSyncStatus({
       syncErrors: currentSyncStatus.syncErrors + 1,
       isSyncing: false,
@@ -627,20 +529,25 @@ export async function flushSyncOutbox(): Promise<void> {
     });
   } finally {
     isFlushingOutbox = false;
+    if (outboxMap.size > 0 && (typeof navigator === 'undefined' || navigator.onLine)) {
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = setTimeout(() => {
+        flushSyncOutbox().catch(() => {});
+      }, 1500);
+    }
   }
 }
 
 // Push a batch of record changes via the smart Dirty-Diff & Outbox batcher
 export async function pushDocsBatchToFirestore(tableName: TableName, items: any[]) {
   if (!items || items.length === 0) return;
+  markUserActivity();
   for (const item of items) {
     if (!item || item.is_demo === true) continue;
     const docId = getCanonicalDocId(tableName, item, item.id);
     enqueueSyncOperation(tableName, docId, { ...item, id: docId }, false);
   }
-  if (sqlBackendAvailable !== false || !getIsQuotaExceeded()) {
-    flushSyncOutbox().catch(() => {});
-  }
+  flushSyncOutbox().catch(() => {});
 }
 
 // Push a single record change via the smart Outbox batcher
@@ -650,76 +557,27 @@ export async function pushDocToFirestore(
   data?: any,
   isDelete = false
 ) {
+  markUserActivity();
   enqueueSyncOperation(tableName, docId, data, isDelete);
 }
 
-// Pull tombstones from Firestore so deletions sync across all devices
 export async function pullTombstonesFromFirestore() {
-  if (getIsQuotaExceeded() || !firestoreDb) return;
-  try {
-    const colRef = collection(firestoreDb, TOMBSTONE_COLLECTION);
-    const snap = await withFirestoreTimeout(
-      getDocs(colRef),
-      6000,
-      'pullTombstonesFromFirestore'
-    );
-    if (snap.empty) return;
-
-    const deletionsByTable = new Map<string, string[]>();
-    snap.docs.forEach((docSnap) => {
-      const data = docSnap.data() as TombstoneRecord;
-      if (data?.table_name && data?.record_id) {
-        const key = `${data.table_name}_${data.record_id}`;
-        tombstoneMap.set(key, {
-          id: key,
-          table_name: data.table_name,
-          record_id: String(data.record_id),
-          deleted_at: data.deleted_at || new Date().toISOString(),
-        });
-        if (!deletionsByTable.has(data.table_name)) {
-          deletionsByTable.set(data.table_name, []);
-        }
-        deletionsByTable.get(data.table_name)!.push(String(data.record_id));
-      }
-    });
-    persistTombstones();
-
-    // Apply tombstones to local IndexedDB
-    setRemoteSyncing(true);
-    try {
-      for (const [tName, ids] of deletionsByTable.entries()) {
-        const dexieTable = (dexieDb as any)[tName];
-        if (!dexieTable || ids.length === 0) continue;
-        const existingRecords = await dexieTable.bulkGet(ids);
-        const confirmedDeleteIds: (string | number)[] = [];
-        existingRecords.forEach((rec: any, idx: number) => {
-          const targetId = ids[idx];
-          if (rec && isRecordTombstoned(tName, targetId, rec.updated_at)) {
-            confirmedDeleteIds.push(targetId);
-            const numId = Number(targetId);
-            if (!isNaN(numId)) confirmedDeleteIds.push(numId);
-          }
-        });
-        if (confirmedDeleteIds.length > 0) {
-          await dexieTable.bulkDelete(confirmedDeleteIds);
-        }
-      }
-    } finally {
-      setRemoteSyncing(false);
-    }
-  } catch (err) {
-    handleFirestoreError(err, 'pullTombstonesFromFirestore');
-  }
+  // Legacy Firestore disconnected; handled directly by Supabase
 }
 
 let isPullingAll = false;
 let isRunningKaizen = false;
 let onlineListenersAttached = false;
+let supabaseRealtimeChannel: any = null;
 
-// Real-time listener setup for Cloud SQL + Firestore -> Dexie (idempotent singleton)
+let realtimeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let lastLocalFlushCompletedAt = 0;
+
+// Real-time listener setup for Supabase PostgreSQL -> Dexie (idempotent singleton)
 export function initRealtimeSync(): () => void {
-  // If realtime listeners or SQL poll timer are already active, do not tear down or re-pull
-  if (unsubscribers.length > 0 || sqlPollTimer !== null) {
+  attachUserActivityListeners();
+
+  if (sqlPollTimer !== null) {
     return () => {};
   }
 
@@ -734,25 +592,55 @@ export function initRealtimeSync(): () => void {
     });
   }
 
-  // Kick off initial background pull & deduplication (Cloud SQL primary -> Firestore fallback)
+  // Kick off initial background pull from Supabase
   pullAllFromFirestore()
     .then(() => flushSyncOutbox())
-    .catch((err) => {
-      handleFirestoreError(err, 'InitialSync');
+    .catch(() => {
       updateSyncStatus({ isSyncing: false });
     });
 
-  // Periodic background Supabase / Cloud SQL sync every 15s when tab is active
+  // Subscribe to Supabase Realtime postgres_changes if available (debounced to prevent echo storms)
+  if (supabase && !supabaseRealtimeChannel) {
+    try {
+      supabaseRealtimeChannel = supabase
+        .channel('smart_edu_realtime_changes')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public' },
+          () => {
+            if (Date.now() - lastLocalFlushCompletedAt < 5000) {
+              return;
+            }
+            if (realtimeDebounceTimer) clearTimeout(realtimeDebounceTimer);
+            realtimeDebounceTimer = setTimeout(() => {
+              realtimeDebounceTimer = null;
+              if (
+                !isUserActivelyEditing() &&
+                !isPullingAll &&
+                !isFlushingOutbox &&
+                outboxMap.size === 0
+              ) {
+                pullAllFromSupabase().catch(() => {});
+              }
+            }, 2500);
+          }
+        )
+        .subscribe();
+    } catch (e) {}
+  }
+
+  // Gentle background delta check every 30s ONLY when user is idle (not typing or focusing inputs)
   if (typeof window !== 'undefined' && !sqlPollTimer) {
     sqlPollTimer = setInterval(() => {
       if (
-        (supabaseReady === true || sqlBackendAvailable === true) &&
         typeof document !== 'undefined' &&
         document.visibilityState === 'visible' &&
         !isPullingAll &&
-        !isFlushingOutbox
+        !isFlushingOutbox &&
+        !isUserActivelyEditing() &&
+        outboxMap.size === 0
       ) {
-        if (supabaseReady === true) {
+        if (supabaseReady !== false) {
           pullAllFromSupabase()
             .then(() => flushSyncOutbox())
             .catch(() => {});
@@ -762,354 +650,27 @@ export function initRealtimeSync(): () => void {
             .catch(() => {});
         }
       }
-    }, 15000);
+    }, 30000);
   }
-
-  if (getIsQuotaExceeded() || !firestoreDb) {
-    return stopRealtimeSync;
-  }
-
-  // Listen to remote tombstones in real time
-  try {
-    const tombColRef = collection(firestoreDb, TOMBSTONE_COLLECTION);
-    const unsubTomb = onSnapshot(
-      tombColRef,
-      async (snapshot) => {
-        const changes = snapshot.docChanges();
-        if (changes.length === 0) return;
-
-        setRemoteSyncing(true);
-        try {
-          for (const change of changes) {
-            if (change.type === 'added' || change.type === 'modified') {
-              const data = change.doc.data() as TombstoneRecord;
-              if (data?.table_name && data?.record_id) {
-                recordLocalTombstone(data.table_name, data.record_id, data.deleted_at);
-                const dexieTable = (dexieDb as any)[data.table_name];
-                if (dexieTable) {
-                  const existing = await dexieTable.get(String(data.record_id));
-                  if (!existing || isRecordTombstoned(data.table_name, data.record_id, existing.updated_at)) {
-                    await dexieTable.delete(String(data.record_id));
-                    const numId = Number(data.record_id);
-                    if (!isNaN(numId)) await dexieTable.delete(numId);
-                  }
-                }
-              }
-            }
-          }
-        } finally {
-          setRemoteSyncing(false);
-        }
-      },
-      (err) => {
-        handleFirestoreError(err, 'Listener deleted_records');
-      }
-    );
-    unsubscribers.push(unsubTomb);
-  } catch (e) {}
-
-  ALL_TABLES.forEach((tableName) => {
-    try {
-      const colRef = collection(firestoreDb, tableName);
-      const unsub = onSnapshot(
-        colRef,
-        async (snapshot) => {
-          const changes = snapshot.docChanges();
-          if (changes.length === 0) return;
-
-          setRemoteSyncing(true);
-          try {
-            const dexieTable = (dexieDb as any)[tableName];
-            if (!dexieTable) return;
-
-            const docsToDelete: (string | number)[] = [];
-            const docsToPut: any[] = [];
-
-            const existingList = await dexieTable.toArray();
-            const existingMap = new Map<string, any>();
-            existingList.forEach((item: any) => {
-              if (item?.id !== undefined && item?.id !== null) {
-                existingMap.set(String(item.id), item);
-              }
-            });
-
-            for (const change of changes) {
-              if (change.doc.metadata.hasPendingWrites) {
-                continue;
-              }
-
-              const rawDocId = change.doc.id;
-              const docData = change.doc.data();
-              const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
-
-              if (change.type === 'removed') {
-                // IMPORTANT: Only delete rawDocId, NEVER delete canonicalId when a legacy duplicate UUID is removed!
-                recordLocalTombstone(tableName, rawDocId);
-                docsToDelete.push(rawDocId);
-                const numId = Number(rawDocId);
-                if (!isNaN(numId)) docsToDelete.push(numId);
-              } else if (change.type === 'added' || change.type === 'modified') {
-                if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
-                  continue;
-                }
-
-                // Only cache signature under canonicalId if the Firestore document ALREADY has canonicalId as its doc ID
-                if (rawDocId === canonicalId) {
-                  const sig = computePayloadSignature({ ...docData, id: canonicalId });
-                  syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
-                } else {
-                  syncedSignatures.delete(`${tableName}/${canonicalId}`);
-                }
-
-                const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
-                if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
-                  docsToDelete.push(rawDocId);
-                }
-
-                let mergedRecord: any;
-                if (existing) {
-                  const localTime = new Date(
-                    existing.updated_at || existing.last_updated || 0
-                  ).getTime();
-                  const remoteTime = new Date(
-                    docData.updated_at || docData.last_updated || 0
-                  ).getTime();
-
-                  if (
-                    typeof existing.id === 'number' &&
-                    typeof canonicalId === 'string' &&
-                    String(existing.id) === canonicalId
-                  ) {
-                    docsToDelete.push(existing.id);
-                  }
-
-                  if (remoteTime >= localTime) {
-                    mergedRecord = {
-                      ...existing,
-                      ...docData,
-                      id: canonicalId,
-                      updated_at: docData.updated_at || new Date().toISOString(),
-                    };
-                  } else {
-                    mergedRecord = {
-                      ...docData,
-                      ...existing,
-                      id: canonicalId,
-                      updated_at: existing.updated_at || new Date().toISOString(),
-                    };
-                  }
-                } else {
-                  mergedRecord = {
-                    ...docData,
-                    id: canonicalId,
-                    updated_at: docData.updated_at || new Date().toISOString(),
-                  };
-                }
-
-                docsToPut.push(mergedRecord);
-
-                // If remote doc was using a legacy non-canonical ID, migrate it to canonicalId on Firestore
-                if (rawDocId !== canonicalId) {
-                  enqueueSyncOperation(tableName, canonicalId, mergedRecord, false, true);
-                  enqueueSyncOperation(tableName, rawDocId, null, true);
-                }
-              }
-            }
-
-            if (docsToDelete.length > 0 || docsToPut.length > 0) {
-              await dexieDb.transaction('rw', dexieTable, async () => {
-                if (docsToDelete.length > 0) {
-                  await dexieTable.bulkDelete(docsToDelete);
-                }
-                if (docsToPut.length > 0) {
-                  await dexieTable.bulkPut(docsToPut);
-                }
-              });
-              persistSignatures();
-            }
-
-            updateSyncStatus({ lastSyncedAt: new Date(), isSyncing: false });
-
-            if (typeof window !== 'undefined') {
-              window.dispatchEvent(
-                new CustomEvent('smart_edu_data_updated', { detail: { tableName } })
-              );
-            }
-          } catch (err: any) {
-            console.error(`[SyncService] Error processing snapshot batch for ${tableName}:`, err);
-            updateSyncStatus({
-              syncErrors: currentSyncStatus.syncErrors + 1,
-              isSyncing: false,
-            });
-          } finally {
-            setRemoteSyncing(false);
-          }
-        },
-        (error) => {
-          handleFirestoreError(error, `Listener ${tableName}`);
-          updateSyncStatus({
-            syncErrors: currentSyncStatus.syncErrors + 1,
-            isSyncing: false,
-          });
-        }
-      );
-      unsubscribers.push(unsub);
-    } catch (err: any) {
-      handleFirestoreError(err, `Init Listener ${tableName}`);
-    }
-  });
 
   return stopRealtimeSync;
 }
 
 export function stopRealtimeSync() {
-  unsubscribers.forEach((unsub) => {
-    try {
-      unsub();
-    } catch (e) {}
-  });
-  unsubscribers = [];
   if (sqlPollTimer) {
     clearInterval(sqlPollTimer);
     sqlPollTimer = null;
   }
+  if (supabaseRealtimeChannel && supabase) {
+    try {
+      supabase.removeChannel(supabaseRealtimeChannel);
+    } catch (e) {}
+    supabaseRealtimeChannel = null;
+  }
 }
 
-// Pull an entire collection from Firestore into Dexie with Tombstone & Canonical ID reconciliation
-export async function pullCollectionFromFirestore(tableName: TableName) {
-  if (getIsQuotaExceeded() || !firestoreDb) return;
-  const colRef = collection(firestoreDb, tableName);
-  const snap = await withFirestoreTimeout(
-    getDocs(colRef),
-    7000,
-    `pullCollection:${tableName}`
-  );
-
-  const dexieTable = (dexieDb as any)[tableName];
-  if (!dexieTable) return;
-
-  setRemoteSyncing(true);
-  try {
-    const existingList = await dexieTable.toArray();
-    const existingMap = new Map<string, any>();
-    existingList.forEach((item: any) => {
-      if (item?.id !== undefined && item?.id !== null) {
-        existingMap.set(String(item.id), item);
-      }
-    });
-
-    const docsToDelete: (string | number)[] = [];
-    const docsToPut: any[] = [];
-    const remoteCanonicalIds = new Set<string>();
-
-    for (const docSnap of snap.docs) {
-      const rawDocId = docSnap.id;
-      const docData = docSnap.data();
-      const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
-
-      if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
-        continue;
-      }
-
-      remoteCanonicalIds.add(canonicalId);
-
-      // Only mark canonicalId as synced if the Firestore doc actually lives at canonicalId
-      if (rawDocId === canonicalId) {
-        const sig = computePayloadSignature({ ...docData, id: canonicalId });
-        syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
-      } else {
-        syncedSignatures.delete(`${tableName}/${canonicalId}`);
-      }
-
-      if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
-        docsToDelete.push(rawDocId);
-      }
-
-      const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
-      let mergedRecord: any;
-      if (existing) {
-        const localTime = new Date(
-          existing.updated_at || existing.last_updated || 0
-        ).getTime();
-        const remoteTime = new Date(
-          docData.updated_at || docData.last_updated || 0
-        ).getTime();
-
-        if (
-          typeof existing.id === 'number' &&
-          typeof canonicalId === 'string' &&
-          String(existing.id) === canonicalId
-        ) {
-          docsToDelete.push(existing.id);
-        }
-
-        if (remoteTime >= localTime) {
-          mergedRecord = {
-            ...existing,
-            ...docData,
-            id: canonicalId,
-            updated_at: docData.updated_at || new Date().toISOString(),
-          };
-        } else {
-          mergedRecord = {
-            ...docData,
-            ...existing,
-            id: canonicalId,
-            updated_at: existing.updated_at || new Date().toISOString(),
-          };
-        }
-      } else {
-        mergedRecord = {
-          ...docData,
-          id: canonicalId,
-          updated_at: docData.updated_at || new Date().toISOString(),
-        };
-      }
-
-      docsToPut.push(mergedRecord);
-
-      // If Firestore document was stored under a legacy UUID instead of canonicalId,
-      // force-write the canonical document and delete the legacy UUID document
-      if (rawDocId !== canonicalId) {
-        enqueueSyncOperation(tableName, canonicalId, mergedRecord, false, true);
-        enqueueSyncOperation(tableName, rawDocId, null, true);
-      }
-    }
-
-    // Reconcile local records: only delete locally if explicitly tombstoned.
-    // If a local record is NOT tombstoned and missing from remote, re-push it to Firestore so no data is lost!
-    existingList.forEach((localItem: any) => {
-      if (!localItem?.id || localItem.is_demo === true) return;
-      const localIdStr = String(localItem.id);
-      const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
-
-      if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
-        docsToDelete.push(localItem.id);
-      } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
-        enqueueSyncOperation(
-          tableName,
-          canonicalLocalId,
-          { ...localItem, id: canonicalLocalId },
-          false,
-          true
-        );
-      }
-    });
-
-    if (docsToDelete.length > 0 || docsToPut.length > 0) {
-      await dexieDb.transaction('rw', dexieTable, async () => {
-        if (docsToDelete.length > 0) {
-          await dexieTable.bulkDelete(docsToDelete);
-        }
-        if (docsToPut.length > 0) {
-          await dexieTable.bulkPut(docsToPut);
-        }
-      });
-      persistSignatures();
-    }
-  } finally {
-    setRemoteSyncing(false);
-  }
+export async function pullCollectionFromFirestore(_tableName: TableName) {
+  // Legacy Firestore disconnected; handled directly by Supabase
 }
 
 /**
@@ -1455,15 +1016,20 @@ export async function recoverMissingClassEnrollments(): Promise<number> {
     );
 
     if (finalRecordsToRestore.length > 0) {
-      await dexieDb.transaction('rw', dexieDb.class_students, async () => {
-        await dexieDb.class_students.bulkPut(finalRecordsToRestore as any);
-      });
+      setRemoteSyncing(true);
+      try {
+        await dexieDb.transaction('rw', dexieDb.class_students, async () => {
+          await dexieDb.class_students.bulkPut(finalRecordsToRestore as any);
+        });
+      } finally {
+        setRemoteSyncing(false);
+      }
 
       for (const rec of finalRecordsToRestore) {
         const tombKey = `class_students_${rec.id}`;
         tombstoneMap.delete(tombKey);
-        if (firestoreDb && !getIsQuotaExceeded()) {
-          deleteDoc(doc(firestoreDb, TOMBSTONE_COLLECTION, tombKey)).catch(() => {});
+        if (supabase && supabaseReady !== false) {
+          supabase.from(TOMBSTONE_COLLECTION).delete().eq('id', tombKey).then(() => {}, () => {});
         }
         enqueueSyncOperation('class_students', rec.id, rec, false, true);
       }
@@ -1478,7 +1044,7 @@ export async function recoverMissingClassEnrollments(): Promise<number> {
 
 /**
  * Kaizen Auto-Deduplication & Merge Engine:
- * Merges duplicate records by canonical business keys across Dexie & queues cleanup for Firestore.
+ * Merges duplicate records by canonical business keys across Dexie & queues cleanup for Supabase.
  */
 export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
   const report: KaizenReport = {
@@ -1488,9 +1054,8 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
     tablesCleaned: [],
   };
 
-  if (isRunningKaizen) return report;
+  if (isRunningKaizen || isUserActivelyEditing()) return report;
   isRunningKaizen = true;
-  setRemoteSyncing(true);
   try {
     // 1. Deduplicate Settings -> 'system_settings'
     const allSettings = await dexieDb.settings.toArray();
@@ -1514,12 +1079,17 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
         .filter((id) => id && String(id) !== 'system_settings');
 
       if (oldSettingIds.length > 0 || bestSetting.id !== 'system_settings') {
-        await dexieDb.transaction('rw', dexieDb.settings, async () => {
-          if (oldSettingIds.length > 0) {
-            await dexieDb.settings.bulkDelete(oldSettingIds);
-          }
-          await dexieDb.settings.put(mergedSetting);
-        });
+        setRemoteSyncing(true);
+        try {
+          await dexieDb.transaction('rw', dexieDb.settings, async () => {
+            if (oldSettingIds.length > 0) {
+              await dexieDb.settings.bulkDelete(oldSettingIds);
+            }
+            await dexieDb.settings.put(mergedSetting);
+          });
+        } finally {
+          setRemoteSyncing(false);
+        }
         oldSettingIds.forEach((oldId) => enqueueSyncOperation('settings', oldId, null, true));
         enqueueSyncOperation('settings', 'system_settings', mergedSetting, false, true);
         report.mergedRecords += 1;
@@ -1564,28 +1134,33 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
       });
 
       if (yearsToPut.length > 0 || yearIdsToDelete.length > 0) {
-        await dexieDb.transaction('rw', [dexieDb.school_years, dexieDb.classes], async () => {
-          if (yearIdsToDelete.length > 0) await dexieDb.school_years.bulkDelete(yearIdsToDelete);
-          if (yearsToPut.length > 0) await dexieDb.school_years.bulkPut(yearsToPut);
+        setRemoteSyncing(true);
+        try {
+          await dexieDb.transaction('rw', [dexieDb.school_years, dexieDb.classes], async () => {
+            if (yearIdsToDelete.length > 0) await dexieDb.school_years.bulkDelete(yearIdsToDelete);
+            if (yearsToPut.length > 0) await dexieDb.school_years.bulkPut(yearsToPut);
 
-          if (yearIdRemap.size > 0) {
-            const allClasses = await dexieDb.classes.toArray();
-            const classesToUpdate: any[] = [];
-            allClasses.forEach((cls) => {
-              const newSyId = yearIdRemap.get(String(cls.school_year_id));
-              if (newSyId && newSyId !== cls.school_year_id) {
-                classesToUpdate.push({ ...cls, school_year_id: newSyId });
+            if (yearIdRemap.size > 0) {
+              const allClasses = await dexieDb.classes.toArray();
+              const classesToUpdate: any[] = [];
+              allClasses.forEach((cls) => {
+                const newSyId = yearIdRemap.get(String(cls.school_year_id));
+                if (newSyId && newSyId !== cls.school_year_id) {
+                  classesToUpdate.push({ ...cls, school_year_id: newSyId });
+                }
+              });
+              if (classesToUpdate.length > 0) {
+                await dexieDb.classes.bulkPut(classesToUpdate);
+                classesToUpdate.forEach((c) =>
+                  enqueueSyncOperation('classes', c.id, c, false, true)
+                );
+                report.remappedForeignKeys += classesToUpdate.length;
               }
-            });
-            if (classesToUpdate.length > 0) {
-              await dexieDb.classes.bulkPut(classesToUpdate);
-              classesToUpdate.forEach((c) =>
-                enqueueSyncOperation('classes', c.id, c, false, true)
-              );
-              report.remappedForeignKeys += classesToUpdate.length;
             }
-          }
-        });
+          });
+        } finally {
+          setRemoteSyncing(false);
+        }
         yearIdsToDelete.forEach((id) => enqueueSyncOperation('school_years', id, null, true));
         yearsToPut.forEach((y) => enqueueSyncOperation('school_years', y.id, y, false, true));
         report.mergedRecords += yearsToPut.length;
@@ -1611,7 +1186,6 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
       ssGroups.forEach((group, canonicalId) => {
         if (group.length > 1 || String(group[0].id) !== canonicalId) {
           group.sort((a, b) => {
-            // Prefer records with actual scores entered, then newest updated_at
             const scoreWeightA =
               (typeof a.homework_score === 'number' ? 2 : 0) +
               (typeof a.test_score === 'number' ? 2 : 0) +
@@ -1637,14 +1211,19 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
       });
 
       if (ssToPut.length > 0 || ssIdsToDelete.length > 0) {
-        await dexieDb.transaction('rw', dexieDb.student_sessions, async () => {
-          if (ssIdsToDelete.length > 0) {
-            await dexieDb.student_sessions.bulkDelete(ssIdsToDelete as any);
-          }
-          if (ssToPut.length > 0) {
-            await dexieDb.student_sessions.bulkPut(ssToPut);
-          }
-        });
+        setRemoteSyncing(true);
+        try {
+          await dexieDb.transaction('rw', dexieDb.student_sessions, async () => {
+            if (ssIdsToDelete.length > 0) {
+              await dexieDb.student_sessions.bulkDelete(ssIdsToDelete as any);
+            }
+            if (ssToPut.length > 0) {
+              await dexieDb.student_sessions.bulkPut(ssToPut);
+            }
+          });
+        } finally {
+          setRemoteSyncing(false);
+        }
         ssIdsToDelete.forEach((id) => enqueueSyncOperation('student_sessions', id, null, true));
         ssToPut.forEach((rec) =>
           enqueueSyncOperation('student_sessions', rec.id, rec, false, true)
@@ -1687,14 +1266,19 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
       });
 
       if (csToPut.length > 0 || csIdsToDelete.length > 0) {
-        await dexieDb.transaction('rw', dexieDb.class_students, async () => {
-          if (csIdsToDelete.length > 0) {
-            await dexieDb.class_students.bulkDelete(csIdsToDelete as any);
-          }
-          if (csToPut.length > 0) {
-            await dexieDb.class_students.bulkPut(csToPut);
-          }
-        });
+        setRemoteSyncing(true);
+        try {
+          await dexieDb.transaction('rw', dexieDb.class_students, async () => {
+            if (csIdsToDelete.length > 0) {
+              await dexieDb.class_students.bulkDelete(csIdsToDelete as any);
+            }
+            if (csToPut.length > 0) {
+              await dexieDb.class_students.bulkPut(csToPut);
+            }
+          });
+        } finally {
+          setRemoteSyncing(false);
+        }
         csIdsToDelete.forEach((id) => enqueueSyncOperation('class_students', id, null, true));
         csToPut.forEach((rec) =>
           enqueueSyncOperation('class_students', rec.id, rec, false, true)
@@ -1737,14 +1321,19 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
       });
 
       if (krToPut.length > 0 || krIdsToDelete.length > 0) {
-        await dexieDb.transaction('rw', dexieDb.knowledge_results, async () => {
-          if (krIdsToDelete.length > 0) {
-            await dexieDb.knowledge_results.bulkDelete(krIdsToDelete as any);
-          }
-          if (krToPut.length > 0) {
-            await dexieDb.knowledge_results.bulkPut(krToPut);
-          }
-        });
+        setRemoteSyncing(true);
+        try {
+          await dexieDb.transaction('rw', dexieDb.knowledge_results, async () => {
+            if (krIdsToDelete.length > 0) {
+              await dexieDb.knowledge_results.bulkDelete(krIdsToDelete as any);
+            }
+            if (krToPut.length > 0) {
+              await dexieDb.knowledge_results.bulkPut(krToPut);
+            }
+          });
+        } finally {
+          setRemoteSyncing(false);
+        }
         krIdsToDelete.forEach((id) => enqueueSyncOperation('knowledge_results', id, null, true));
         krToPut.forEach((rec) =>
           enqueueSyncOperation('knowledge_results', rec.id, rec, false, true)
@@ -1755,7 +1344,7 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
       }
     }
 
-    // 6. Auto-recover any missing class_students relationships from sessions, warnings, audit logs & tombstones
+    // 6. Auto-recover any missing class_students relationships
     const recoveredEnrollments = await recoverMissingClassEnrollments();
     if (recoveredEnrollments > 0) {
       report.mergedRecords += recoveredEnrollments;
@@ -1770,11 +1359,10 @@ export async function kaizenDeduplicateAndMerge(): Promise<KaizenReport> {
         : 'Cơ sở dữ liệu đã chuẩn hóa 100% (0 bản ghi trùng lặp).';
     updateSyncStatus({ lastKaizenSummary: summaryText });
   } finally {
-    setRemoteSyncing(false);
     isRunningKaizen = false;
   }
 
-  if (sqlBackendAvailable !== false || !getIsQuotaExceeded()) {
+  if (outboxMap.size > 0 && (supabaseReady !== false || sqlBackendAvailable !== false)) {
     flushSyncOutbox().catch(() => {});
   }
 
@@ -1798,16 +1386,15 @@ export async function pullAllFromSqlCloud(): Promise<{
 
   try {
     const token = await getActiveAuthToken();
-    const res = await withFirestoreTimeout(
-      fetch('/api/sql-sync/pull', {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      }),
-      8000,
-      'pullAllFromSqlCloud'
-    );
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch('/api/sql-sync/pull', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
 
     const contentType = res.headers.get('content-type') || '';
     if (res.status === 404 || !contentType.includes('application/json')) {
@@ -1847,126 +1434,145 @@ export async function pullAllFromSqlCloud(): Promise<{
       persistTombstones();
     }
 
-    setRemoteSyncing(true);
-    try {
-      for (const [tName, ids] of deletionsByTable.entries()) {
-        const dexieTable = (dexieDb as any)[tName];
-        if (!dexieTable || ids.length === 0) continue;
-        const existingRecords = await dexieTable.bulkGet(ids);
-        const confirmedDeleteIds: (string | number)[] = [];
-        existingRecords.forEach((rec: any, idx: number) => {
-          const targetId = ids[idx];
-          if (rec && isRecordTombstoned(tName, targetId, rec.updated_at)) {
-            confirmedDeleteIds.push(targetId);
-            const numId = Number(targetId);
-            if (!isNaN(numId)) confirmedDeleteIds.push(numId);
-          }
-        });
-        if (confirmedDeleteIds.length > 0) {
+    for (const [tName, ids] of deletionsByTable.entries()) {
+      const dexieTable = (dexieDb as any)[tName];
+      if (!dexieTable || ids.length === 0) continue;
+      const existingRecords = await dexieTable.bulkGet(ids);
+      const confirmedDeleteIds: (string | number)[] = [];
+      existingRecords.forEach((rec: any, idx: number) => {
+        const targetId = ids[idx];
+        if (rec && isRecordTombstoned(tName, targetId, rec.updated_at)) {
+          confirmedDeleteIds.push(targetId);
+          const numId = Number(targetId);
+          if (!isNaN(numId)) confirmedDeleteIds.push(numId);
+        }
+      });
+      if (confirmedDeleteIds.length > 0) {
+        setRemoteSyncing(true);
+        try {
           await dexieTable.bulkDelete(confirmedDeleteIds);
+        } finally {
+          setRemoteSyncing(false);
         }
       }
+    }
 
-      // 2. Reconcile all 12 domain tables
-      for (const tableName of ALL_TABLES) {
-        const remoteRows: any[] = Array.isArray(payload.tables[tableName])
-          ? payload.tables[tableName]
-          : [];
-        totalRemoteRecords += remoteRows.length;
+    // 2. Reconcile all 12 domain tables with strict Delta-Only bulkPut & Outbox Guard
+    for (const tableName of ALL_TABLES) {
+      const remoteRows: any[] = Array.isArray(payload.tables[tableName])
+        ? payload.tables[tableName]
+        : [];
+      totalRemoteRecords += remoteRows.length;
 
-        const dexieTable = (dexieDb as any)[tableName];
-        if (!dexieTable) continue;
+      const dexieTable = (dexieDb as any)[tableName];
+      if (!dexieTable) continue;
 
-        const existingList = await dexieTable.toArray();
-        const existingMap = new Map<string, any>();
-        existingList.forEach((item: any) => {
-          if (item?.id !== undefined && item?.id !== null) {
-            existingMap.set(String(item.id), item);
-          }
-        });
+      const existingList = await dexieTable.toArray();
+      const existingMap = new Map<string, any>();
+      existingList.forEach((item: any) => {
+        if (item?.id !== undefined && item?.id !== null) {
+          existingMap.set(String(item.id), item);
+        }
+      });
 
-        const docsToDelete: (string | number)[] = [];
-        const docsToPut: any[] = [];
-        const remoteCanonicalIds = new Set<string>();
+      const docsToDelete: (string | number)[] = [];
+      const docsToPut: any[] = [];
+      const remoteCanonicalIds = new Set<string>();
 
-        for (const docData of remoteRows) {
-          if (!docData) continue;
-          const rawDocId = String(docData.id || '');
-          const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
+      for (const docData of remoteRows) {
+        if (!docData) continue;
+        const rawDocId = String(docData.id || '');
+        const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
 
-          if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
-            continue;
-          }
+        if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
+          continue;
+        }
 
-          remoteCanonicalIds.add(canonicalId);
+        remoteCanonicalIds.add(canonicalId);
 
-          if (rawDocId === canonicalId) {
-            const sig = computePayloadSignature({ ...docData, id: canonicalId });
-            syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
-          } else {
-            syncedSignatures.delete(`${tableName}/${canonicalId}`);
-          }
+        // Outbox Guard: never overwrite a record that has pending local edits in Outbox
+        if (
+          outboxMap.has(`${tableName}/${canonicalId}`) ||
+          outboxMap.has(`${tableName}/${rawDocId}`)
+        ) {
+          continue;
+        }
 
-          if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
-            docsToDelete.push(rawDocId);
-          }
+        if (rawDocId === canonicalId) {
+          const sig = computePayloadSignature({ ...docData, id: canonicalId });
+          syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+        } else {
+          syncedSignatures.delete(`${tableName}/${canonicalId}`);
+        }
 
-          const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
-          let mergedRecord: any;
-          if (existing) {
-            const localTime = new Date(
-              existing.updated_at || existing.last_updated || 0
-            ).getTime();
-            const remoteTime = new Date(
-              docData.updated_at || docData.last_updated || 0
-            ).getTime();
+        if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
+          docsToDelete.push(rawDocId);
+        }
 
-            if (remoteTime >= localTime) {
-              mergedRecord = {
-                ...existing,
-                ...docData,
-                id: canonicalId,
-                updated_at: docData.updated_at || new Date().toISOString(),
-              };
-            } else {
-              mergedRecord = {
-                ...docData,
-                ...existing,
-                id: canonicalId,
-                updated_at: existing.updated_at || new Date().toISOString(),
-              };
-            }
-          } else {
-            mergedRecord = {
+        const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
+        if (existing) {
+          const localTime = new Date(
+            existing.updated_at || existing.last_updated || 0
+          ).getTime();
+          const remoteTime = new Date(
+            docData.updated_at || docData.last_updated || 0
+          ).getTime();
+
+          if (remoteTime >= localTime) {
+            const mergedRecord = {
+              ...existing,
               ...docData,
               id: canonicalId,
               updated_at: docData.updated_at || new Date().toISOString(),
             };
+            const existingSig = computePayloadSignature(existing);
+            const mergedSig = computePayloadSignature(mergedRecord);
+            if (rawDocId !== canonicalId || existingSig !== mergedSig) {
+              docsToPut.push(mergedRecord);
+            }
+          } else {
+            const mergedRecord = {
+              ...docData,
+              ...existing,
+              id: canonicalId,
+              updated_at: existing.updated_at || new Date().toISOString(),
+            };
+            if (rawDocId !== canonicalId && !existingMap.has(canonicalId)) {
+              docsToPut.push(mergedRecord);
+            }
+            enqueueSyncOperation(tableName, canonicalId, mergedRecord, false, true);
           }
-
-          docsToPut.push(mergedRecord);
+        } else {
+          docsToPut.push({
+            ...docData,
+            id: canonicalId,
+            updated_at: docData.updated_at || new Date().toISOString(),
+          });
         }
+      }
 
-        // Queue any non-demo local records missing from Cloud SQL so they automatically migrate up
-        existingList.forEach((localItem: any) => {
-          if (!localItem?.id || localItem.is_demo === true) return;
-          const localIdStr = String(localItem.id);
-          const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
+      // Queue any non-demo local records missing from Cloud SQL so they automatically migrate up
+      existingList.forEach((localItem: any) => {
+        if (!localItem?.id || localItem.is_demo === true) return;
+        const localIdStr = String(localItem.id);
+        const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
 
-          if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
-            docsToDelete.push(localItem.id);
-          } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
-            enqueueSyncOperation(
-              tableName,
-              canonicalLocalId,
-              { ...localItem, id: canonicalLocalId },
-              false,
-              true
-            );
-          }
-        });
+        if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
+          docsToDelete.push(localItem.id);
+        } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
+          enqueueSyncOperation(
+            tableName,
+            canonicalLocalId,
+            { ...localItem, id: canonicalLocalId },
+            false,
+            true
+          );
+        }
+      });
 
-        if (docsToDelete.length > 0 || docsToPut.length > 0) {
+      if (docsToDelete.length > 0 || docsToPut.length > 0) {
+        setRemoteSyncing(true);
+        try {
           await dexieDb.transaction('rw', dexieTable, async () => {
             if (docsToDelete.length > 0) {
               await dexieTable.bulkDelete(docsToDelete);
@@ -1975,12 +1581,12 @@ export async function pullAllFromSqlCloud(): Promise<{
               await dexieTable.bulkPut(docsToPut);
             }
           });
+        } finally {
+          setRemoteSyncing(false);
         }
       }
-      persistSignatures();
-    } finally {
-      setRemoteSyncing(false);
     }
+    persistSignatures();
 
     return { ok: true, totalRemoteRecords };
   } catch (err) {
@@ -2035,7 +1641,6 @@ export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boo
     >();
     const deletionsByTable = new Map<TableName, string[]>();
     const tombstonesToUpsert: TombstoneRecord[] = [];
-    const committedKeys: Array<{ key: string; sig?: string }> = [];
 
     for (const entry of entries) {
       if (entry.isDelete) {
@@ -2045,7 +1650,6 @@ export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boo
         }
         deletionsByTable.get(entry.tableName)!.push(entry.docId);
         tombstonesToUpsert.push(tomb);
-        committedKeys.push({ key: entry.key });
       } else if (entry.data) {
         if (entry.data.is_demo === true) {
           outboxMap.delete(entry.key);
@@ -2071,7 +1675,6 @@ export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boo
             updated_at: updatedAt,
           },
         });
-        committedKeys.push({ key: entry.key, sig });
       }
     }
 
@@ -2080,47 +1683,72 @@ export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boo
       return true;
     }
 
-    // Upsert changed records per table
+    // Upsert changed records per table in chunks of 500 (deduplicated by id to prevent PostgreSQL batch conflict)
     for (const [tName, rows] of mutationsByTable.entries()) {
-      const { error } = await supabase.from(tName).upsert(rows, { onConflict: 'id' });
-      if (error) {
-        if (error.code === 'PGRST205' || error.code === '42P01') {
-          supabaseReady = false;
-          supabaseNeedsSchemaSetup = true;
-          updateSyncStatus({ supabaseConnected: false, supabaseNeedsSetup: true });
+      const uniqueMap = new Map<string, { id: string; updated_at: string; payload: any }>();
+      rows.forEach((r) => uniqueMap.set(r.id, r));
+      const uniqueRows = Array.from(uniqueMap.values());
+
+      const CHUNK_SIZE = 500;
+      let tableError = false;
+      for (let i = 0; i < uniqueRows.length; i += CHUNK_SIZE) {
+        const chunk = uniqueRows.slice(i, i + CHUNK_SIZE);
+        const { error } = await supabase.from(tName).upsert(chunk, { onConflict: 'id' });
+        if (error) {
+          if (error.code === 'PGRST205' || error.code === '42P01') {
+            supabaseReady = false;
+            supabaseNeedsSchemaSetup = true;
+            updateSyncStatus({ supabaseConnected: false, supabaseNeedsSetup: true });
+            return false;
+          }
+          tableError = true;
+          break;
         }
-        return false;
       }
+      if (tableError) continue;
+
       // Remove any old tombstones for upserted rows
-      const tombIds = rows.map((r) => `${tName}_${r.id}`);
-      if (tombIds.length > 0) {
-        await supabase.from(TOMBSTONE_COLLECTION).delete().in('id', tombIds);
+      const tombIds = uniqueRows.map((r) => `${tName}_${r.id}`);
+      for (let i = 0; i < tombIds.length; i += CHUNK_SIZE) {
+        const chunkIds = tombIds.slice(i, i + CHUNK_SIZE);
+        await supabase.from(TOMBSTONE_COLLECTION).delete().in('id', chunkIds);
+      }
+
+      for (const r of uniqueRows) {
+        const key = `${tName}/${r.id}`;
+        const sig = computePayloadSignature(r.payload);
+        outboxMap.delete(key);
+        syncedSignatures.set(key, sig);
       }
     }
 
     // Apply deletions & tombstones
     for (const [tName, ids] of deletionsByTable.entries()) {
       if (ids.length > 0) {
-        await supabase.from(tName).delete().in('id', ids);
+        const CHUNK_SIZE = 500;
+        for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+          const chunkIds = ids.slice(i, i + CHUNK_SIZE);
+          await supabase.from(tName).delete().in('id', chunkIds);
+        }
+        ids.forEach((id) => {
+          const key = `${tName}/${id}`;
+          outboxMap.delete(key);
+          syncedSignatures.delete(key);
+        });
       }
     }
     if (tombstonesToUpsert.length > 0) {
-      await supabase
-        .from(TOMBSTONE_COLLECTION)
-        .upsert(tombstonesToUpsert, { onConflict: 'id' });
+      const CHUNK_SIZE = 500;
+      for (let i = 0; i < tombstonesToUpsert.length; i += CHUNK_SIZE) {
+        const chunk = tombstonesToUpsert.slice(i, i + CHUNK_SIZE);
+        await supabase.from(TOMBSTONE_COLLECTION).upsert(chunk, { onConflict: 'id' });
+      }
     }
 
     supabaseReady = true;
     supabaseNeedsSchemaSetup = false;
+    lastLocalFlushCompletedAt = Date.now();
 
-    for (const item of committedKeys) {
-      outboxMap.delete(item.key);
-      if (item.sig) {
-        syncedSignatures.set(item.key, item.sig);
-      } else {
-        syncedSignatures.delete(item.key);
-      }
-    }
     persistOutbox();
     persistSignatures();
     return true;
@@ -2130,7 +1758,52 @@ export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boo
 }
 
 /**
+ * Fetches all rows from a Supabase table using 1,000-row pagination
+ * so tables with >1,000 records (e.g. student_sessions with 1,518+ rows) are never truncated.
+ */
+async function fetchAllRowsFromSupabaseTable(
+  tableName: string
+): Promise<{ data: any[] | null; error: any }> {
+  if (!supabase) return { data: null, error: new Error('Supabase not configured') };
+
+  if (tableName === 'audit_logs') {
+    const res = await supabase
+      .from(tableName)
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(100);
+    return { data: res.data || [], error: res.error };
+  }
+
+  const allRows: any[] = [];
+  const PAGE_SIZE = 1000;
+  let offset = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from(tableName)
+      .select('*')
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (error) {
+      return { data: null, error };
+    }
+    if (!data || data.length === 0) {
+      break;
+    }
+    allRows.push(...data);
+    if (data.length < PAGE_SIZE) {
+      break;
+    }
+    offset += PAGE_SIZE;
+  }
+
+  return { data: allRows, error: null };
+}
+
+/**
  * Pulls all 12 domain tables + deleted_records tombstones from Supabase PostgreSQL
+ * using paginated fetches, Outbox protection, and strict Delta-Only bulkPut.
  */
 export async function pullAllFromSupabase(): Promise<{
   ok: boolean;
@@ -2142,8 +1815,25 @@ export async function pullAllFromSupabase(): Promise<{
   }
 
   try {
-    // Quick probe on deleted_records to check if schema exists on Supabase
-    const tombRes = await supabase.from(TOMBSTONE_COLLECTION).select('*');
+    // One-time browser cache reset to purge ~2,500 stuck legacy/duplicate IndexedDB records
+    let isCleanResetBoot = false;
+    if (
+      typeof window !== 'undefined' &&
+      localStorage.getItem(SUPABASE_CLEAN_SYNC_VERSION_KEY) !== SUPABASE_CLEAN_SYNC_VERSION
+    ) {
+      isCleanResetBoot = true;
+      outboxMap.clear();
+      tombstoneMap.clear();
+      syncedSignatures.clear();
+      try {
+        localStorage.removeItem(LOCAL_TOMBSTONE_KEY);
+        localStorage.removeItem(LOCAL_OUTBOX_KEY);
+        sessionStorage.removeItem(LOCAL_SIGNATURES_KEY);
+      } catch (e) {}
+    }
+
+    // 1. Fetch deleted_records tombstones (paginated)
+    const tombRes = await fetchAllRowsFromSupabaseTable(TOMBSTONE_COLLECTION);
     if (tombRes.error) {
       if (tombRes.error.code === 'PGRST205' || tombRes.error.code === '42P01') {
         supabaseReady = false;
@@ -2163,7 +1853,6 @@ export async function pullAllFromSupabase(): Promise<{
 
     let totalRemoteRecords = 0;
 
-    // 1. Apply remote tombstones
     const deletionsByTable = new Map<string, string[]>();
     if (Array.isArray(tombRes.data)) {
       tombRes.data.forEach((t: any) => {
@@ -2184,144 +1873,189 @@ export async function pullAllFromSupabase(): Promise<{
       persistTombstones();
     }
 
-    // 2. Fetch all 12 domain tables in parallel from Supabase
+    // 2. Fetch all 12 domain tables in parallel (with 1,000-row pagination for large tables)
     const tableResponses = await Promise.all(
-      ALL_TABLES.map((tName) =>
-        tName === 'audit_logs'
-          ? supabase
-              .from(tName)
-              .select('*')
-              .order('updated_at', { ascending: false })
-              .limit(100)
-          : supabase.from(tName).select('*')
-      )
+      ALL_TABLES.map((tName) => fetchAllRowsFromSupabaseTable(tName))
     );
 
-    setRemoteSyncing(true);
-    try {
-      for (const [tName, ids] of deletionsByTable.entries()) {
-        const dexieTable = (dexieDb as any)[tName];
-        if (!dexieTable || ids.length === 0) continue;
-        const existingRecords = await dexieTable.bulkGet(ids);
-        const confirmedDeleteIds: (string | number)[] = [];
-        existingRecords.forEach((rec: any, idx: number) => {
-          const targetId = ids[idx];
-          if (rec && isRecordTombstoned(tName, targetId, rec.updated_at)) {
-            confirmedDeleteIds.push(targetId);
-            const numId = Number(targetId);
-            if (!isNaN(numId)) confirmedDeleteIds.push(numId);
+    // Count total remote records first
+    for (let idx = 0; idx < ALL_TABLES.length; idx++) {
+      const res = tableResponses[idx];
+      if (!res.error && Array.isArray(res.data)) {
+        totalRemoteRecords += res.data.length;
+      }
+    }
+
+    // If this is the one-time clean reset boot and Supabase has data, clear all local IndexedDB tables first
+    if (isCleanResetBoot && totalRemoteRecords > 0) {
+      setRemoteSyncing(true);
+      try {
+        for (const tName of ALL_TABLES) {
+          const dexieTable = (dexieDb as any)[tName];
+          if (dexieTable) {
+            await dexieTable.clear();
           }
-        });
-        if (confirmedDeleteIds.length > 0) {
+        }
+        if (typeof window !== 'undefined') {
+          localStorage.setItem(SUPABASE_CLEAN_SYNC_VERSION_KEY, SUPABASE_CLEAN_SYNC_VERSION);
+        }
+      } finally {
+        setRemoteSyncing(false);
+      }
+    }
+
+    // 3. Apply confirmed tombstone deletions only where records actually exist locally
+    for (const [tName, ids] of deletionsByTable.entries()) {
+      const dexieTable = (dexieDb as any)[tName];
+      if (!dexieTable || ids.length === 0) continue;
+      const existingRecords = await dexieTable.bulkGet(ids);
+      const confirmedDeleteIds: (string | number)[] = [];
+      existingRecords.forEach((rec: any, idx: number) => {
+        const targetId = ids[idx];
+        if (
+          rec &&
+          !outboxMap.has(`${tName}/${targetId}`) &&
+          isRecordTombstoned(tName, targetId, rec.updated_at)
+        ) {
+          confirmedDeleteIds.push(targetId);
+          const numId = Number(targetId);
+          if (!isNaN(numId)) confirmedDeleteIds.push(numId);
+        }
+      });
+      if (confirmedDeleteIds.length > 0) {
+        setRemoteSyncing(true);
+        try {
           await dexieTable.bulkDelete(confirmedDeleteIds);
+        } finally {
+          setRemoteSyncing(false);
         }
       }
+    }
 
-      for (let idx = 0; idx < ALL_TABLES.length; idx++) {
-        const tableName = ALL_TABLES[idx];
-        const res = tableResponses[idx];
-        if (res.error || !Array.isArray(res.data)) continue;
+    // 4. Reconcile all 12 domain tables with strict Delta-Only bulkPut & Outbox protection
+    for (let idx = 0; idx < ALL_TABLES.length; idx++) {
+      const tableName = ALL_TABLES[idx];
+      const res = tableResponses[idx];
+      if (res.error || !Array.isArray(res.data)) continue;
 
-        const remoteRows = res.data.map((r: any) => ({
-          ...(typeof r.payload === 'object' && r.payload !== null ? r.payload : r),
-          id: r.id,
-          updated_at: r.updated_at,
-        }));
-        totalRemoteRecords += remoteRows.length;
+      const remoteRows = res.data.map((r: any) => ({
+        ...(typeof r.payload === 'object' && r.payload !== null ? r.payload : r),
+        id: r.id,
+        updated_at: r.updated_at,
+      }));
 
-        const dexieTable = (dexieDb as any)[tableName];
-        if (!dexieTable) continue;
+      const dexieTable = (dexieDb as any)[tableName];
+      if (!dexieTable) continue;
 
-        const existingList = await dexieTable.toArray();
-        const existingMap = new Map<string, any>();
-        existingList.forEach((item: any) => {
-          if (item?.id !== undefined && item?.id !== null) {
-            existingMap.set(String(item.id), item);
-          }
-        });
+      const existingList = await dexieTable.toArray();
+      const existingMap = new Map<string, any>();
+      existingList.forEach((item: any) => {
+        if (item?.id !== undefined && item?.id !== null) {
+          existingMap.set(String(item.id), item);
+        }
+      });
 
-        const docsToDelete: (string | number)[] = [];
-        const docsToPut: any[] = [];
-        const remoteCanonicalIds = new Set<string>();
+      const docsToDelete: (string | number)[] = [];
+      const docsToPut: any[] = [];
+      const remoteCanonicalIds = new Set<string>();
 
-        for (const docData of remoteRows) {
-          if (!docData) continue;
-          const rawDocId = String(docData.id || '');
-          const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
+      for (const docData of remoteRows) {
+        if (!docData) continue;
+        const rawDocId = String(docData.id || '');
+        const canonicalId = getCanonicalDocId(tableName, docData, rawDocId);
 
-          if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
-            continue;
-          }
+        if (isRecordTombstoned(tableName, canonicalId, docData.updated_at)) {
+          continue;
+        }
 
-          remoteCanonicalIds.add(canonicalId);
+        remoteCanonicalIds.add(canonicalId);
 
-          if (rawDocId === canonicalId) {
-            const sig = computePayloadSignature({ ...docData, id: canonicalId });
-            syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
-          } else {
-            syncedSignatures.delete(`${tableName}/${canonicalId}`);
-          }
+        // Outbox Guard: Never overwrite a record that has pending local edits in Outbox
+        if (
+          outboxMap.has(`${tableName}/${canonicalId}`) ||
+          outboxMap.has(`${tableName}/${rawDocId}`)
+        ) {
+          continue;
+        }
 
-          if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
-            docsToDelete.push(rawDocId);
-          }
+        if (rawDocId === canonicalId) {
+          const sig = computePayloadSignature({ ...docData, id: canonicalId });
+          syncedSignatures.set(`${tableName}/${canonicalId}`, sig);
+        } else {
+          syncedSignatures.delete(`${tableName}/${canonicalId}`);
+        }
 
-          const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
-          let mergedRecord: any;
-          if (existing) {
-            const localTime = new Date(
-              existing.updated_at || existing.last_updated || 0
-            ).getTime();
-            const remoteTime = new Date(
-              docData.updated_at || docData.last_updated || 0
-            ).getTime();
+        if (rawDocId !== canonicalId && existingMap.has(rawDocId)) {
+          docsToDelete.push(rawDocId);
+        }
 
-            if (remoteTime >= localTime) {
-              mergedRecord = {
-                ...existing,
-                ...docData,
-                id: canonicalId,
-                updated_at: docData.updated_at || new Date().toISOString(),
-              };
-            } else {
-              mergedRecord = {
-                ...docData,
-                ...existing,
-                id: canonicalId,
-                updated_at: existing.updated_at || new Date().toISOString(),
-              };
-            }
-          } else {
-            mergedRecord = {
+        const existing = existingMap.get(canonicalId) || existingMap.get(rawDocId);
+        if (existing) {
+          const localTime = new Date(
+            existing.updated_at || existing.last_updated || 0
+          ).getTime();
+          const remoteTime = new Date(
+            docData.updated_at || docData.last_updated || 0
+          ).getTime();
+
+          if (remoteTime >= localTime) {
+            const mergedRecord = {
               ...docData,
               id: canonicalId,
               updated_at: docData.updated_at || new Date().toISOString(),
             };
+            const existingSig = computePayloadSignature(existing);
+            const mergedSig = computePayloadSignature(mergedRecord);
+            // Strict Delta-Only: only write to Dexie if the payload actually changed or ID was remapped
+            if (rawDocId !== canonicalId || existingSig !== mergedSig) {
+              docsToPut.push(mergedRecord);
+            }
+          } else {
+            // Local record is newer than remote -> keep local record and queue push to Supabase
+            const mergedRecord = {
+              ...docData,
+              ...existing,
+              id: canonicalId,
+              updated_at: existing.updated_at || new Date().toISOString(),
+            };
+            if (rawDocId !== canonicalId && !existingMap.has(canonicalId)) {
+              docsToPut.push(mergedRecord);
+            }
+            enqueueSyncOperation(tableName, canonicalId, mergedRecord, false, true);
           }
-
-          docsToPut.push(mergedRecord);
+        } else {
+          docsToPut.push({
+            ...docData,
+            id: canonicalId,
+            updated_at: docData.updated_at || new Date().toISOString(),
+          });
         }
+      }
 
-        // Queue any non-demo local records missing from Supabase so they migrate automatically
-        existingList.forEach((localItem: any) => {
-          if (!localItem?.id || localItem.is_demo === true) return;
-          const localIdStr = String(localItem.id);
-          const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
+      // Reconcile local records missing from Supabase:
+      // - If the local record is in Outbox, keep it (it's a pending local creation).
+      // - If Supabase already has data (totalRemoteRecords > 0) and a local record is NOT in remoteCanonicalIds and NOT in Outbox,
+      //   it is a stale/deleted ghost record -> remove it from local IndexedDB instead of re-uploading it!
+      existingList.forEach((localItem: any) => {
+        if (!localItem?.id || localItem.is_demo === true) return;
+        const localIdStr = String(localItem.id);
+        const canonicalLocalId = getCanonicalDocId(tableName, localItem, localIdStr);
 
-          if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
+        if (isRecordTombstoned(tableName, canonicalLocalId, localItem.updated_at)) {
+          docsToDelete.push(localItem.id);
+        } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
+          const isPendingInOutbox =
+            outboxMap.has(`${tableName}/${canonicalLocalId}`) ||
+            outboxMap.has(`${tableName}/${localIdStr}`);
+          if (!isPendingInOutbox && totalRemoteRecords > 0) {
             docsToDelete.push(localItem.id);
-          } else if (!remoteCanonicalIds.has(canonicalLocalId)) {
-            enqueueSyncOperation(
-              tableName,
-              canonicalLocalId,
-              { ...localItem, id: canonicalLocalId },
-              false,
-              true
-            );
           }
-        });
+        }
+      });
 
-        if (docsToDelete.length > 0 || docsToPut.length > 0) {
+      if (docsToDelete.length > 0 || docsToPut.length > 0) {
+        setRemoteSyncing(true);
+        try {
           await dexieDb.transaction('rw', dexieTable, async () => {
             if (docsToDelete.length > 0) {
               await dexieTable.bulkDelete(docsToDelete);
@@ -2330,12 +2064,12 @@ export async function pullAllFromSupabase(): Promise<{
               await dexieTable.bulkPut(docsToPut);
             }
           });
+        } finally {
+          setRemoteSyncing(false);
         }
       }
-      persistSignatures();
-    } finally {
-      setRemoteSyncing(false);
     }
+    persistSignatures();
 
     return { ok: true, totalRemoteRecords };
   } catch (err) {
@@ -2343,14 +2077,14 @@ export async function pullAllFromSupabase(): Promise<{
   }
 }
 
-// Pull all collections from Supabase (primary) -> Cloud SQL -> Firestore into Dexie
+// Pull all collections from Supabase (primary) -> Cloud SQL into Dexie
 export async function pullAllFromFirestore() {
   if (isPullingAll) return;
   isPullingAll = true;
   updateSyncStatus({ isSyncing: true });
 
   try {
-    // 1. Try pulling from Supabase PostgreSQL first (works on both Vercel & AI Studio)
+    // 1. Pull from Supabase PostgreSQL first (primary cloud database)
     const supaResult = await pullAllFromSupabase();
 
     // 2. Also pull from Cloud SQL if Supabase is not set up yet or has 0 records
@@ -2359,23 +2093,7 @@ export async function pullAllFromFirestore() {
       sqlResult = await pullAllFromSqlCloud();
     }
 
-    // 3. Pull from Firestore if both SQL stores are brand-new (0 records) or unavailable
-    // so existing Firestore data automatically migrates into IndexedDB, Supabase & Cloud SQL
-    const totalSqlRecords = supaResult.totalRemoteRecords + sqlResult.totalRemoteRecords;
-    const shouldAlsoPullFirestore =
-      ((!supaResult.ok && !sqlResult.ok) || totalSqlRecords === 0) &&
-      !getIsQuotaExceeded() &&
-      !!firestoreDb;
-
-    if (shouldAlsoPullFirestore) {
-      await pullTombstonesFromFirestore();
-      for (const tableName of ALL_TABLES) {
-        if (getIsQuotaExceeded()) break;
-        await pullCollectionFromFirestore(tableName);
-      }
-    }
-
-    // If Supabase or Cloud SQL is active and was empty, queue all local/Firestore records to migrate up
+    // If Supabase or Cloud SQL is active and was completely empty (0 records), queue local records to migrate up
     if (
       (supaResult.ok && supaResult.totalRemoteRecords === 0) ||
       (sqlResult.ok && sqlResult.totalRemoteRecords === 0)
@@ -2400,23 +2118,13 @@ export async function pullAllFromFirestore() {
       }
     }
 
-    await kaizenDeduplicateAndMerge();
     updateSyncStatus({
       lastSyncedAt: new Date(),
       isSyncing: false,
-      quotaExceeded:
-        supabaseReady === true || sqlBackendAvailable === true
-          ? false
-          : getIsQuotaExceeded(),
+      quotaExceeded: false,
     });
-
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('smart_edu_data_updated', { detail: { all: true } })
-      );
-    }
   } catch (err: any) {
-    handleFirestoreError(err, 'pullAllFromFirestore');
+    console.warn('[SyncService] pullAllFromFirestore error:', err);
     updateSyncStatus({
       syncErrors: currentSyncStatus.syncErrors + 1,
       isSyncing: false,
@@ -2427,20 +2135,15 @@ export async function pullAllFromFirestore() {
   }
 }
 
-// Push all changed non-demo local records from Dexie to Supabase / Cloud SQL / Firestore
+// Push all changed non-demo local records from Dexie to Supabase / Cloud SQL
 export async function pushAllToFirestore() {
-  if (
-    supabaseReady === false &&
-    sqlBackendAvailable === false &&
-    (getIsQuotaExceeded() || !firestoreDb)
-  ) {
+  if (supabaseReady === false && sqlBackendAvailable === false) {
     updateSyncStatus({ isSyncing: false });
     return;
   }
   updateSyncStatus({ isSyncing: true });
 
   try {
-    await kaizenDeduplicateAndMerge();
     for (const tableName of ALL_TABLES) {
       const dexieTable = (dexieDb as any)[tableName];
       if (!dexieTable) continue;
@@ -2450,14 +2153,14 @@ export async function pushAllToFirestore() {
         if (!item || item.is_demo === true) continue;
         const docId = getCanonicalDocId(tableName, item, item.id);
         if (!isRecordTombstoned(tableName, docId, item.updated_at)) {
-          enqueueSyncOperation(tableName, docId, { ...item, id: docId }, false);
+          enqueueSyncOperation(tableName, docId, { ...item, id: docId }, false, true);
         }
       }
     }
     await flushSyncOutbox();
-    updateSyncStatus({ lastSyncedAt: new Date(), isSyncing: false });
+    updateSyncStatus({ lastSyncedAt: new Date(), isSyncing: false, quotaExceeded: false });
   } catch (err: any) {
-    handleFirestoreError(err, 'pushAllToFirestore');
+    console.warn('[SyncService] pushAllToFirestore error:', err);
     updateSyncStatus({
       syncErrors: currentSyncStatus.syncErrors + 1,
       isSyncing: false,
@@ -2467,20 +2170,15 @@ export async function pushAllToFirestore() {
   }
 }
 
-// Complete 2-way sync: Pull latest cloud updates & tombstones, deduplicate, then push dirty local items
+// Complete 2-way sync: Pull latest cloud updates & tombstones, then push dirty local items
 export async function syncAll() {
-  if (
-    supabaseReady === false &&
-    sqlBackendAvailable === false &&
-    (getIsQuotaExceeded() || !firestoreDb)
-  )
-    return;
+  if (supabaseReady === false && sqlBackendAvailable === false) return;
   updateSyncStatus({ isSyncing: true });
 
   try {
     await pullAllFromFirestore();
     await pushAllToFirestore();
-    updateSyncStatus({ lastSyncedAt: new Date(), isSyncing: false });
+    updateSyncStatus({ lastSyncedAt: new Date(), isSyncing: false, quotaExceeded: false });
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
@@ -2488,7 +2186,7 @@ export async function syncAll() {
       );
     }
   } catch (err: any) {
-    handleFirestoreError(err, 'syncAll');
+    console.warn('[SyncService] syncAll error:', err);
     updateSyncStatus({
       syncErrors: currentSyncStatus.syncErrors + 1,
       isSyncing: false,
@@ -2498,6 +2196,7 @@ export async function syncAll() {
 
 export async function forceFullSync() {
   supabaseReady = null;
+  hasRunInitialKaizen = false;
   await syncAll();
 }
 
@@ -2516,13 +2215,10 @@ export async function reconnectAndSyncCloud(): Promise<boolean> {
     await pushAllToFirestore();
     return true;
   }
-  const ok = await tryReconnectFirestore();
-  if (!ok) return false;
-  await syncAll();
-  return !getIsQuotaExceeded();
+  return false;
 }
 
-// Clear all Supabase, Cloud SQL & Firestore collections for real-world blank slate deployment
+// Clear all Supabase & Cloud SQL collections for real-world blank slate deployment
 export async function clearFirestoreDatabase() {
   try {
     if (supabaseReady !== false && supabase) {
@@ -2544,32 +2240,11 @@ export async function clearFirestoreDatabase() {
       } catch (e) {}
     }
 
-    if (!getIsQuotaExceeded() && firestoreDb) {
-      for (const tableName of ALL_TABLES) {
-        if (tableName === 'knowledge_tags' || tableName === 'settings') continue;
-        const colRef = collection(firestoreDb, tableName);
-        const snap = await getDocs(colRef);
-        if (snap.empty) continue;
-
-        const docs = snap.docs;
-        const BATCH_SIZE = 200;
-        for (let i = 0; i < docs.length; i += BATCH_SIZE) {
-          const chunk = docs.slice(i, i + BATCH_SIZE);
-          const batch = writeBatch(firestoreDb);
-          chunk.forEach((docSnapshot) => {
-            batch.delete(docSnapshot.ref);
-            const tomb = recordLocalTombstone(tableName, docSnapshot.id);
-            const tombRef = doc(firestoreDb, TOMBSTONE_COLLECTION, tomb.id);
-            batch.set(tombRef, tomb, { merge: true });
-          });
-          await batch.commit();
-        }
-      }
-    }
     outboxMap.clear();
     persistOutbox();
-    updateSyncStatus({ pendingOutboxCount: 0, lastSyncedAt: new Date() });
+    updateSyncStatus({ pendingOutboxCount: 0, lastSyncedAt: new Date(), quotaExceeded: false });
   } catch (err: any) {
-    handleFirestoreError(err, 'clearFirestoreDatabase');
+    console.warn('[SyncService] clearFirestoreDatabase error:', err);
   }
 }
+

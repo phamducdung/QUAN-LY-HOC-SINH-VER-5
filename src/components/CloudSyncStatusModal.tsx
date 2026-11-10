@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Database,
   Layers,
@@ -18,8 +18,8 @@ import { db } from '../db/dexie';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { useCloudSync } from '../hooks/useCloudSync';
 import { getIsQuotaExceeded } from '../firebase';
-import { SUPABASE_SETUP_SQL } from '../lib/supabase';
-import { getSupabaseSyncState } from '../services/syncService';
+import { supabase, SUPABASE_SETUP_SQL } from '../lib/supabase';
+import { getSupabaseSyncState, ALL_TABLES } from '../services/syncService';
 
 interface CloudSyncStatusModalProps {
   isOpen: boolean;
@@ -43,6 +43,7 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
 
   const [isManualSyncing, setIsManualSyncing] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [supabaseCounts, setSupabaseCounts] = useState<Record<string, number>>({});
 
   // Live queries for local counts
   const classesCount = useLiveQuery(() => db.classes.count()) ?? 0;
@@ -57,6 +58,33 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
   const schoolYearsCount = useLiveQuery(() => db.school_years.count()) ?? 0;
   const aiDiagnosesCount = useLiveQuery(() => db.ai_diagnoses.count()) ?? 0;
   const auditLogsCount = useLiveQuery(() => db.audit_logs.count()) ?? 0;
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    async function fetchRemoteCounts() {
+      const counts: Record<string, number> = {};
+      await Promise.all(
+        ALL_TABLES.map(async (tName) => {
+          try {
+            const { count, error } = await supabase
+              .from(tName)
+              .select('id', { count: 'exact', head: true });
+            if (!error && typeof count === 'number') {
+              counts[tName] = count;
+            }
+          } catch (e) {}
+        })
+      );
+      if (!cancelled) {
+        setSupabaseCounts(counts);
+      }
+    }
+    fetchRemoteCounts();
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, isManualSyncing, lastSyncedAt]);
 
   if (!isOpen) return null;
 
@@ -355,23 +383,39 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
           <div>
             <h3 className="text-xs font-bold text-slate-500 dark:text-slate-400 mb-2.5 flex items-center gap-1.5">
               <Layers className="w-3.5 h-3.5" />
-              <span>Chi tiết số lượng bản ghi theo bảng dữ liệu</span>
+              <span>Đối chiếu bản ghi: Máy tính (Local) vs Đám mây (Supabase)</span>
             </h3>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {tableList.map((t) => (
-                <div
-                  key={t.name}
-                  className="px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200/80 dark:border-slate-800 flex items-center justify-between"
-                >
-                  <span className="text-xs font-medium text-slate-700 dark:text-slate-200">
-                    {t.label}
-                  </span>
-                  <span className="text-xs font-bold px-2 py-0.5 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 font-mono tabular-nums">
-                    {t.count}
-                  </span>
-                </div>
-              ))}
+              {tableList.map((t) => {
+                const remoteCount = supabaseCounts[t.name];
+                return (
+                  <div
+                    key={t.name}
+                    className="px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200/80 dark:border-slate-800 flex items-center justify-between gap-2"
+                  >
+                    <span className="text-xs font-medium text-slate-700 dark:text-slate-200 truncate">
+                      {t.label}
+                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <span
+                        title="Số bản ghi trên trình duyệt (IndexedDB)"
+                        className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 font-mono tabular-nums"
+                      >
+                        Máy: {t.count}
+                      </span>
+                      {remoteCount !== undefined && (
+                        <span
+                          title="Số bản ghi đã lưu trên Supabase Cloud"
+                          className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 font-mono tabular-nums"
+                        >
+                          Supabase: {remoteCount}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>

@@ -118,11 +118,12 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
     if (!reportClassId) return;
 
     async function loadCyclesAndData() {
-      const sessions = await db.sessions.where('class_id').equals(reportClassId!).toArray();
+      const allSessions = await db.sessions.toArray();
+      const sessions = allSessions.filter((s) => String(s.class_id) === String(reportClassId));
       sessions.sort((a, b) => {
         const dateDiff = new Date(a.session_date).getTime() - new Date(b.session_date).getTime();
         if (dateDiff !== 0) return dateDiff;
-        return (a.id || "").localeCompare(b.id || "");
+        return String(a.id || '').localeCompare(String(b.id || ''));
       });
 
       const groupedCycles: any[] = [];
@@ -181,16 +182,20 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
 
     async function compileCycleReport() {
       const cycleSessions = currentCycle.sessions;
-      const sessionIds = cycleSessions.map(s => s.id!);
+      const sessionIdSet = new Set(cycleSessions.map((s: any) => String(s.id)));
 
-      const studentSessions = await db.student_sessions.where('session_id').anyOf(sessionIds).toArray();
-      const classStudentRelations = await db.class_students
-        .where('class_id')
-        .equals(reportClassId!)
-        .toArray()
-        .then(relations => relations.filter(r => !r.leave_date));
-      const studentIdsInClass = classStudentRelations.map(cs => cs.student_id);
-      const classStudents = students.filter(s => studentIdsInClass.includes(s.id!));
+      const [allStudSessions, allClassStudents] = await Promise.all([
+        db.student_sessions.toArray(),
+        db.class_students.toArray(),
+      ]);
+      const studentSessions = allStudSessions.filter((ss) =>
+        sessionIdSet.has(String(ss.session_id))
+      );
+      const classStudentRelations = allClassStudents.filter(
+        (r) => String(r.class_id) === String(reportClassId) && !r.leave_date
+      );
+      const studentIdsInClass = new Set(classStudentRelations.map(cs => String(cs.student_id)));
+      const classStudents = students.filter(s => s.id && studentIdsInClass.has(String(s.id)));
 
       let totalAttendanceRateSum = 0;
       let totalHwSum = 0;
@@ -205,10 +210,10 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
       let praiseTotalCount = 0;
 
       const studentData = classStudents.map(student => {
-        const ssList = studentSessions.filter(ss => ss.student_id === student.id);
+        const ssList = studentSessions.filter(ss => String(ss.student_id) === String(student.id));
 
-        const attendanceMap = cycleSessions.map(session => {
-          const ss = ssList.find(ss => ss.session_id === session.id);
+        const attendanceMap = cycleSessions.map((session: any) => {
+          const ss = ssList.find(ss => String(ss.session_id) === String(session.id));
           return ss ? {
             attendance: ss.attendance,
             homework_score: ss.homework_score,
@@ -231,7 +236,7 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
         totalOpportunity += totalOpportunities;
 
         const hwSessions = ssList.filter(ss => {
-          const session = cycleSessions.find(s => s.id === ss.session_id);
+          const session = cycleSessions.find((s: any) => String(s.id) === String(ss.session_id));
           return session?.has_homework !== false && ss.homework_score !== undefined && ss.homework_score >= 0;
         });
         const hwSum = hwSessions.reduce((acc, ss) => acc + ss.homework_score, 0);
@@ -243,7 +248,7 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
         }
 
         const testSessions = ssList.filter(ss => {
-          const session = cycleSessions.find(s => s.id === ss.session_id);
+          const session = cycleSessions.find((s: any) => String(s.id) === String(ss.session_id));
           return session?.has_test !== false && ss.test_score !== undefined && ss.test_score >= 0;
         });
         const testSum = testSessions.reduce((acc, ss) => acc + ss.test_score, 0);

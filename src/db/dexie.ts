@@ -22,9 +22,9 @@ import {
   getCanonicalDocId,
   enqueueSyncOperation,
   kaizenDeduplicateAndMerge,
+  markUserActivity,
   TableName,
 } from '../services/syncService';
-import { getIsQuotaExceeded } from '../firebase';
 
 export let isRemoteSyncing = false;
 export function setRemoteSyncing(val: boolean) {
@@ -32,8 +32,9 @@ export function setRemoteSyncing(val: boolean) {
 }
 
 export async function pushBatchDocsToFirestore(tableName: string, items: any[]) {
-  if (isRemoteSyncing || getIsQuotaExceeded() || !items || items.length === 0) return;
+  if (isRemoteSyncing || !items || items.length === 0) return;
   try {
+    markUserActivity();
     items.forEach((item) => {
       if (item?.id && item.is_demo !== true) {
         broadcastLocalMutation(tableName, 'put', item.id);
@@ -54,6 +55,7 @@ export async function pushSingleDocToFirestore(
   if (isRemoteSyncing) return;
   if (!isDelete && data?.is_demo === true) return;
   try {
+    markUserActivity();
     broadcastLocalMutation(tableName, isDelete ? 'delete' : 'put', docId);
     await pushDocToFirestore(tableName as TableName, String(docId), data, isDelete);
   } catch (err) {
@@ -232,9 +234,6 @@ export async function initializeDefaultSystemData() {
   } finally {
     setRemoteSyncing(false);
   }
-
-  // Run Kaizen deduplication & recovery asynchronously in background so UI boots immediately
-  cleanDuplicateStudentSessions().catch(() => {});
 }
 
 export async function seedDemoData() {

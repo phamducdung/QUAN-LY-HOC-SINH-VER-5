@@ -15,6 +15,7 @@ import {
 } from 'recharts';
 import { ClassItem, Session, Student, StudentSession, AttendanceStatus, KnowledgeTag, Warning } from '../types';
 import { db, pushBatchDocsToFirestore } from '../db/dexie';
+import { markUserActivity } from '../services/syncService';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { logAudit } from '../utils/auditLogger';
 import { computeGradeDiffs, logDetailedGradeAudit } from '../utils/gradeHistoryLogger';
@@ -210,65 +211,79 @@ const formatKnowledgeTagLabel = (tag: KnowledgeTag): string => {
   return `${categoryPrefix} ${tag.grade_level} - ${tag.tag_name}`;
 };
 
+const EMPTY_ARRAY: any[] = [];
+
 export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   classes,
   selectedClassId,
   onSelectClassId,
   onRefreshData,
 }) => {
-  const activeClasses = classes.filter((c) => c.status === 'active');
-  const currentClass = activeClasses.find((c) => c.id === selectedClassId) || activeClasses[0];
+  const activeClasses = useMemo(() => classes.filter((c) => c.status === 'active'), [classes]);
+  const currentClass = useMemo(
+    () =>
+      activeClasses.find((c) => String(c.id) === String(selectedClassId)) || activeClasses[0],
+    [activeClasses, selectedClassId]
+  );
 
-  // Real-time IndexedDB Live Queries for realtime data synchronization
-  const liveKnowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) || [];
+  // Real-time IndexedDB Live Queries with stable empty array fallbacks (prevents infinite render loops)
+  const liveKnowledgeTags =
+    useLiveQuery(() => db.knowledge_tags.toArray()) ?? (EMPTY_ARRAY as KnowledgeTag[]);
+  const allSessions = useLiveQuery(() => db.sessions.toArray()) ?? (EMPTY_ARRAY as Session[]);
+  const allClassStudents = useLiveQuery(() => db.class_students.toArray()) ?? EMPTY_ARRAY;
+  const liveStudents = useLiveQuery(() => db.students.toArray()) ?? (EMPTY_ARRAY as Student[]);
+  const liveStudentSessions =
+    useLiveQuery(() => db.student_sessions.toArray()) ?? (EMPTY_ARRAY as StudentSession[]);
+  const liveWarnings = useLiveQuery(() => db.warnings.toArray()) ?? (EMPTY_ARRAY as Warning[]);
 
-  const liveSessions = useLiveQuery(
-    async () => {
-      if (!currentClass?.id) return [];
-      const classIdStr = String(currentClass.id);
-      const all = await db.sessions.toArray();
-      return all
-        .filter((s) => String(s.class_id) === classIdStr)
-        .sort((a, b) => (a.session_date || '').localeCompare(b.session_date || ''));
-    },
-    [currentClass?.id]
-  ) || [];
+  const liveSessions = useMemo(() => {
+    if (!currentClass?.id) return EMPTY_ARRAY as Session[];
+    const classIdStr = String(currentClass.id);
+    return allSessions
+      .filter((s) => String(s.class_id) === classIdStr)
+      .sort((a, b) => (a.session_date || '').localeCompare(b.session_date || ''));
+  }, [allSessions, currentClass?.id]);
 
-  const liveClassStudents = useLiveQuery(
-    async () => {
-      if (!currentClass?.id) return [];
-      const classIdStr = String(currentClass.id);
-      const all = await db.class_students.toArray();
-      return all.filter((cs) => String(cs.class_id) === classIdStr);
-    },
-    [currentClass?.id]
-  ) || [];
+  const liveClassStudents = useMemo(() => {
+    if (!currentClass?.id) return EMPTY_ARRAY;
+    const classIdStr = String(currentClass.id);
+    return allClassStudents.filter((cs) => String(cs.class_id) === classIdStr);
+  }, [allClassStudents, currentClass?.id]);
 
-  const liveStudents = useLiveQuery(() => db.students.toArray()) || [];
+  const students = useMemo(() => {
+    if (!currentClass?.id) return EMPTY_ARRAY as Student[];
+    const activeLinks = liveClassStudents.filter((l) => !l.leave_date);
+    const stIds = new Set(activeLinks.map((l) => String(l.student_id)));
+    return sortStudentsByName(
+      liveStudents.filter((s) => s.id && stIds.has(String(s.id)) && s.status === 'studying')
+    );
+  }, [currentClass?.id, liveClassStudents, liveStudents]);
 
-  const liveStudentSessions = useLiveQuery(() => db.student_sessions.toArray()) || [];
-
-  const liveWarnings = useLiveQuery(() => db.warnings.toArray()) || [];
   const liveWarningsMap = useMemo(() => {
     const map: Record<string, Warning[]> = {};
-    liveWarnings.filter((w) => !w.resolved).forEach((w) => {
-      const sId = String(w.student_id);
-      if (!map[sId]) map[sId] = [];
-      map[sId].push(w);
-    });
+    liveWarnings
+      .filter((w) => !w.resolved)
+      .forEach((w) => {
+        const sId = String(w.student_id);
+        if (!map[sId]) map[sId] = [];
+        map[sId].push(w);
+      });
     return map;
   }, [liveWarnings]);
 
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [selectedSessionId, setSelectedSessionId] = useState<string | number | undefined>(undefined);
-  const [students, setStudents] = useState<Student[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | number | undefined>(
+    undefined
+  );
   const [studentSessions, setStudentSessions] = useState<Record<string, StudentSession>>({});
   const initialStudentSessionsRef = useRef<Record<string, StudentSession>>({});
+  const loadedSessionKeyRef = useRef<string>('');
 
   // Quick Grade Return Mode for Previous Session
   const [showPrevTestReturn, setShowPrevTestReturn] = useState<boolean>(true);
   const [prevStudentSessions, setPrevStudentSessions] = useState<Record<string, StudentSession>>({});
   const initialPrevStudentSessionsRef = useRef<Record<string, StudentSession>>({});
+  const loadedPrevSessionKeyRef = useRef<string>('');
 
   // Print & PDF Export Column Preferences
   const [printIncludePrevTest, setPrintIncludePrevTest] = useState<boolean>(true);
@@ -277,8 +292,17 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   // Active view tab: 'entry', 'knowledge_map', or 'gradebook'
   const [activeTab, setActiveTab] = useState<'entry' | 'knowledge_map' | 'gradebook'>('entry');
 
-  const selectedSession = sessions.find((s) => s.id === selectedSessionId);
-  const selectedSessionIndex = selectedSession ? sessions.findIndex((s) => s.id === selectedSession.id) : -1;
+  const selectedSession = useMemo(
+    () => sessions.find((s) => String(s.id) === String(selectedSessionId)),
+    [sessions, selectedSessionId]
+  );
+  const selectedSessionIndex = useMemo(
+    () =>
+      selectedSession
+        ? sessions.findIndex((s) => String(s.id) === String(selectedSession.id))
+        : -1,
+    [sessions, selectedSession]
+  );
   const previousSession = selectedSessionIndex > 0 ? sessions[selectedSessionIndex - 1] : null;
 
   // Currently focused student row & field column index for Keyboard Navigation
@@ -744,7 +768,21 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
   // Synchronize liveSessions into component state and select valid session
   useEffect(() => {
-    setSessions(liveSessions);
+    setSessions((prev) => {
+      if (
+        prev.length === liveSessions.length &&
+        prev.every(
+          (s, i) =>
+            s.id === liveSessions[i]?.id &&
+            s.updated_at === liveSessions[i]?.updated_at &&
+            s.lesson_title === liveSessions[i]?.lesson_title &&
+            s.session_date === liveSessions[i]?.session_date
+        )
+      ) {
+        return prev;
+      }
+      return liveSessions;
+    });
     if (liveSessions.length > 0) {
       const exists = liveSessions.some((s) => String(s.id) === String(selectedSessionId));
       if (!exists || selectedSessionId === undefined) {
@@ -752,7 +790,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         setSelectedSessionId(latestSession.id);
       }
     } else {
-      setSelectedSessionId(undefined);
+      setSelectedSessionId((prev) => (prev === undefined ? prev : undefined));
     }
   }, [liveSessions, selectedSessionId]);
 
@@ -776,85 +814,154 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     }
   }, [selectedSessionId, liveSessions, liveKnowledgeTags]);
 
-  // Synchronize Students & StudentSession scores reactively from IndexedDB/Firestore
+  // Synchronize StudentSession scores reactively from IndexedDB/Supabase
+  // Preserves any unsaved/dirty student edits when liveStudentSessions updates on the same session
   useEffect(() => {
-    if (!currentClass?.id) {
-      setStudents([]);
-      setStudentSessions({});
+    if (!currentClass?.id || !selectedSessionId) {
+      loadedSessionKeyRef.current = '';
+      setStudentSessions((prev) => (Object.keys(prev).length === 0 ? prev : {}));
       return;
     }
 
-    const activeLinks = liveClassStudents.filter((l) => !l.leave_date);
-    const stIds = new Set(activeLinks.map((l) => String(l.student_id)));
-    const validStudents = sortStudentsByName(
-      liveStudents.filter((s) => s.id && stIds.has(String(s.id)) && s.status === 'studying')
+    const sessIdStr = String(selectedSessionId);
+    const belongsToCurrentClass = liveSessions.some((s) => String(s.id) === sessIdStr);
+    if (!belongsToCurrentClass) {
+      // Wait for selectedSessionId to align with the newly selected class
+      return;
+    }
+
+    const sessionKey = `${String(currentClass.id)}_${sessIdStr}`;
+    const isSameSession = loadedSessionKeyRef.current === sessionKey;
+
+    const scoreRecords = liveStudentSessions.filter(
+      (ss) => String(ss.session_id) === sessIdStr
     );
-    setStudents(validStudents);
 
-    if (selectedSessionId) {
-      const sessIdStr = String(selectedSessionId);
-      const scoreRecords = liveStudentSessions.filter(
-        (ss) => String(ss.session_id) === sessIdStr
-      );
+    const recordMap: Record<string, StudentSession> = {};
+    students.forEach((st) => {
+      const stId = String(st.id!);
+      const found = scoreRecords.find((r) => String(r.student_id) === stId);
+      if (found) {
+        let comment = found.custom_comment || '';
+        const isAbsent =
+          typeof found.attendance === 'string' && found.attendance.startsWith('absent');
+        const isHwMissingOrLate =
+          found.homework_submitted === false || found.late_submit === true;
+        const isExemptHW = found.exempt || (found as any).exempt_homework;
 
-      const recordMap: Record<string, StudentSession> = {};
-      validStudents.forEach((st) => {
-        const found = scoreRecords.find((r) => String(r.student_id) === String(st.id));
-        if (found) {
-          let comment = found.custom_comment || '';
-          const isAbsent = typeof found.attendance === 'string' && found.attendance.startsWith('absent');
-          const isHwMissingOrLate = found.homework_submitted === false || found.late_submit === true;
-          const isExemptHW = found.exempt || (found as any).exempt_homework;
-
-          if (isAbsent) {
-            if (!comment) comment = ABSENT_DEFAULT_COMMENT;
-          } else {
-            comment = ensurePresentCommentFormat(comment, isHwMissingOrLate, !!isExemptHW);
-          }
-          recordMap[st.id!] = { ...found, custom_comment: comment };
+        if (isAbsent) {
+          if (!comment) comment = ABSENT_DEFAULT_COMMENT;
         } else {
-          recordMap[st.id!] = {
-            student_id: String(st.id!),
-            session_id: String(selectedSessionId || ''),
-            attendance: 'present',
-            homework_score: undefined as any,
-            test_score: undefined as any,
-            homework_submitted: true,
-            late_submit: false,
-            makeup_test: false,
-            exempt: false,
-            quick_preset_comments: [],
-            custom_comment: ensurePresentCommentFormat('', false, false),
-            updated_at: new Date().toISOString(),
-          };
+          comment = ensurePresentCommentFormat(comment, isHwMissingOrLate, !!isExemptHW);
         }
-      });
+        recordMap[stId] = { ...found, custom_comment: comment };
+      } else {
+        recordMap[stId] = {
+          student_id: stId,
+          session_id: sessIdStr,
+          attendance: 'present',
+          homework_score: undefined as any,
+          test_score: undefined as any,
+          homework_submitted: true,
+          late_submit: false,
+          makeup_test: false,
+          exempt: false,
+          quick_preset_comments: [],
+          custom_comment: ensurePresentCommentFormat('', false, false),
+          updated_at: new Date().toISOString(),
+        };
+      }
+    });
+
+    if (!isSameSession) {
+      loadedSessionKeyRef.current = sessionKey;
       initialStudentSessionsRef.current = JSON.parse(JSON.stringify(recordMap));
       setStudentSessions(recordMap);
     } else {
-      setStudentSessions({});
-    }
-  }, [currentClass?.id, selectedSessionId, liveClassStudents, liveStudents, liveStudentSessions]);
+      setStudentSessions((prev) => {
+        const next: Record<string, StudentSession> = {};
+        let hasChanged = false;
+        const initMap = initialStudentSessionsRef.current;
 
-  // Synchronize Previous Session's student scores reactively
+        students.forEach((st) => {
+          const stId = String(st.id!);
+          const prevRec = prev[stId];
+          const initRec = initMap[stId];
+          const dbRec = recordMap[stId];
+
+          const isDirty =
+            prevRec &&
+            initRec &&
+            (prevRec.attendance !== initRec.attendance ||
+              prevRec.homework_score !== initRec.homework_score ||
+              prevRec.test_score !== initRec.test_score ||
+              prevRec.homework_submitted !== initRec.homework_submitted ||
+              prevRec.late_submit !== initRec.late_submit ||
+              prevRec.makeup_test !== initRec.makeup_test ||
+              prevRec.exempt !== initRec.exempt ||
+              prevRec.exempt_homework !== initRec.exempt_homework ||
+              prevRec.exempt_test !== initRec.exempt_test ||
+              (prevRec.custom_comment || '') !== (initRec.custom_comment || '') ||
+              JSON.stringify(prevRec.quick_preset_comments || []) !==
+                JSON.stringify(initRec.quick_preset_comments || []));
+
+          if (isDirty) {
+            // Keep teacher's unsaved edits untouched!
+            next[stId] = prevRec;
+          } else {
+            next[stId] = dbRec;
+            initMap[stId] = JSON.parse(JSON.stringify(dbRec));
+            if (
+              !prevRec ||
+              prevRec.attendance !== dbRec.attendance ||
+              prevRec.homework_score !== dbRec.homework_score ||
+              prevRec.test_score !== dbRec.test_score ||
+              prevRec.homework_submitted !== dbRec.homework_submitted ||
+              prevRec.late_submit !== dbRec.late_submit ||
+              prevRec.makeup_test !== dbRec.makeup_test ||
+              prevRec.exempt !== dbRec.exempt ||
+              prevRec.exempt_homework !== dbRec.exempt_homework ||
+              prevRec.exempt_test !== dbRec.exempt_test ||
+              (prevRec.custom_comment || '') !== (dbRec.custom_comment || '')
+            ) {
+              hasChanged = true;
+            }
+          }
+        });
+
+        if (Object.keys(prev).length !== Object.keys(next).length) {
+          hasChanged = true;
+        }
+
+        return hasChanged ? next : prev;
+      });
+    }
+  }, [currentClass?.id, selectedSessionId, liveSessions, students, liveStudentSessions]);
+
+  // Synchronize Previous Session's student scores reactively while preserving unsaved edits
   useEffect(() => {
     if (!currentClass?.id || !previousSession?.id) {
-      setPrevStudentSessions({});
+      loadedPrevSessionKeyRef.current = '';
+      setPrevStudentSessions((prev) => (Object.keys(prev).length === 0 ? prev : {}));
       return;
     }
 
     const prevSessIdStr = String(previousSession.id);
+    const prevKey = `${String(currentClass.id)}_${prevSessIdStr}`;
+    const isSamePrevSession = loadedPrevSessionKeyRef.current === prevKey;
+
     const scoreRecords = liveStudentSessions.filter(
       (ss) => String(ss.session_id) === prevSessIdStr
     );
 
     const recordMap: Record<string, StudentSession> = {};
     students.forEach((st) => {
-      const found = scoreRecords.find((r) => String(r.student_id) === String(st.id));
+      const stId = String(st.id!);
+      const found = scoreRecords.find((r) => String(r.student_id) === stId);
       if (found) {
-        recordMap[st.id!] = found;
+        recordMap[stId] = found;
       } else {
-        recordMap[st.id!] = {
+        recordMap[stId] = {
           student_id: st.id!,
           session_id: previousSession.id,
           attendance: 'present',
@@ -871,8 +978,55 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       }
     });
 
-    initialPrevStudentSessionsRef.current = JSON.parse(JSON.stringify(recordMap));
-    setPrevStudentSessions(recordMap);
+    if (!isSamePrevSession) {
+      loadedPrevSessionKeyRef.current = prevKey;
+      initialPrevStudentSessionsRef.current = JSON.parse(JSON.stringify(recordMap));
+      setPrevStudentSessions(recordMap);
+    } else {
+      setPrevStudentSessions((prev) => {
+        const next: Record<string, StudentSession> = {};
+        let hasChanged = false;
+        const initMap = initialPrevStudentSessionsRef.current;
+
+        students.forEach((st) => {
+          const stId = String(st.id!);
+          const prevRec = prev[stId];
+          const initRec = initMap[stId];
+          const dbRec = recordMap[stId];
+
+          const isDirty =
+            prevRec &&
+            initRec &&
+            (prevRec.test_score !== initRec.test_score ||
+              prevRec.exempt_test !== initRec.exempt_test ||
+              prevRec.makeup_test !== initRec.makeup_test ||
+              prevRec.exempt !== initRec.exempt ||
+              (prevRec.custom_comment || '') !== (initRec.custom_comment || ''));
+
+          if (isDirty) {
+            next[stId] = prevRec;
+          } else {
+            next[stId] = dbRec;
+            initMap[stId] = JSON.parse(JSON.stringify(dbRec));
+            if (
+              !prevRec ||
+              prevRec.test_score !== dbRec.test_score ||
+              prevRec.exempt_test !== dbRec.exempt_test ||
+              prevRec.makeup_test !== dbRec.makeup_test ||
+              prevRec.exempt !== dbRec.exempt
+            ) {
+              hasChanged = true;
+            }
+          }
+        });
+
+        if (Object.keys(prev).length !== Object.keys(next).length) {
+          hasChanged = true;
+        }
+
+        return hasChanged ? next : prev;
+      });
+    }
   }, [currentClass?.id, previousSession?.id, liveStudentSessions, students]);
 
   // Previous session statistics calculation
@@ -909,6 +1063,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     value: any
   ) => {
     if (!previousSession?.id) return;
+    markUserActivity();
     const stIdStr = String(studentId);
 
     setPrevStudentSessions((prev) => {
@@ -927,16 +1082,19 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         updated_at: new Date().toISOString(),
       };
 
+      const canonicalId = `ss_${String(previousSession.id)}_${stIdStr}`;
       const updated: StudentSession = {
         ...current,
+        id: canonicalId,
         [field]: value,
         updated_at: new Date().toISOString(),
       };
 
+      initialPrevStudentSessionsRef.current[stIdStr] = JSON.parse(JSON.stringify(updated));
+
       // Auto-save to Dexie & Outbox Queue in background using deterministic ID
       (async () => {
         try {
-          const canonicalId = `ss_${String(previousSession.id)}_${stIdStr}`;
           await db.student_sessions.put({
             ...updated,
             id: canonicalId,
@@ -1064,6 +1222,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     field: keyof StudentSession,
     value: any
   ) => {
+    markUserActivity();
     const stIdStr = String(studentId);
     setStudentSessions((prev) => {
       const current: StudentSession = prev[stIdStr] || {
@@ -1147,6 +1306,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
   // 1-Click Preset Comment Appender
   const handleTogglePresetComment = useCallback((studentId: string | number, presetText: string) => {
+    markUserActivity();
     setStudentSessions((prev) => {
       const current = prev[studentId];
       if (!current) return prev;
@@ -1276,11 +1436,10 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       const updatedSessions = { ...studentSessions };
       const updatedPrevSessions = { ...prevStudentSessions };
 
-      // Pre-fetch existing sessions for this session_id and previousSession from Dexie
-      const existingDbSessions = await db.student_sessions
-        .where('session_id')
-        .equals(selectedSessionId)
-        .toArray();
+      // Pre-fetch existing sessions for this session_id and previousSession
+      const existingDbSessions = liveStudentSessions.filter(
+        (s) => String(s.session_id) === String(selectedSessionId)
+      );
       const existingMap = new Map(existingDbSessions.map((s) => [String(s.student_id), s]));
 
       const docsToBulkPut: any[] = [];
@@ -1292,22 +1451,23 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
         const payload = {
           ...rec,
-          id: finalId,
+          id: String(finalId),
+          student_id: String(rec.student_id),
+          session_id: String(rec.session_id),
         };
 
         docsToBulkPut.push(payload);
 
         if (rec.student_id) {
-          updatedSessions[rec.student_id] = payload;
+          updatedSessions[String(rec.student_id)] = payload;
         }
       }
 
       // Handle previous session records
       if (previousSession?.id && prevRecordsToSave.length > 0) {
-        const existingPrevDbSessions = await db.student_sessions
-          .where('session_id')
-          .equals(previousSession.id)
-          .toArray();
+        const existingPrevDbSessions = liveStudentSessions.filter(
+          (s) => String(s.session_id) === String(previousSession.id)
+        );
         const existingPrevMap = new Map(existingPrevDbSessions.map((s) => [String(s.student_id), s]));
 
         for (const pRec of prevRecordsToSave) {
@@ -1317,13 +1477,15 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
           const payload = {
             ...pRec,
-            id: finalId,
+            id: String(finalId),
+            student_id: String(pRec.student_id),
+            session_id: String(pRec.session_id),
           };
 
           docsToBulkPut.push(payload);
 
           if (pRec.student_id) {
-            updatedPrevSessions[pRec.student_id] = payload;
+            updatedPrevSessions[String(pRec.student_id)] = payload;
           }
         }
       }
@@ -1363,12 +1525,12 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       // so the UI save finishes instantly (<20ms) for the user!
       Promise.all([
         (async () => {
-          const selectedSess = sessions.find((s) => s.id === selectedSessionId);
+          const selectedSess = sessions.find((s) => String(s.id) === String(selectedSessionId));
           if (allDiffs.length > 0) {
             await logDetailedGradeAudit({
               userRole: 'Teacher',
-              sessionId: selectedSessionId,
-              classId: currentClass.id,
+              sessionId: String(selectedSessionId),
+              classId: String(currentClass.id),
               className: currentClass.class_name,
               sessionTitle: selectedSess?.lesson_title,
               diffs: allDiffs,
@@ -1413,7 +1575,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     const now = new Date().toISOString();
     const fullLessonTitle = `${newKnowledgeTag} - ${newLessonTitle}`;
     const sessionPayload = {
-      class_id: currentClass.id,
+      class_id: String(currentClass.id),
       session_date: newSessionDate,
       lesson_title: fullLessonTitle,
       chapter: '',
@@ -1434,28 +1596,28 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     );
 
     setIsAddSessionOpen(false);
-    setSelectedSessionId(newId);
+    setSelectedSessionId(String(newId));
     setCurrentKnowledgeTag(newKnowledgeTag);
     setNewTestKnowledgeTag('same');
     setIsNewTestTagCustom(false);
 
     // Refresh session list
-    const updatedSessions = await db.sessions
-      .where('class_id')
-      .equals(currentClass.id)
-      .sortBy('session_date');
+    const allSess = await db.sessions.toArray();
+    const updatedSessions = allSess
+      .filter((s) => String(s.class_id) === String(currentClass.id))
+      .sort((a, b) => (a.session_date || '').localeCompare(b.session_date || ''));
     setSessions(updatedSessions);
   };
 
   const handleOpenEditSession = () => {
-    const selectedSess = sessions.find((s) => s.id === selectedSessionId);
+    const selectedSess = sessions.find((s) => String(s.id) === String(selectedSessionId));
     if (!selectedSess) return;
 
     let kTag = tagOptions[0]?.label || 'Đại số 9 - Căn thức bậc hai & Rút gọn';
     let title = selectedSess.lesson_title;
 
     if (selectedSess.knowledge_tag_id) {
-      const tag = liveKnowledgeTags.find((t) => t.id === selectedSess.knowledge_tag_id);
+      const tag = liveKnowledgeTags.find((t) => String(t.id) === String(selectedSess.knowledge_tag_id));
       if (tag) {
         kTag = formatKnowledgeTagLabel(tag);
       }
@@ -1490,7 +1652,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     e.preventDefault();
     if (!selectedSessionId || !currentClass?.id) return;
 
-    const selectedSess = sessions.find((s) => s.id === selectedSessionId);
+    const selectedSess = sessions.find((s) => String(s.id) === String(selectedSessionId));
     if (!selectedSess) return;
 
     const matchedTag = liveKnowledgeTags.find(
@@ -1504,7 +1666,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     const fullLessonTitle = `${editKnowledgeTag} - ${editLessonTitle}`;
 
     if (selectedSessionId) {
-      await db.sessions.update(selectedSessionId as any, {
+      await db.sessions.update(String(selectedSessionId), {
         session_date: editSessionDate,
         lesson_title: fullLessonTitle,
         chapter: '',
@@ -1527,10 +1689,10 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     setCurrentKnowledgeTag(editKnowledgeTag);
 
     // Refresh session list
-    const updatedSessions = await db.sessions
-      .where('class_id')
-      .equals(currentClass.id)
-      .sortBy('session_date');
+    const allSess = await db.sessions.toArray();
+    const updatedSessions = allSess
+      .filter((s) => String(s.class_id) === String(currentClass.id))
+      .sort((a, b) => (a.session_date || '').localeCompare(b.session_date || ''));
     setSessions(updatedSessions);
   };
 
@@ -1646,10 +1808,10 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         setStudentSessions((prev) => {
           const next = { ...prev };
           res.comments.forEach((c) => {
-            const numId = Number(c.student_id);
-            if (next[numId]) {
-              next[numId] = {
-                ...next[numId],
+            const stKey = String(c.student_id);
+            if (next[stKey]) {
+              next[stKey] = {
+                ...next[stKey],
                 custom_comment: c.ai_comment,
               };
             }
@@ -1734,7 +1896,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
   // Export Excel File
   const handleExportExcel = () => {
-    const selectedSess = sessions.find((s) => s.id === selectedSessionId);
+    const selectedSess = sessions.find((s) => String(s.id) === String(selectedSessionId));
     if (!currentClass || !selectedSess) return;
 
     const exportData = students.map((st, idx) => {

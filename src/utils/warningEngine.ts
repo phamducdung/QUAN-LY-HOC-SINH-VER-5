@@ -1,4 +1,4 @@
-import { db } from '../db/dexie';
+import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { logAudit } from './auditLogger';
 import {
   Student,
@@ -607,6 +607,7 @@ export async function runWarningScanForClass(
   customConfig?: WarningRuleConfig
 ): Promise<number> {
   const now = new Date().toISOString();
+  const classIdStr = String(classId);
   let newWarningsCount = 0;
 
   // Load custom config or global config from Dexie settings if available
@@ -619,19 +620,22 @@ export async function runWarningScanForClass(
   }
 
   // Fetch all students linked to this class (only those who are active)
-  const classStudentLinks = await db.class_students
-    .where('class_id')
-    .equals(classId)
-    .toArray()
-    .then(links => links.filter(l => !l.leave_date));
-  const studentIds = classStudentLinks.map((cs) => cs.student_id);
+  const allLinks = await db.class_students.toArray();
+  const classStudentLinks = allLinks.filter(
+    (l) => String(l.class_id) === classIdStr && !l.leave_date
+  );
+  const studentIds = classStudentLinks.map((cs) => String(cs.student_id));
+  if (studentIds.length === 0) return 0;
 
   // Fetch all sessions for class ordered by date
-  const classSessions = await db.sessions.where('class_id').equals(classId).sortBy('session_date');
+  const allSess = await db.sessions.toArray();
+  const classSessions = allSess
+    .filter((s) => String(s.class_id) === classIdStr)
+    .sort((a, b) => (a.session_date || '').localeCompare(b.session_date || ''));
   if (classSessions.length === 0) return 0;
 
-  const cls = await db.classes.get(classId);
-  const className = cls?.class_name || `Lớp #${classId}`;
+  const cls = await db.classes.get(classIdStr);
+  const className = cls?.class_name || `Lớp #${classIdStr}`;
 
   // Adjust config dynamically based on class profile from settings
   if (!customConfig && cls && cls.class_type && activeSettings?.class_profile_configs) {
@@ -641,44 +645,46 @@ export async function runWarningScanForClass(
     }
   }
 
-  // Pre-fetch all student sessions for this class's sessions in 1 query
-  const sessionIds = classSessions.map(s => s.id!).filter(Boolean);
-  const allClassStudentSessions = await db.student_sessions
-    .where('session_id')
-    .anyOf(sessionIds)
-    .toArray();
+  // Pre-fetch all student sessions for this class's sessions
+  const sessionIdSet = new Set(classSessions.map((s) => String(s.id)).filter(Boolean));
+  const allStudSess = await db.student_sessions.toArray();
+  const allClassStudentSessions = allStudSess.filter((ss) =>
+    sessionIdSet.has(String(ss.session_id))
+  );
   const studentSessionsMap = new Map<string, StudentSession[]>();
-  allClassStudentSessions.forEach(ss => {
+  allClassStudentSessions.forEach((ss) => {
     const sKey = String(ss.student_id);
     if (!studentSessionsMap.has(sKey)) studentSessionsMap.set(sKey, []);
     studentSessionsMap.get(sKey)!.push(ss);
   });
 
-  // Pre-fetch all students in 1 query
-  const allStudents = await db.students.where('id').anyOf(studentIds).toArray();
-  const studentMap = new Map(allStudents.map(s => [String(s.id), s]));
+  // Pre-fetch all students
+  const allStudents = await db.students.toArray();
+  const studentMap = new Map(allStudents.map((s) => [String(s.id), s]));
 
-  // Pre-fetch all warnings for these students
-  const allStudentWarnings = await db.warnings.where('student_id').anyOf(studentIds).toArray();
+  // Pre-fetch all warnings for this class
+  const allWarnings = await db.warnings.toArray();
   const warningsByStudent = new Map<string, any[]>();
-  allStudentWarnings.forEach(w => {
-    const sKey = String(w.student_id);
-    if (!warningsByStudent.has(sKey)) warningsByStudent.set(sKey, []);
-    warningsByStudent.get(sKey)!.push(w);
-  });
+  allWarnings
+    .filter((w) => String(w.class_id) === classIdStr)
+    .forEach((w) => {
+      const sKey = String(w.student_id);
+      if (!warningsByStudent.has(sKey)) warningsByStudent.set(sKey, []);
+      warningsByStudent.get(sKey)!.push(w);
+    });
 
   const warningsToPut: any[] = [];
 
   for (const studentId of studentIds) {
-    const student = studentMap.get(String(studentId));
+    const studentIdStr = String(studentId);
+    const student = studentMap.get(studentIdStr);
     if (!student) continue;
 
-    const studentIdStr = String(studentId);
     const existingWarnings = warningsByStudent.get(studentIdStr) || [];
 
     // Auto cancel/resolve active warnings if student status is 'paused' or 'stopped'
     if (student.status !== 'studying') {
-      const activeWarnings = existingWarnings.filter(w => !w.resolved);
+      const activeWarnings = existingWarnings.filter((w) => !w.resolved);
 
       for (const w of activeWarnings) {
         const resolveAction = `Tự động hủy cảnh báo do học sinh chuyển trạng thái: ${
@@ -697,15 +703,27 @@ export async function runWarningScanForClass(
 
     // Get student sessions
     const studentSessions = studentSessionsMap.get(studentIdStr) || [];
-    const csLink = classStudentLinks.find(l => String(l.student_id) === studentIdStr);
+    const csLink = classStudentLinks.find((l) => String(l.student_id) === studentIdStr);
 
-    const stats = calculateStudentStats(studentId, classSessions, studentSessions, config, csLink);
-    const detectedList = detectStudentWarnings(student, stats, classSessions, studentSessions, config);
+    const stats = calculateStudentStats(
+      studentIdStr,
+      classSessions,
+      studentSessions,
+      config,
+      csLink
+    );
+    const detectedList = detectStudentWarnings(
+      student,
+      stats,
+      classSessions,
+      studentSessions,
+      config
+    );
 
-    // Fetch all currently active (unresolved) warnings for this student
+    // Fetch all currently active (unresolved) warnings for this student in this class
     const activeWarnings = existingWarnings.filter((w) => !w.resolved);
 
-    // 1. Tự động đánh giá và HỦY/HOÀN THÀNH các cảnh báo cũ nếu không còn vi phạm tiêu chí (do sửa điểm/làm bài bù)
+    // 1. Tự động đánh giá và HỦY/HOÀN THÀNH các cảnh báo cũ nếu không còn vi phạm tiêu chí
     const detectedTitles = new Set(detectedList.map((d) => d.title));
     const detectedReasons = new Set(detectedList.map((d) => d.reason));
 
@@ -714,7 +732,8 @@ export async function runWarningScanForClass(
         detectedTitles.has(activeWarn.warning_type) || detectedReasons.has(activeWarn.reason);
 
       if (!stillTriggers) {
-        const resolveAction = 'Tự động hoàn thành/hủy do điểm số hoặc BTVN đã được cập nhật đạt yêu cầu';
+        const resolveAction =
+          'Tự động hoàn thành/hủy do điểm số hoặc BTVN đã được cập nhật đạt yêu cầu';
         const updatedW = {
           ...activeWarn,
           resolved: true,
@@ -729,19 +748,19 @@ export async function runWarningScanForClass(
     for (const det of detectedList) {
       const existing = activeWarnings.find(
         (w) =>
-          w.student_id === studentId &&
+          String(w.student_id) === studentIdStr &&
           (w.warning_type === det.title ||
             w.reason === det.reason ||
-            (w.warning_type || '').replace(/^[🔴🟡🟢⚡📊⚠️\s]+/, '').trim() ===
-              (det.title || '').replace(/^[🔴🟡🟢⚡📊⚠️\s]+/, '').trim())
+            (w.warning_type || '').replace(/^[🔴🟠🟡🟢⚡📊⚠️\s]+/, '').trim() ===
+              (det.title || '').replace(/^[🔴🟠🟡🟢⚡📊⚠️\s]+/, '').trim())
       );
 
       if (!existing) {
-        const newWarnId = `warn_${studentId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        const newWarnId = `warn_${classIdStr}_${studentIdStr}_${det.type}`;
         const warnPayload = {
           id: newWarnId,
-          student_id: studentId,
-          class_id: classId,
+          student_id: studentIdStr,
+          class_id: classIdStr,
           priority: det.priority,
           warning_type: det.title,
           reason: det.reason,
@@ -761,6 +780,7 @@ export async function runWarningScanForClass(
 
   if (warningsToPut.length > 0) {
     await db.warnings.bulkPut(warningsToPut);
+    await pushBatchDocsToFirestore('warnings', warningsToPut);
   }
 
   if (newWarningsCount > 0) {

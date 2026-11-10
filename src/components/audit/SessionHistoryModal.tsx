@@ -28,6 +28,8 @@ interface SessionHistoryModalProps {
   onRollbackComplete?: () => void;
 }
 
+const EMPTY_LOGS: AuditLog[] = [];
+
 export const SessionHistoryModal: React.FC<SessionHistoryModalProps> = ({
   isOpen,
   onClose,
@@ -45,7 +47,7 @@ export const SessionHistoryModal: React.FC<SessionHistoryModalProps> = ({
 
   // Query audit logs related to this session or class
   const auditLogs = useLiveQuery(async () => {
-    if (!sessionId && !classId) return [];
+    if (!sessionId && !classId) return EMPTY_LOGS;
 
     try {
       const allLogs = await db.audit_logs.toArray();
@@ -57,9 +59,9 @@ export const SessionHistoryModal: React.FC<SessionHistoryModalProps> = ({
       return filtered.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
     } catch (err) {
       console.warn('Error querying audit logs:', err);
-      return [];
+      return EMPTY_LOGS;
     }
-  }, [sessionId, classId]) || [];
+  }, [sessionId, classId]) ?? EMPTY_LOGS;
 
   if (!isOpen) return null;
 

@@ -1,6 +1,6 @@
 {
-  "summary":  "Kế hoạch nâng cấp và chuyển đổi cơ sở dữ liệu sang PostgreSQL (Cloud SQL + Drizzle ORM) kết hợp bộ đệm cục bộ IndexedDB, loại bỏ hoàn toàn giới hạn 20.000 lượt ghi/ngày của Firebase Firestore và bảo toàn 100% dữ liệu hiện có.",
-  "updatedAt":  "2026-11-09T16:17:38.164562439Z",
+  "summary":  "Kế hoạch kiểm tra chia nhỏ và khắc phục triệt để từng tính năng một (6 Module) sau khi chuyển sang Supabase, bao gồm cơ chế tự động dọn sạch bộ nhớ đệm IndexedDB/localStorage cũ bị kẹt trên trình duyệt và nạp lại 100% dữ liệu chuẩn từ Supabase.",
+  "updatedAt":  "2026-11-10T16:27:51.111391918Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

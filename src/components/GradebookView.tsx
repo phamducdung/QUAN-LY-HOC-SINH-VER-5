@@ -27,6 +27,8 @@ interface GradebookViewProps {
   studentSessions: StudentSession[];
 }
 
+const EMPTY_ARRAY: any[] = [];
+
 export const GradebookView: React.FC<GradebookViewProps> = ({
   currentClass,
   sessions,
@@ -36,9 +38,9 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
 
-  const classStudents = useLiveQuery(() => db.class_students.toArray()) || [];
-  const knowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) || [];
-  const warnings = useLiveQuery(() => db.warnings.toArray()) || [];
+  const classStudents = useLiveQuery(() => db.class_students.toArray()) ?? EMPTY_ARRAY;
+  const knowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) ?? EMPTY_ARRAY;
+  const warnings = useLiveQuery(() => db.warnings.toArray()) ?? EMPTY_ARRAY;
 
   if (!currentClass) {
     return (
@@ -51,13 +53,13 @@ export const GradebookView: React.FC<GradebookViewProps> = ({
   // Compute breakdown for all students including Lifecycle link (join_date/leave_date)
   const studentBreakdowns = students.map((st) => {
     const link = classStudents.find(
-      (cs) => cs.student_id === st.id && cs.class_id === currentClass.id
+      (cs) => String(cs.student_id) === String(st.id) && String(cs.class_id) === String(currentClass.id)
     );
-    return calculateStudentCycleGrades(st.id!, sessions, studentSessions, link);
+    return calculateStudentCycleGrades(String(st.id!), sessions, studentSessions, link);
   });
 
-  const selectedBreakdown = studentBreakdowns.find((b) => b.studentId === selectedStudentId);
-  const selectedStudent = students.find((s) => s.id === selectedStudentId);
+  const selectedBreakdown = studentBreakdowns.find((b) => String(b.studentId) === String(selectedStudentId));
+  const selectedStudent = students.find((s) => String(s.id) === String(selectedStudentId));
 
   // Class overall averages
   const validHwAvgs = studentBreakdowns.map((b) => b.hwAverage).filter((v): v is number => typeof v === 'number' && !Number.isNaN(v) && v !== null);

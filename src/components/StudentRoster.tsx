@@ -52,6 +52,8 @@ interface StudentRosterProps {
   isLoadingData?: boolean;
 }
 
+const EMPTY_ARRAY: any[] = [];
+
 export const StudentRoster: React.FC<StudentRosterProps> = ({
   students,
   classes,
@@ -63,9 +65,9 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
   const [statusFilter, setStatusFilter] = useState<StudentStatus | 'all'>('studying');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Live queries for reactive data
-  const classStudents = useLiveQuery(() => db.class_students.toArray()) || [];
-  const knowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) || [];
+  // Live queries for reactive data (stable fallback reference)
+  const classStudents = useLiveQuery(() => db.class_students.toArray()) ?? EMPTY_ARRAY;
+  const knowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) ?? EMPTY_ARRAY;
 
   // Add / Edit Modal
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -105,7 +107,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
     const filteredRaw = selectedProfileClassId === 'all'
       ? studentSessionsRaw
       : studentSessionsRaw.filter(ss => {
-          const sess = studentSessionsList.find(s => s.id === ss.session_id);
+          const sess = studentSessionsList.find(s => String(s.id) === String(ss.session_id));
           return sess && String(sess.class_id) === String(selectedProfileClassId);
         });
 
@@ -113,7 +115,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
 
     return filteredRaw
       .map((ss) => {
-        const sess = sortedSessList.find((s) => s.id === ss.session_id);
+        const sess = sortedSessList.find((s) => String(s.id) === String(ss.session_id));
         return {
           session_id: ss.session_id,
           class_id: sess ? sess.class_id : undefined,
@@ -143,20 +145,20 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
     const filteredRaw = selectedProfileClassId === 'all'
       ? studentSessionsRaw
       : studentSessionsRaw.filter(ss => {
-          const sess = studentSessionsList.find(s => s.id === ss.session_id);
+          const sess = studentSessionsList.find(s => String(s.id) === String(ss.session_id));
           return sess && String(sess.class_id) === String(selectedProfileClassId);
         });
 
     filteredRaw.forEach((ss) => {
       if (ss.exempt) return;
-      const sess = studentSessionsList.find((s) => s.id === ss.session_id);
+      const sess = studentSessionsList.find((s) => String(s.id) === String(ss.session_id));
       if (!sess) return;
 
       let topicName = '';
       let category = 'Algebra';
 
       if (sess.knowledge_tag_id) {
-        const tag = knowledgeTags.find(t => t.id === sess.knowledge_tag_id);
+        const tag = knowledgeTags.find(t => String(t.id) === String(sess.knowledge_tag_id));
         if (tag) {
           topicName = tag.tag_name;
           category = tag.category;
@@ -382,25 +384,27 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
         updated_at: now,
       };
       const studentId = await db.students.add(addPayload);
+      const studentIdStr = String(studentId);
 
       // Ghi danh vào các lớp học đã chọn
       const todayStr = now.split('T')[0];
       for (const classId of enrollClassIds) {
+        const classIdStr = String(classId);
         const csPayload = {
-          id: `cs_${classId}_${studentId}`,
-          class_id: classId,
-          student_id: studentId,
+          id: `cs_${classIdStr}_${studentIdStr}`,
+          class_id: classIdStr,
+          student_id: studentIdStr,
           join_date: todayStr,
-          created_at: now
+          created_at: now,
         };
         await db.class_students.put(csPayload);
       }
-      
+
       await db.audit_logs.add({
         user_role: currentRole as any,
         action_type: 'Edit',
         description: `Thêm mới học sinh ${fullName} và ghi danh vào ${enrollClassIds.length} lớp`,
-        timestamp: now
+        timestamp: now,
       });
     }
 
@@ -1467,7 +1471,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                   </h4>
                   <div className="space-y-2.5">
                     {(() => {
-                      const studentMemberships = classStudents.filter((cs) => cs.student_id === viewingStudent.id);
+                      const studentMemberships = classStudents.filter((cs) => String(cs.student_id) === String(viewingStudent.id));
 
                       if (studentMemberships.length === 0) {
                         return (
@@ -1478,7 +1482,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                       }
 
                       return studentMemberships.map((cs, idx) => {
-                        const c = classes.find((cls) => cls.id === cs.class_id);
+                        const c = classes.find((cls) => String(cls.id) === String(cs.class_id));
                         if (!c) return null;
                         const isCurrentlyActive = !cs.leave_date;
 
@@ -1512,7 +1516,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                                     onClick={async () => {
                                       if (confirm(`Bạn có chắc chắn muốn cho học sinh ${viewingStudent.full_name} rút lui an toàn khỏi lớp ${c.class_name}?\nHệ thống sẽ chốt ngày rút là ngày hôm nay. Dữ liệu điểm số và cảnh báo cũ vẫn được bảo lưu đầy đủ trong nhật ký.`)) {
                                         const todayStr = new Date().toISOString().split('T')[0];
-                                        await db.class_students.update(cs.id!, {
+                                        await db.class_students.update(String(cs.id!), {
                                           leave_date: todayStr
                                         });
 
@@ -1533,7 +1537,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                                   <button
                                     onClick={async () => {
                                       if (confirm(`Bạn muốn khôi phục học sinh ${viewingStudent.full_name} quay trở lại học lớp ${c.class_name}?`)) {
-                                        await db.class_students.update(cs.id!, {
+                                        await db.class_students.update(String(cs.id!), {
                                           leave_date: undefined,
                                           join_date: new Date().toISOString().split('T')[0]
                                         });
@@ -1555,7 +1559,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                                 <button
                                   onClick={async () => {
                                     if (confirm(`CẢNH BÁO: Bạn có chắc chắn muốn xóa VĨNH VIỄN mối liên kết lớp của ${viewingStudent.full_name} với lớp ${c.class_name}?\nHành động này sẽ xóa hẳn dòng liên kết trong database. Để lưu vết chuyển lớp, khuyến khích sử dụng nút "Rút lui an toàn".`)) {
-                                      await db.class_students.delete(cs.id!);
+                                      await db.class_students.delete(String(cs.id!));
                                       await db.audit_logs.add({
                                         user_role: currentRole as any,
                                         action_type: 'Edit',
@@ -1663,8 +1667,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                             const oldRel = classStudents.find(
                               (cs) => String(cs.student_id) === String(viewingStudent.id) && String(cs.class_id) === String(transferFromClassId) && !cs.leave_date
                             );
-                            if (oldRel) {
-                              await db.class_students.update(oldRel.id!, {
+                            if (oldRel && oldRel.id) {
+                              await db.class_students.update(String(oldRel.id), {
                                 leave_date: todayStr,
                               });
                             }
@@ -1673,7 +1677,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                             await db.class_students.put({
                               id: `cs_${String(transferToClassId)}_${String(viewingStudent.id!)}`,
                               class_id: String(transferToClassId),
-                              student_id: viewingStudent.id!,
+                              student_id: String(viewingStudent.id!),
                               join_date: todayStr,
                               created_at: new Date().toISOString(),
                             });
@@ -1722,9 +1726,9 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                           .filter((c) => c.status === 'active')
                           .filter((c) => {
                             const enrolledActiveIds = classStudents
-                              .filter((cs) => cs.student_id === viewingStudent.id && !cs.leave_date)
-                              .map((cs) => cs.class_id);
-                            return !enrolledActiveIds.includes(c.id!);
+                              .filter((cs) => String(cs.student_id) === String(viewingStudent.id) && !cs.leave_date)
+                              .map((cs) => String(cs.class_id));
+                            return !enrolledActiveIds.includes(String(c.id!));
                           })
                           .map((c, idx) => (
                             <option key={c.id ? `${c.id}-${idx}` : idx} value={c.id}>
@@ -1739,14 +1743,14 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                             alert('Vui lòng chọn một lớp học!');
                             return;
                           }
-                          const targetClassId = selectEl.value;
-                          const targetClass = classes.find(c => c.id === targetClassId);
+                          const targetClassId = String(selectEl.value);
+                          const targetClass = classes.find(c => String(c.id) === targetClassId);
                           const todayStr = new Date().toISOString().split('T')[0];
                           
                           await db.class_students.put({
                             id: `cs_${targetClassId}_${String(viewingStudent.id!)}`,
                             class_id: targetClassId,
-                            student_id: viewingStudent.id!,
+                            student_id: String(viewingStudent.id!),
                             join_date: todayStr,
                             created_at: new Date().toISOString()
                           });

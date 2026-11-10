@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { ClassItem, GradeLevel, ClassStatus, ClassType, UserRole, Session, Warning, StudentSession } from '../types';
-import { db } from '../db/dexie';
+import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { logAudit } from '../utils/auditLogger';
 import { compareVietnameseNames } from '../utils/sortUtils';
 import * as XLSX from 'xlsx';
@@ -34,6 +34,8 @@ interface ClassManagementProps {
   onSelectClassForGradeEntry: (classId: string) => void;
 }
 
+const EMPTY_ARRAY: any[] = [];
+
 export const ClassManagement: React.FC<ClassManagementProps> = ({
   classes,
   selectedYearId,
@@ -46,12 +48,12 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
   const [selectedGrade, setSelectedGrade] = useState<number | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Live queries for reactive size and sub-list details
-  const classStudents = useLiveQuery(() => db.class_students.toArray()) || [];
-  const students = useLiveQuery(() => db.students.toArray()) || [];
-  const sessions = useLiveQuery(() => db.sessions.toArray()) || [];
-  const studentSessions = useLiveQuery(() => db.student_sessions.toArray()) || [];
-  const warnings = useLiveQuery(() => db.warnings.toArray()) || [];
+  // Live queries for reactive size and sub-list details (stable fallback reference)
+  const classStudents = useLiveQuery(() => db.class_students.toArray()) ?? EMPTY_ARRAY;
+  const students = useLiveQuery(() => db.students.toArray()) ?? EMPTY_ARRAY;
+  const sessions = useLiveQuery(() => db.sessions.toArray()) ?? EMPTY_ARRAY;
+  const studentSessions = useLiveQuery(() => db.student_sessions.toArray()) ?? EMPTY_ARRAY;
+  const warnings = useLiveQuery(() => db.warnings.toArray()) ?? EMPTY_ARRAY;
 
   // Modal States
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -229,22 +231,40 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
 
   // Safe Cascade Delete Guard
   const handleConfirmDelete = async () => {
-    if (!deletingClass) return;
+    if (!deletingClass || !deletingClass.id) return;
     if ((deleteConfirmText || '').trim() !== (deletingClass.class_name || '').trim()) {
       alert('Tên lớp nhập lại không chính xác!');
       return;
     }
 
-    const classSessions = await db.sessions.where('class_id').equals(deletingClass.id!).toArray();
-    const sessionIds = classSessions.map((s) => s.id!).filter(Boolean);
-    if (sessionIds.length > 0) {
-      await db.student_sessions.where('session_id').anyOf(sessionIds).delete();
+    const targetClassIdStr = String(deletingClass.id);
+    const classSessions = sessions.filter((s) => String(s.class_id) === targetClassIdStr);
+    const sessionIdSet = new Set(classSessions.map((s) => String(s.id)).filter(Boolean));
+
+    if (sessionIdSet.size > 0) {
+      const targetStudSessions = studentSessions.filter((ss) =>
+        sessionIdSet.has(String(ss.session_id))
+      );
+      for (const ss of targetStudSessions) {
+        if (ss.id) await db.student_sessions.delete(String(ss.id));
+      }
     }
 
-    await db.classes.delete(deletingClass.id!);
-    await db.class_students.where('class_id').equals(deletingClass.id!).delete();
-    await db.sessions.where('class_id').equals(deletingClass.id!).delete();
-    await db.warnings.where('class_id').equals(deletingClass.id!).delete();
+    for (const s of classSessions) {
+      if (s.id) await db.sessions.delete(String(s.id));
+    }
+
+    const targetLinks = classStudents.filter((cs) => String(cs.class_id) === targetClassIdStr);
+    for (const cs of targetLinks) {
+      if (cs.id) await db.class_students.delete(String(cs.id));
+    }
+
+    const targetWarnings = warnings.filter((w) => String(w.class_id) === targetClassIdStr);
+    for (const w of targetWarnings) {
+      if (w.id) await db.warnings.delete(String(w.id));
+    }
+
+    await db.classes.delete(String(deletingClass.id));
 
     await logAudit(currentRole as UserRole, 'Xóa lớp học', `Xóa vĩnh viễn lớp ${deletingClass.class_name}`);
 
@@ -326,15 +346,16 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     };
 
     const newClassId = await db.classes.add(promotePayload);
-    await db.classes.update(promotingClass.id!, { status: 'archived', updated_at: now });
+    await db.classes.update(String(promotingClass.id!), { status: 'archived', updated_at: now });
 
-    const studentLinks = await db.class_students.where('class_id').equals(promotingClass.id!).toArray();
-    const activeLinks = studentLinks.filter(l => !l.leave_date);
+    const activeLinks = classStudents.filter(
+      (l) => String(l.class_id) === String(promotingClass.id) && !l.leave_date
+    );
     for (const link of activeLinks) {
       const csPayload = {
-        id: `cs_${newClassId}_${link.student_id}`,
-        class_id: newClassId,
-        student_id: link.student_id,
+        id: `cs_${String(newClassId)}_${String(link.student_id)}`,
+        class_id: String(newClassId),
+        student_id: String(link.student_id),
         join_date: now.split('T')[0],
         created_at: now,
       };
@@ -1201,6 +1222,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                                   created_at: now,
                                 }));
                                 await db.class_students.bulkPut(records);
+                                await pushBatchDocsToFirestore('class_students', records);
                                 await logAudit(
                                   currentRole as UserRole,
                                   'Xếp lớp hàng loạt',

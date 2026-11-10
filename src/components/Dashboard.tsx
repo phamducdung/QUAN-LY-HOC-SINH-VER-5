@@ -28,6 +28,8 @@ interface DashboardProps {
   onSelectClassForGradeEntry?: (classId: string) => void;
 }
 
+const EMPTY_ARRAY: any[] = [];
+
 export const Dashboard: React.FC<DashboardProps> = ({
   classes,
   students,
@@ -44,19 +46,19 @@ export const Dashboard: React.FC<DashboardProps> = ({
   // Selected grade filter for whole dashboard view
   const [selectedGrade, setSelectedGrade] = useState<GradeLevel | 'all'>('all');
 
-  // Dexie live queries (reactive to local offline/online changes)
-  const sessions = useLiveQuery(() => db.sessions.toArray()) || [];
-  const studentSessions = useLiveQuery(() => db.student_sessions.toArray()) || [];
-  const classStudents = useLiveQuery(() => db.class_students.toArray()) || [];
+  // Dexie live queries (reactive to local offline/online changes with stable fallback references)
+  const sessions = useLiveQuery(() => db.sessions.toArray()) ?? EMPTY_ARRAY;
+  const studentSessions = useLiveQuery(() => db.student_sessions.toArray()) ?? EMPTY_ARRAY;
+  const classStudents = useLiveQuery(() => db.class_students.toArray()) ?? EMPTY_ARRAY;
 
   // Filtered classes based on grade selection
   const filteredClasses = useMemo(() => {
     if (selectedGrade === 'all') return classes;
-    return classes.filter((c) => c.grade_level === selectedGrade);
+    return classes.filter((c) => Number(c.grade_level) === Number(selectedGrade));
   }, [classes, selectedGrade]);
 
   const filteredClassIdSet = useMemo(() => {
-    return new Set(filteredClasses.map((c) => c.id).filter(Boolean) as string[]);
+    return new Set(filteredClasses.map((c) => String(c.id)).filter(Boolean));
   }, [filteredClasses]);
 
   // Filtered students & sessions if grade filter is active
@@ -64,26 +66,26 @@ export const Dashboard: React.FC<DashboardProps> = ({
     if (selectedGrade === 'all') return students;
     const activeStudentIdsInGrade = new Set(
       classStudents
-        .filter((cs) => filteredClassIdSet.has(cs.class_id) && !cs.leave_date)
-        .map((cs) => cs.student_id)
+        .filter((cs) => filteredClassIdSet.has(String(cs.class_id)) && !cs.leave_date)
+        .map((cs) => String(cs.student_id))
     );
-    return students.filter((s) => s.id && activeStudentIdsInGrade.has(s.id));
+    return students.filter((s) => s.id && activeStudentIdsInGrade.has(String(s.id)));
   }, [selectedGrade, students, classStudents, filteredClassIdSet]);
 
   const filteredWarnings = useMemo(() => {
     if (selectedGrade === 'all') return warnings;
-    return warnings.filter((w) => filteredClassIdSet.has(w.class_id));
+    return warnings.filter((w) => filteredClassIdSet.has(String(w.class_id)));
   }, [selectedGrade, warnings, filteredClassIdSet]);
 
   const filteredStudentSessions = useMemo(() => {
     if (selectedGrade === 'all') return studentSessions;
     const gradeSessionIds = new Set(
       sessions
-        .filter((s) => filteredClassIdSet.has(s.class_id))
-        .map((s) => s.id)
-        .filter(Boolean) as string[]
+        .filter((s) => filteredClassIdSet.has(String(s.class_id)))
+        .map((s) => String(s.id))
+        .filter(Boolean)
     );
-    return studentSessions.filter((ss) => gradeSessionIds.has(ss.session_id));
+    return studentSessions.filter((ss) => gradeSessionIds.has(String(ss.session_id)));
   }, [selectedGrade, studentSessions, sessions, filteredClassIdSet]);
 
   // Compute 5 core KPI metrics

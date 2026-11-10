@@ -29,6 +29,8 @@ import { QuotaBanner } from './components/QuotaBanner';
 import { CloudSyncStatusModal } from './components/CloudSyncStatusModal';
 import { sortStudentsByName } from './utils/sortUtils';
 
+const EMPTY_ARRAY: any[] = [];
+
 export default function App() {
   const [isInitializing, setIsInitializing] = useState(true);
 
@@ -89,12 +91,13 @@ export default function App() {
     }
   }, [theme]);
 
-  // Dexie Live Queries
-  const classes = useLiveQuery(() => db.classes.toArray()) || [];
-  const rawStudents = useLiveQuery(() => db.students.toArray()) || [];
+  // Dexie Live Queries with stable empty array fallback
+  const classes = useLiveQuery(() => db.classes.toArray()) ?? (EMPTY_ARRAY as ClassItem[]);
+  const rawStudents = useLiveQuery(() => db.students.toArray()) ?? (EMPTY_ARRAY as Student[]);
   const students = React.useMemo(() => sortStudentsByName(rawStudents), [rawStudents]);
-  const warnings = useLiveQuery(() => db.warnings.toArray()) || [];
-  const knowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) || [];
+  const warnings = useLiveQuery(() => db.warnings.toArray()) ?? (EMPTY_ARRAY as Warning[]);
+  const knowledgeTags =
+    useLiveQuery(() => db.knowledge_tags.toArray()) ?? (EMPTY_ARRAY as KnowledgeTag[]);
 
   const p1Count = warnings.filter((w) => !w.resolved && w.priority === 'P1').length;
 

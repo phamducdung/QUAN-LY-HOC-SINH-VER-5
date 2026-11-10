@@ -1,4 +1,4 @@
-import { db } from '../db/dexie';
+import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { KnowledgeTag, Session, StudentSession } from '../types';
 
 export interface TopicDetailHistory {
@@ -236,18 +236,19 @@ export async function recalculateKnowledgeMastery(
  */
 export async function recalculateKnowledgeResultsForClass(classId: string | number): Promise<number> {
   const targetClassId = String(classId);
-  const classSessions = await db.sessions.where('class_id').equals(targetClassId).toArray();
+  const allSess = await db.sessions.toArray();
+  const classSessions = allSess.filter((s) => String(s.class_id) === targetClassId);
   if (classSessions.length === 0) return 0;
 
   const allTags = await db.knowledge_tags.toArray();
-  const sessionIds = classSessions.map((s) => s.id!).filter(Boolean);
+  const sessionIdSet = new Set(classSessions.map((s) => String(s.id)).filter(Boolean));
   const sessionMap = new Map(classSessions.map((s) => [String(s.id), s]));
 
   // Lấy tất cả điểm của các học sinh thuộc các buổi học trong lớp này
-  const studentSessions = await db.student_sessions
-    .where('session_id')
-    .anyOf(sessionIds)
-    .toArray();
+  const allStudSess = await db.student_sessions.toArray();
+  const studentSessions = allStudSess.filter((ss) =>
+    sessionIdSet.has(String(ss.session_id))
+  );
 
   if (studentSessions.length === 0) return 0;
 
@@ -328,6 +329,7 @@ export async function recalculateKnowledgeResultsForClass(classId: string | numb
 
   if (dexiePayloads.length > 0) {
     await db.knowledge_results.bulkPut(dexiePayloads);
+    await pushBatchDocsToFirestore('knowledge_results', dexiePayloads);
   }
 
   return dexiePayloads.length;
