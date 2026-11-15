@@ -18,6 +18,7 @@ import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { markUserActivity } from '../services/syncService';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { logAudit } from '../utils/auditLogger';
+import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
 import { computeGradeDiffs, logDetailedGradeAudit } from '../utils/gradeHistoryLogger';
 import { SessionHistoryModal } from './audit/SessionHistoryModal';
 import { exportSessionReportPDF } from '../utils/pdfGenerator';
@@ -1703,10 +1704,17 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
     if (
       window.confirm(
-        `Bạn có chắc chắn muốn xóa vĩnh viễn buổi học "${selectedSess.lesson_title}"? Toàn bộ điểm số đã nhập của học sinh trong buổi học này cũng sẽ bị xóa vĩnh viễn.`
+        `Bạn có chắc chắn muốn xóa buổi học "${selectedSess.lesson_title}"?\n\nHệ thống sẽ tự động tạo bản sao lưu dự phòng đầy đủ trước khi xóa để Thầy/Cô có thể hoàn tác trong mục Cài đặt nếu cần.`
       )
     ) {
       const sessIdStr = String(selectedSessionId);
+
+      // Automatically capture Pre-Delete Safety Snapshot before deleting session
+      await createPreDeleteSnapshot(
+        'session',
+        sessIdStr,
+        `Buổi học "${selectedSess.lesson_title}" (${selectedSess.session_date}) - Lớp ${currentClass.class_name}`
+      );
 
       // Find and delete matching student_sessions across Dexie
       const allStudSessions = await db.student_sessions.toArray();
@@ -1727,7 +1735,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       await logAudit(
         'Teacher',
         'Xóa buổi học',
-        `Xóa vĩnh viễn buổi học "${selectedSess.lesson_title}" (Lớp ${currentClass.class_name})`
+        `Xóa buổi học "${selectedSess.lesson_title}" (Lớp ${currentClass.class_name}) - Đã lưu bản sao dự phòng tự động`
       );
 
       setIsEditSessionOpen(false);

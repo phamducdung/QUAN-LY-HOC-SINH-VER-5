@@ -2,6 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { Student, StudentStatus, ClassItem, StudentSession, Session, Warning } from '../types';
 import { db, deleteStudent } from '../db/dexie';
+import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { StudentPerformanceTrend } from './student/StudentPerformanceTrend';
 import {
@@ -1081,14 +1082,19 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
               <div className="flex items-center gap-2">
                 <button
                   onClick={async () => {
-                    if (confirm(`Bạn có chắc chắn muốn xóa học sinh ${viewingStudent.full_name}? Hành động này sẽ xóa toàn bộ dữ liệu liên quan và không thể khôi phục!`)) {
+                    if (confirm(`Xác nhận xóa học sinh ${viewingStudent.full_name}?\n\nHệ thống sẽ tự động tạo bản sao lưu dự phòng đầy đủ trước khi xóa để Thầy/Cô có thể hoàn tác trong mục Cài đặt nếu cần.`)) {
+                      await createPreDeleteSnapshot(
+                        'student',
+                        viewingStudent.id!,
+                        `Học sinh ${viewingStudent.full_name} (${viewingStudent.parent_phone || 'Chưa có SĐT'})`
+                      );
                       await deleteStudent(viewingStudent.id!);
                       setViewingStudent(null);
                       onRefresh();
                     }
                   }}
                   className="p-1.5 text-rose-400 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30 rounded-lg transition-colors"
-                  title="Xóa học sinh"
+                  title="Xóa học sinh (Có sao lưu dự phòng tự động)"
                 >
                   <Trash2 className="w-4 h-4" />
                 </button>

@@ -26,9 +26,18 @@ import {
   TableName,
 } from '../services/syncService';
 
+let remoteSyncDepth = 0;
 export let isRemoteSyncing = false;
 export function setRemoteSyncing(val: boolean) {
-  isRemoteSyncing = val;
+  if (val) {
+    remoteSyncDepth++;
+  } else {
+    remoteSyncDepth = Math.max(0, remoteSyncDepth - 1);
+  }
+  isRemoteSyncing = remoteSyncDepth > 0;
+}
+export function getRemoteSyncDepth(): number {
+  return remoteSyncDepth;
 }
 
 export async function pushBatchDocsToFirestore(tableName: string, items: any[]) {
@@ -676,244 +685,51 @@ export async function seedDemoData() {
 export async function deleteOnlyDemoTestData() {
   setRemoteSyncing(true);
   try {
-    // 1. Define demo matching criteria
-  const demoClassNames = [
-    '9A1 - Chuyên Ôn Thi Vào 10 (Chất lượng cao)',
-    '9B2 - Luyện Đề & Lấy Lại Căn Bản',
-    '8A2 - Hình học Tứ giác & Đồng dạng',
-    '8A1 - Niên khóa 2024 (Đã hoàn thành)',
-    '9B2 - Đại trà & Chống liệt Toán 10',
-    '8A2 - Bứt phá điểm số Hình học',
-    '8B1 - Luyện đề nâng cao'
-  ];
-
-  const demoStudentNames = [
-    'Nguyễn Minh Anh',
-    'Trần Gia Bảo',
-    'Lê Hoàng Nam',
-    'Phạm Phương Thảo',
-    'Hoàng Đức Mạnh',
-    'Đỗ Thị Khánh Linh',
-    'Vũ Quốc Huy',
-    'Bùi Anh Khoa',
-    'Ngô Thanh Hà',
-    'Nguyễn Đức Anh'
-  ];
-
-  const demoTagNames = [
-    'Căn thức bậc hai & Rút gọn biểu thức',
-    'Hệ phương trình bậc nhất 2 ẩn',
-    'Phương trình bậc hai & Định lý Vi-ét',
-    'Bất đẳng thức & Cực trị đại số',
-    'Hệ thức lượng trong tam giác vuông',
-    'Đường tròn & Góc với đường tròn',
-    'Tứ giác nội tiếp & Chứng minh đồng quy',
-    'Hằng đẳng thức đáng nhớ & Phân tích đa thức',
-    'Tam giác đồng dạng & Định lý Talét',
-    'Số hữu tỉ & Tỉ lệ thức',
-    'Số nguyên & Phân số'
-  ];
-
-  // 2. Fetch all demo class IDs
-  const demoClassIds = new Set<string>();
-  const demoClasses: any[] = [];
-  await db.classes.each((item) => {
-    if (
-      item.is_demo === true ||
-      demoClassNames.includes(item.class_name) ||
-      demoClassNames.some(name => item.class_name.includes(name.split(' - ')[0]))
-    ) {
-      if (item.id) {
-        demoClassIds.add(item.id);
-        demoClasses.push(item);
+    // Strictly delete ONLY records explicitly marked with is_demo === true (never match by name!)
+    const deleteDemoFromTable = async (table: any) => {
+      const demoItems = await table.filter((item: any) => item?.is_demo === true).toArray();
+      const ids = demoItems.map((x: any) => x.id).filter(Boolean);
+      if (ids.length > 0) {
+        await table.bulkDelete(ids);
       }
-    }
-  });
+    };
 
-  // 3. Fetch all demo student IDs
-  const demoStudentIds = new Set<string>();
-  const demoStudents: any[] = [];
-  await db.students.each((item) => {
-    if (
-      item.is_demo === true ||
-      demoStudentNames.includes(item.full_name)
-    ) {
-      if (item.id) {
-        demoStudentIds.add(item.id);
-        demoStudents.push(item);
+    await db.transaction(
+      'rw',
+      [
+        db.school_years,
+        db.classes,
+        db.students,
+        db.class_students,
+        db.sessions,
+        db.student_sessions,
+        db.warnings,
+        db.ai_diagnoses,
+        db.audit_logs,
+        db.knowledge_results,
+        db.knowledge_tags,
+      ],
+      async () => {
+        await deleteDemoFromTable(db.classes);
+        await deleteDemoFromTable(db.students);
+        await deleteDemoFromTable(db.class_students);
+        await deleteDemoFromTable(db.sessions);
+        await deleteDemoFromTable(db.student_sessions);
+        await deleteDemoFromTable(db.warnings);
+        await deleteDemoFromTable(db.ai_diagnoses);
+        await deleteDemoFromTable(db.knowledge_results);
+        await deleteDemoFromTable(db.knowledge_tags);
+        await deleteDemoFromTable(db.audit_logs);
+        await deleteDemoFromTable(db.school_years);
       }
-    }
-  });
-
-  // 4. Fetch all demo knowledge tag IDs
-  const demoTagIds = new Set<string>();
-  const demoTags: any[] = [];
-  await db.knowledge_tags.each((item) => {
-    if (
-      item.is_demo === true ||
-      demoTagNames.includes(item.tag_name)
-    ) {
-      if (item.id) {
-        demoTagIds.add(item.id);
-        demoTags.push(item);
-      }
-    }
-  });
-
-  // 5. Fetch all sessions belonging to demo classes
-  const demoSessionIds = new Set<string>();
-  const demoSessions: any[] = [];
-  await db.sessions.each((item) => {
-    if (
-      item.is_demo === true ||
-      (item.class_id && demoClassIds.has(item.class_id))
-    ) {
-      if (item.id) {
-        demoSessionIds.add(item.id);
-        demoSessions.push(item);
-      }
-    }
-  });
-
-  // 6. Gather all associated records for cascading deletions
-  const demoClassStudents: any[] = [];
-  await db.class_students.each((item) => {
-    if (
-      item.is_demo === true ||
-      (item.class_id && demoClassIds.has(item.class_id)) ||
-      (item.student_id && demoStudentIds.has(item.student_id))
-    ) {
-      demoClassStudents.push(item);
-    }
-  });
-
-  const demoStudentSessions: any[] = [];
-  await db.student_sessions.each((item) => {
-    if (
-      item.is_demo === true ||
-      (item.student_id && demoStudentIds.has(item.student_id)) ||
-      (item.session_id && demoSessionIds.has(item.session_id))
-    ) {
-      demoStudentSessions.push(item);
-    }
-  });
-
-  const demoWarnings: any[] = [];
-  await db.warnings.each((item) => {
-    if (
-      item.is_demo === true ||
-      (item.student_id && demoStudentIds.has(item.student_id)) ||
-      (item.class_id && demoClassIds.has(item.class_id))
-    ) {
-      demoWarnings.push(item);
-    }
-  });
-
-  const demoAiDiagnoses: any[] = [];
-  await db.ai_diagnoses.each((item) => {
-    if (
-      item.is_demo === true ||
-      (item.student_id && demoStudentIds.has(item.student_id))
-    ) {
-      demoAiDiagnoses.push(item);
-    }
-  });
-
-  const demoKnowledgeResults: any[] = [];
-  await db.knowledge_results.each((item) => {
-    if (
-      item.is_demo === true ||
-      (item.student_id && demoStudentIds.has(item.student_id)) ||
-      (item.knowledge_tag_id && demoTagIds.has(item.knowledge_tag_id))
-    ) {
-      demoKnowledgeResults.push(item);
-    }
-  });
-
-  const demoAuditLogs: any[] = [];
-  await db.audit_logs.each((item) => {
-    if (
-      item.is_demo === true ||
-      (item.description && (
-        item.description.includes('9A1') ||
-        item.description.includes('9B2') ||
-        item.description.includes('8A2') ||
-        item.description.includes('8B1') ||
-        item.description.includes('cảnh báo tự động') ||
-        item.description.includes('dữ liệu mẫu')
-      ))
-    ) {
-      demoAuditLogs.push(item);
-    }
-  });
-
-  const demoSchoolYears: any[] = [];
-  await db.school_years.each((item) => {
-    if (item.is_demo === true) {
-      demoSchoolYears.push(item);
-    }
-  });
-
-  // 7. Perform Dexie transactions synchronously (WITHOUT dynamic imports/non-DB network awaits inside)
-  await db.transaction('rw', [
-    db.school_years,
-    db.classes,
-    db.students,
-    db.class_students,
-    db.sessions,
-    db.student_sessions,
-    db.warnings,
-    db.ai_diagnoses,
-    db.audit_logs,
-    db.knowledge_results,
-    db.knowledge_tags
-  ], async () => {
-    if (demoClasses.length > 0) await db.classes.bulkDelete(demoClasses.map(x => x.id));
-    if (demoStudents.length > 0) await db.students.bulkDelete(demoStudents.map(x => x.id));
-    if (demoClassStudents.length > 0) await db.class_students.bulkDelete(demoClassStudents.map(x => x.id));
-    if (demoSessions.length > 0) await db.sessions.bulkDelete(demoSessions.map(x => x.id));
-    if (demoStudentSessions.length > 0) await db.student_sessions.bulkDelete(demoStudentSessions.map(x => x.id));
-    if (demoWarnings.length > 0) await db.warnings.bulkDelete(demoWarnings.map(x => x.id));
-    if (demoAiDiagnoses.length > 0) await db.ai_diagnoses.bulkDelete(demoAiDiagnoses.map(x => x.id));
-    if (demoKnowledgeResults.length > 0) await db.knowledge_results.bulkDelete(demoKnowledgeResults.map(x => x.id));
-    if (demoTags.length > 0) await db.knowledge_tags.bulkDelete(demoTags.map(x => x.id));
-    if (demoAuditLogs.length > 0) await db.audit_logs.bulkDelete(demoAuditLogs.map(x => x.id));
-    if (demoSchoolYears.length > 0) await db.school_years.bulkDelete(demoSchoolYears.map(x => x.id));
-  });
+    );
   } finally {
     setRemoteSyncing(false);
   }
 }
 
 export async function clearAllDataToBlankSlate() {
-  setRemoteSyncing(true);
-  try {
-    await db.transaction('rw', [
-      db.classes,
-      db.students,
-      db.class_students,
-      db.sessions,
-      db.student_sessions,
-      db.warnings,
-      db.ai_diagnoses,
-      db.audit_logs,
-      db.knowledge_results
-    ], async () => {
-      await db.classes.clear();
-      await db.students.clear();
-      await db.class_students.clear();
-      await db.sessions.clear();
-      await db.student_sessions.clear();
-      await db.warnings.clear();
-      await db.ai_diagnoses.clear();
-      await db.audit_logs.clear();
-      await db.knowledge_results.clear();
-    });
-
-    // Ensure demo data seed is marked completed
-    localStorage.setItem('seed_demo_data_done', 'true');
-  } finally {
-    setRemoteSyncing(false);
-  }
+  // Locked: Only removes demo records (is_demo === true) to prevent accidental loss of real user data
+  await deleteOnlyDemoTestData();
 }
 

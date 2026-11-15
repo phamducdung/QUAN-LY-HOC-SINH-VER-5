@@ -1,8 +1,16 @@
-import React, { useState, useEffect } from 'react';
-import { Settings, WarningRuleConfig } from '../types';
-import { db, clearAllDataToBlankSlate, seedDemoData, deleteOnlyDemoTestData } from '../db/dexie';
-import { clearFirestoreDatabase } from '../services/syncService';
-import { UserRole } from '../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { Settings, WarningRuleConfig, UserRole } from '../types';
+import { db } from '../db/dexie';
+import {
+  getSafetySnapshots,
+  restoreSafetySnapshot,
+  removeSafetySnapshot,
+  exportFullDatabaseBackupJson,
+  importFullDatabaseBackupJson,
+  runComprehensiveDatabaseQA,
+  SafetySnapshotItem,
+  DatabaseQAReport,
+} from '../utils/dbSafetyAndQA';
 import {
   Settings as SettingsIcon,
   Key,
@@ -15,9 +23,13 @@ import {
   Lock,
   AlertCircle,
   Trash2,
-  HardDrive,
   Database,
-  Sparkles,
+  Download,
+  Upload,
+  RotateCcw,
+  ShieldCheck,
+  Activity,
+  RefreshCw,
 } from 'lucide-react';
 
 interface SettingsModalProps {
@@ -49,21 +61,31 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   });
 
   const [saveSuccess, setSaveSuccess] = useState(false);
-  const [showResetConfirm, setShowResetConfirm] = useState(false);
-  const [resetConfirmText, setResetConfirmText] = useState('');
-  const [isResetting, setIsResetting] = useState(false);
-  const [demoMessage, setDemoMessage] = useState<string | null>(null);
+
+  // Backup, Safety Vault & QA States
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [safetySnapshots, setSafetySnapshots] = useState<SafetySnapshotItem[]>(() =>
+    getSafetySnapshots()
+  );
+  const [isExportingJson, setIsExportingJson] = useState(false);
+  const [isImportingJson, setIsImportingJson] = useState(false);
+  const [restoringSnapId, setRestoringSnapId] = useState<string | null>(null);
+  const [vaultBanner, setVaultBanner] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+
+  const [isRunningQA, setIsRunningQA] = useState(false);
+  const [qaReport, setQaReport] = useState<DatabaseQAReport | null>(null);
 
   useEffect(() => {
-    const msg = localStorage.getItem('demo_action_message');
-    if (msg) {
-      setDemoMessage(msg);
-      localStorage.removeItem('demo_action_message');
-      const timer = setTimeout(() => {
-        setDemoMessage(null);
-      }, 15000);
-      return () => clearTimeout(timer);
-    }
+    const refreshVault = () => {
+      setSafetySnapshots(getSafetySnapshots());
+    };
+    window.addEventListener('smart_edu_safety_vault_updated', refreshVault);
+    return () => {
+      window.removeEventListener('smart_edu_safety_vault_updated', refreshVault);
+    };
   }, []);
 
   useEffect(() => {
@@ -76,10 +98,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           setTeacherName(s.pronoun_config.teacher_name);
           setStudentPronoun(s.pronoun_config.student_pronoun);
         }
-        
-        // Restore profile configs if present
+
         const newProfiles = { ...profileConfigs };
-        const defaultBase = s.warning_rule_config || {
+        const defaultBase = (s.warning_rule_config || {
           maxAbsences: 2,
           consecutiveLowTests: 2,
           consecutiveLowHomework: 3,
@@ -89,47 +110,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           excellentTestScore: 9.0,
           progressIncreaseThreshold: 1.5,
           enablePraiseAttendanceHw: true,
-        } as WarningRuleConfig;
+        }) as WarningRuleConfig;
 
         if (s.class_profile_configs) {
           if (s.class_profile_configs.standard) {
-             newProfiles.standard = { 
-               maxAbsences: s.class_profile_configs.standard.maxAbsences,
-               consecutiveLowTests: s.class_profile_configs.standard.consecutiveLowTests,
-               consecutiveLowHomework: s.class_profile_configs.standard.consecutiveLowHomework,
-               scoreDropThreshold: s.class_profile_configs.standard.scoreDropThreshold,
-               minTestScore: s.class_profile_configs.standard.minTestScore ?? 5.0,
-               minHomeworkScore: s.class_profile_configs.standard.minHomeworkScore ?? 5.0,
-               excellentTestScore: s.class_profile_configs.standard.excellentTestScore ?? 9.0,
-               progressIncreaseThreshold: s.class_profile_configs.standard.progressIncreaseThreshold ?? 1.5,
-               enablePraiseAttendanceHw: s.class_profile_configs.standard.enablePraiseAttendanceHw ?? true,
-             };
+            newProfiles.standard = {
+              maxAbsences: s.class_profile_configs.standard.maxAbsences,
+              consecutiveLowTests: s.class_profile_configs.standard.consecutiveLowTests,
+              consecutiveLowHomework: s.class_profile_configs.standard.consecutiveLowHomework,
+              scoreDropThreshold: s.class_profile_configs.standard.scoreDropThreshold,
+              minTestScore: s.class_profile_configs.standard.minTestScore ?? 5.0,
+              minHomeworkScore: s.class_profile_configs.standard.minHomeworkScore ?? 5.0,
+              excellentTestScore: s.class_profile_configs.standard.excellentTestScore ?? 9.0,
+              progressIncreaseThreshold:
+                s.class_profile_configs.standard.progressIncreaseThreshold ?? 1.5,
+              enablePraiseAttendanceHw:
+                s.class_profile_configs.standard.enablePraiseAttendanceHw ?? true,
+            };
           }
           if (s.class_profile_configs.specialized) {
-             newProfiles.specialized = { 
-               maxAbsences: s.class_profile_configs.specialized.maxAbsences,
-               consecutiveLowTests: s.class_profile_configs.specialized.consecutiveLowTests,
-               consecutiveLowHomework: s.class_profile_configs.specialized.consecutiveLowHomework,
-               scoreDropThreshold: s.class_profile_configs.specialized.scoreDropThreshold,
-               minTestScore: s.class_profile_configs.specialized.minTestScore ?? 7.0,
-               minHomeworkScore: s.class_profile_configs.specialized.minHomeworkScore ?? 7.0,
-               excellentTestScore: s.class_profile_configs.specialized.excellentTestScore ?? 9.5,
-               progressIncreaseThreshold: s.class_profile_configs.specialized.progressIncreaseThreshold ?? 1.5,
-               enablePraiseAttendanceHw: s.class_profile_configs.specialized.enablePraiseAttendanceHw ?? true,
-             };
+            newProfiles.specialized = {
+              maxAbsences: s.class_profile_configs.specialized.maxAbsences,
+              consecutiveLowTests: s.class_profile_configs.specialized.consecutiveLowTests,
+              consecutiveLowHomework: s.class_profile_configs.specialized.consecutiveLowHomework,
+              scoreDropThreshold: s.class_profile_configs.specialized.scoreDropThreshold,
+              minTestScore: s.class_profile_configs.specialized.minTestScore ?? 7.0,
+              minHomeworkScore: s.class_profile_configs.specialized.minHomeworkScore ?? 7.0,
+              excellentTestScore: s.class_profile_configs.specialized.excellentTestScore ?? 9.5,
+              progressIncreaseThreshold:
+                s.class_profile_configs.specialized.progressIncreaseThreshold ?? 1.5,
+              enablePraiseAttendanceHw:
+                s.class_profile_configs.specialized.enablePraiseAttendanceHw ?? true,
+            };
           }
           if (s.class_profile_configs.remedial) {
-             newProfiles.remedial = { 
-               maxAbsences: s.class_profile_configs.remedial.maxAbsences,
-               consecutiveLowTests: s.class_profile_configs.remedial.consecutiveLowTests,
-               consecutiveLowHomework: s.class_profile_configs.remedial.consecutiveLowHomework,
-               scoreDropThreshold: s.class_profile_configs.remedial.scoreDropThreshold,
-               minTestScore: s.class_profile_configs.remedial.minTestScore ?? 4.0,
-               minHomeworkScore: s.class_profile_configs.remedial.minHomeworkScore ?? 4.0,
-               excellentTestScore: s.class_profile_configs.remedial.excellentTestScore ?? 8.5,
-               progressIncreaseThreshold: s.class_profile_configs.remedial.progressIncreaseThreshold ?? 1.5,
-               enablePraiseAttendanceHw: s.class_profile_configs.remedial.enablePraiseAttendanceHw ?? true,
-             };
+            newProfiles.remedial = {
+              maxAbsences: s.class_profile_configs.remedial.maxAbsences,
+              consecutiveLowTests: s.class_profile_configs.remedial.consecutiveLowTests,
+              consecutiveLowHomework: s.class_profile_configs.remedial.consecutiveLowHomework,
+              scoreDropThreshold: s.class_profile_configs.remedial.scoreDropThreshold,
+              minTestScore: s.class_profile_configs.remedial.minTestScore ?? 4.0,
+              minHomeworkScore: s.class_profile_configs.remedial.minHomeworkScore ?? 4.0,
+              excellentTestScore: s.class_profile_configs.remedial.excellentTestScore ?? 8.5,
+              progressIncreaseThreshold:
+                s.class_profile_configs.remedial.progressIncreaseThreshold ?? 1.5,
+              enablePraiseAttendanceHw:
+                s.class_profile_configs.remedial.enablePraiseAttendanceHw ?? true,
+            };
           }
         } else {
           newProfiles.standard = {
@@ -143,8 +170,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             progressIncreaseThreshold: defaultBase.progressIncreaseThreshold ?? 1.5,
             enablePraiseAttendanceHw: defaultBase.enablePraiseAttendanceHw ?? true,
           };
-          newProfiles.specialized = { ...newProfiles.standard, minTestScore: 7.0, minHomeworkScore: 7.0, excellentTestScore: 9.5 };
-          newProfiles.remedial = { ...newProfiles.standard, minTestScore: 4.0, minHomeworkScore: 4.0, excellentTestScore: 8.5 };
+          newProfiles.specialized = {
+            ...newProfiles.standard,
+            minTestScore: 7.0,
+            minHomeworkScore: 7.0,
+            excellentTestScore: 9.5,
+          };
+          newProfiles.remedial = {
+            ...newProfiles.standard,
+            minTestScore: 4.0,
+            minHomeworkScore: 4.0,
+            excellentTestScore: 8.5,
+          };
         }
         setProfileConfigs(newProfiles);
       }
@@ -158,26 +195,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const sList = await db.settings.toArray();
     const now = new Date().toISOString();
 
-    let currentWarningConfig = sList.length > 0 && sList[0].warning_rule_config 
-      ? sList[0].warning_rule_config 
-      : {
-          minTestScore: 5.0,
-          consecutiveLowTests: 2,
-          maxAbsences: 2,
-          minHomeworkScore: 5.0,
-          consecutiveLowHomework: 3,
-          scoreDropThreshold: 2.0,
-          excellentTestScore: 9.0,
-          progressIncreaseThreshold: 1.5,
-          enablePraiseAttendanceHw: true,
-      };
-      
-    // Update the base config with standard profile values
+    let currentWarningConfig =
+      sList.length > 0 && sList[0].warning_rule_config
+        ? sList[0].warning_rule_config
+        : {
+            minTestScore: 5.0,
+            consecutiveLowTests: 2,
+            maxAbsences: 2,
+            minHomeworkScore: 5.0,
+            consecutiveLowHomework: 3,
+            scoreDropThreshold: 2.0,
+            excellentTestScore: 9.0,
+            progressIncreaseThreshold: 1.5,
+            enablePraiseAttendanceHw: true,
+          };
+
     currentWarningConfig = {
       ...currentWarningConfig,
       ...profileConfigs.standard,
     };
-    
+
     const fullProfileConfigs = {
       standard: { ...currentWarningConfig, ...profileConfigs.standard },
       specialized: { ...currentWarningConfig, ...profileConfigs.specialized },
@@ -206,58 +243,118 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setTimeout(() => setSaveSuccess(false), 3000);
   };
 
+  const handleExportBackup = async () => {
+    try {
+      setIsExportingJson(true);
+      const res = await exportFullDatabaseBackupJson();
+      setVaultBanner({
+        type: 'success',
+        text: `Đã xuất thành công file sao lưu "${res.filename}" với ${res.totalRecords.toLocaleString()} bản ghi từ 12 bảng CSDL!`,
+      });
+      setTimeout(() => setVaultBanner(null), 7000);
+    } catch (e) {
+      setVaultBanner({
+        type: 'error',
+        text: 'Lỗi khi tạo file sao lưu JSON. Vui lòng thử lại.',
+      });
+    } finally {
+      setIsExportingJson(false);
+    }
+  };
+
+  const handleImportFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      setIsImportingJson(true);
+      const text = await file.text();
+      const res = await importFullDatabaseBackupJson(text);
+      if (res.ok) {
+        setVaultBanner({
+          type: 'success',
+          text: `Khôi phục thành công ${res.restoredRecords.toLocaleString()} bản ghi trên ${res.tablesRestored} bảng và đã đồng bộ lên Supabase!`,
+        });
+      } else {
+        setVaultBanner({
+          type: 'error',
+          text: res.error || 'Không thể khôi phục từ file JSON này.',
+        });
+      }
+      setTimeout(() => setVaultBanner(null), 8000);
+    } finally {
+      setIsImportingJson(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleRestoreSnapshot = async (snap: SafetySnapshotItem) => {
+    try {
+      setRestoringSnapId(snap.id);
+      const res = await restoreSafetySnapshot(snap.id);
+      if (res.ok) {
+        setSafetySnapshots(getSafetySnapshots());
+        setVaultBanner({
+          type: 'success',
+          text: `Đã hoàn tác & khôi phục thành công "${res.label}" (${res.restoredCount} bản ghi liên đới) lên cả Máy và Supabase!`,
+        });
+        setTimeout(() => setVaultBanner(null), 7000);
+      }
+    } finally {
+      setRestoringSnapId(null);
+    }
+  };
+
+  const handleRunQA = async () => {
+    try {
+      setIsRunningQA(true);
+      const report = await runComprehensiveDatabaseQA();
+      setQaReport(report);
+      setSafetySnapshots(getSafetySnapshots());
+    } finally {
+      setIsRunningQA(false);
+    }
+  };
+
   return (
     <div id="settings-view" className="space-y-6">
-      {demoMessage === 'seed_success' && (
-        <div className="bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900/50 p-4 rounded-2xl flex items-start gap-3 shadow-sm animate-fadeIn">
-          <div className="p-1.5 bg-emerald-500 rounded-lg text-white shrink-0">
-            <CheckCircle2 className="w-4 h-4" />
+      {vaultBanner && (
+        <div
+          className={`p-4 rounded-xl border flex items-start justify-between gap-3 ${
+            vaultBanner.type === 'success'
+              ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900/60 text-emerald-900 dark:text-emerald-100'
+              : 'bg-rose-50 dark:bg-rose-950/30 border-rose-200 dark:border-rose-900/60 text-rose-900 dark:text-rose-100'
+          }`}
+        >
+          <div className="flex items-center gap-2.5 text-xs font-semibold">
+            <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+            <span>{vaultBanner.text}</span>
           </div>
-          <div className="flex-1">
-            <h4 className="text-xs font-bold text-emerald-900 dark:text-emerald-100">
-              Nạp dữ liệu mẫu thử nghiệm thành công!
-            </h4>
-            <p className="text-[11px] text-emerald-800 dark:text-emerald-300 mt-0.5 leading-relaxed">
-              Hệ thống đã tự động bổ sung các lớp học mẫu (<strong>9A1, 9B2, 8A2</strong>), phân phối chương trình môn Toán, danh sách học sinh mẫu cùng các nhận xét và cảnh báo mẫu tương ứng. <span className="underline decoration-dotted font-semibold">Bảo toàn dữ liệu:</span> Toàn bộ các dữ liệu thật do thầy cô tự nhập trước đó đều được <strong>giữ nguyên vẹn 100%</strong>.
-            </p>
-          </div>
-          <button onClick={() => setDemoMessage(null)} className="text-emerald-500 hover:text-emerald-700 dark:hover:text-emerald-300 ml-auto text-xs font-bold shrink-0 p-1">✕</button>
+          <button
+            type="button"
+            onClick={() => setVaultBanner(null)}
+            className="text-xs font-bold opacity-70 hover:opacity-100 cursor-pointer"
+          >
+            ✕
+          </button>
         </div>
       )}
 
-      {demoMessage === 'delete_success' && (
-        <div className="bg-rose-50 dark:bg-rose-950/20 border border-rose-200 dark:border-rose-900/50 p-4 rounded-2xl flex items-start gap-3 shadow-sm animate-fadeIn">
-          <div className="p-1.5 bg-rose-500 rounded-lg text-white shrink-0">
-            <Trash2 className="w-4 h-4" />
-          </div>
-          <div className="flex-1">
-            <h4 className="text-xs font-bold text-rose-900 dark:text-rose-100">
-              Đã xóa dữ liệu thử nghiệm thành công!
-            </h4>
-            <p className="text-[11px] text-rose-800 dark:text-rose-300 mt-0.5 leading-relaxed">
-              Đã gỡ bỏ sạch sẽ toàn bộ các lớp học mẫu (9A1, 9B2, 8A2), danh sách học sinh mẫu, điểm số mẫu và các cảnh báo học tập tương ứng. <span className="underline decoration-dotted font-semibold">An tâm tuyệt đối:</span> Tất cả dữ liệu thực tế do thầy cô tự tạo trước đó đều được <strong>bảo toàn nguyên vẹn 100%</strong> và không bị ảnh hưởng.
-            </p>
-          </div>
-          <button onClick={() => setDemoMessage(null)} className="text-rose-500 hover:text-rose-700 dark:hover:text-rose-300 ml-auto text-xs font-bold shrink-0 p-1">✕</button>
-        </div>
-      )}
-
-      <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+      <div className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200 dark:border-slate-800 flex items-center justify-between">
         <div>
           <div className="flex items-center gap-2">
             <SettingsIcon className="w-5 h-5 text-emerald-600" />
             <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Cài Đặt Cấu Hình Hệ Thống
+              Cài Đặt Cấu Hình, Sao Lưu & Kiểm Thử Cơ Sở Dữ Liệu
             </h2>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
-            Quản lý Gemini API Key, ngưỡng cảnh báo tự động P1/P2 và danh xưng Thầy/Cô.
+            Quản lý Gemini API Key, ngưỡng cảnh báo P1/P2, sao lưu JSON 12 bảng và kiểm thử toàn vẹn Supabase.
           </p>
         </div>
 
         <button
           onClick={onToggleTheme}
-          className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 rounded-xl text-xs font-bold text-slate-700 dark:text-slate-200 flex items-center gap-2 border border-slate-200 dark:border-slate-700 cursor-pointer"
+          className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 rounded-xl text-xs font-bold text-slate-700 dark:text-slate-200 flex items-center gap-2 border border-slate-200 dark:border-slate-700 cursor-pointer shrink-0"
         >
           {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
           <span>Giao diện: {theme === 'dark' ? 'Tối (Dark)' : 'Sáng (Light)'}</span>
@@ -267,20 +364,267 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       {!isAdmin && (
         <div className="p-4 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-xl text-xs text-amber-800 dark:text-amber-300 font-medium flex items-center gap-2">
           <AlertCircle className="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400" />
-          <span>Bạn đang xem với quyền <strong>Trợ giảng (Assistant)</strong>. Chỉ Admin (Giáo viên chính) mới được phép thay đổi cài đặt hệ thống.</span>
+          <span>
+            Bạn đang xem với quyền <strong>Trợ giảng (Assistant)</strong>. Chỉ Admin (Giáo viên chính) mới được phép thay đổi cài đặt hệ thống.
+          </span>
         </div>
       )}
 
       {saveSuccess && (
-        <div className="p-3 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold flex items-center gap-2 animate-bounce">
+        <div className="p-3 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />
           <span>Lưu cấu hình hệ thống thành công!</span>
         </div>
       )}
 
+      {/* SECTION 1: 12-TABLE DATABASE QA & SELF-HEALING SUITE */}
+      <div className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <Activity className="w-5 h-5 text-emerald-600" />
+              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                Kiểm Thử Chẩn Đoán & Tự Động Sửa Lỗi CSDL (6 Kịch Bản QA · 12 Bảng)
+              </h3>
+            </div>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Kiểm tra khóa định danh tất định, toàn vẹn khóa ngoại, đối soát Local ↔ Supabase, chống xung đột luồng và khóa chống xóa hàng loạt.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleRunQA}
+            disabled={isRunningQA}
+            className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50 whitespace-nowrap shrink-0"
+          >
+            <RefreshCw className={`w-4 h-4 ${isRunningQA ? 'animate-spin' : ''}`} />
+            <span>{isRunningQA ? 'Đang kiểm thử 12 bảng...' : 'Chạy Kiểm Thử Toàn Diện 12 Bảng'}</span>
+          </button>
+        </div>
+
+        {qaReport && (
+          <div className="space-y-4 pt-2 border-t border-slate-200 dark:border-slate-800">
+            {/* Summary Row */}
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
+                <span className="text-[11px] text-slate-500 block">Trạng thái CSDL</span>
+                <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400 mt-0.5 block">
+                  {qaReport.overallStatus === 'healthy'
+                    ? 'Đạt chuẩn 100% (6/6 Kịch bản)'
+                    : `Đã tự động vá ${qaReport.totalAutoFixed} điểm lệch`}
+                </span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
+                <span className="text-[11px] text-slate-500 block">Tổng bản ghi Trình duyệt</span>
+                <span className="text-sm font-bold text-slate-900 dark:text-slate-100 font-mono tabular-nums mt-0.5 block">
+                  {qaReport.totalLocalRecords.toLocaleString()} bản ghi
+                </span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
+                <span className="text-[11px] text-slate-500 block">Tổng bản ghi Supabase Cloud</span>
+                <span className="text-sm font-bold text-emerald-700 dark:text-emerald-300 font-mono tabular-nums mt-0.5 block">
+                  {qaReport.totalSupabaseRecords.toLocaleString()} bản ghi
+                </span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
+                <span className="text-[11px] text-slate-500 block">Thời gian thực thi</span>
+                <span className="text-sm font-bold text-slate-900 dark:text-slate-100 font-mono tabular-nums mt-0.5 block">
+                  {qaReport.totalDurationMs} ms · {new Date(qaReport.executedAt).toLocaleTimeString('vi-VN')}
+                </span>
+              </div>
+            </div>
+
+            {/* 6 Scenarios Breakdown */}
+            <div className="space-y-2">
+              {qaReport.scenarios.map((sc) => (
+                <div
+                  key={sc.id}
+                  className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 flex flex-col gap-1"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-bold text-slate-900 dark:text-slate-100">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span className="font-mono text-emerald-700 dark:text-emerald-400">
+                        {sc.code}
+                      </span>
+                      <span>·</span>
+                      <span>{sc.title}</span>
+                    </div>
+                    <span className="text-[11px] font-mono tabular-nums text-slate-500 shrink-0">
+                      {sc.status === 'passed' ? 'ĐẠT CHUẨN' : 'ĐÃ TỰ ĐỘNG SỬA'} · {sc.durationMs} ms
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-700 dark:text-slate-300 pl-6">{sc.summary}</p>
+                  <div className="pl-6 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
+                    {sc.details.map((d, idx) => (
+                      <span key={idx}>• {d}</span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* 12-Table Comparison Matrix */}
+            <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-xl">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-100 dark:bg-slate-800/80 text-slate-600 dark:text-slate-300 border-b border-slate-200 dark:border-slate-800">
+                    <th className="py-2.5 px-3 font-bold">Bảng Dữ Liệu (12 Bảng)</th>
+                    <th className="py-2.5 px-3 font-bold text-right">Máy tính (IndexedDB)</th>
+                    <th className="py-2.5 px-3 font-bold text-right">Đám mây (Supabase)</th>
+                    <th className="py-2.5 px-3 font-bold text-right">Đã sửa khóa / Mồ côi</th>
+                    <th className="py-2.5 px-3 font-bold text-right">Trạng thái</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {qaReport.tableMatrix.map((row) => (
+                    <tr
+                      key={row.tableName}
+                      className="hover:bg-slate-50/80 dark:hover:bg-slate-800/30"
+                    >
+                      <td className="py-2 px-3 font-medium text-slate-800 dark:text-slate-200">
+                        {row.label}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono tabular-nums font-bold text-slate-900 dark:text-slate-100">
+                        {row.localCount.toLocaleString()}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono tabular-nums font-bold text-emerald-700 dark:text-emerald-400">
+                        {row.supabaseCount.toLocaleString()}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono tabular-nums text-slate-500">
+                        {row.canonicalIssuesFixed + row.orphansRemoved}
+                      </td>
+                      <td className="py-2 px-3 text-right font-semibold text-emerald-600 dark:text-emerald-400">
+                        {row.inSync ? 'Đồng bộ 100%' : 'Đã cân bằng'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* SECTION 2: JSON FULL BACKUP & PRE-DELETE SAFETY SNAPSHOT VAULT */}
+      <div className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-5 h-5 text-emerald-600" />
+              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                Sao Lưu Toàn Hệ Thống (.JSON) & Kho Khôi Phục Tự Động Trước Khi Xóa
+              </h3>
+            </div>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Các tính năng xóa trắng nguy hiểm đã được khóa vĩnh viễn. Hệ thống tự động lưu bản sao dự phòng trước mọi thao tác xóa Lớp học, Học sinh hoặc Buổi học.
+            </p>
+          </div>
+
+          <div className="flex items-center flex-wrap gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleExportBackup}
+              disabled={isExportingJson}
+              className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:hover:bg-white text-white dark:text-slate-900 text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>{isExportingJson ? 'Đang đóng gói...' : 'Tải Bản Sao Lưu (.JSON)'}</span>
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportFileChange}
+              className="hidden"
+            />
+            <button
+              type="button"
+              disabled={!isAdmin || isImportingJson}
+              onClick={() => fileInputRef.current?.click()}
+              className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>{isImportingJson ? 'Đang nạp...' : 'Khôi Phục Từ File .JSON'}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Pre-Delete Safety Snapshots List */}
+        <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+              <Database className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Danh sách Bản Sao Lưu Tự Động Trước Khi Xóa ({safetySnapshots.length})</span>
+            </span>
+            <span className="text-[11px] text-slate-500">
+              Tự động kích hoạt khi xóa Lớp học · Học sinh · Buổi học
+            </span>
+          </div>
+
+          {safetySnapshots.length === 0 ? (
+            <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200/80 dark:border-slate-800 text-xs text-slate-500">
+              Chưa có thao tác xóa nào phát sinh. Bất kỳ khi nào Thầy/Cô xóa một Lớp học, Học sinh hoặc Buổi học, gói dữ liệu gốc sẽ tự động xuất hiện tại đây để có thể khôi phục 1-Click.
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {safetySnapshots.map((snap) => (
+                <div
+                  key={snap.id}
+                  className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                >
+                  <div>
+                    <div className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                      <span>{snap.label}</span>
+                      <span className="text-[11px] font-normal text-slate-500 font-mono tabular-nums">
+                        · {snap.recordCount} bản ghi liên đới
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
+                      Sao lưu lúc: {new Date(snap.createdAt).toLocaleString('vi-VN')}
+                      {snap.restoredAt
+                        ? ` · Đã khôi phục lúc ${new Date(snap.restoredAt).toLocaleTimeString('vi-VN')}`
+                        : ''}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={restoringSnapId === snap.id}
+                      onClick={() => handleRestoreSnapshot(snap)}
+                      className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>
+                        {restoringSnapId === snap.id ? 'Đang khôi phục...' : 'Khôi phục 1-Click'}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        removeSafetySnapshot(snap.id);
+                        setSafetySnapshots(getSafetySnapshots());
+                      }}
+                      title="Gỡ bản ghi sao lưu này"
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-colors cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* SECTION 3: SYSTEM CONFIGURATION FORM */}
       <form onSubmit={handleSaveSettings} className="space-y-6">
         {/* Gemini API Key */}
-        <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-3">
+        <div className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-3">
           <div className="flex items-center gap-2">
             <Key className="w-4 h-4 text-emerald-600" />
             <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
@@ -289,7 +633,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
 
           <p className="text-xs text-slate-500">
-            API Key dùng để kích hoạt tính năng Gemini 1.5 Flash chẩn đoán học tập thông minh và viết tóm tắt Zalo Phụ huynh.
+            API Key dùng để kích hoạt tính năng chẩn đoán học tập thông minh và viết tóm tắt Zalo Phụ huynh.
           </p>
 
           <input
@@ -302,7 +646,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* Warning Thresholds */}
-        <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
+        <div className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Sliders className="w-4 h-4 text-emerald-600" />
@@ -310,13 +654,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 Ngưỡng Cảnh Báo (Warning Engine)
               </h3>
             </div>
-            
+
             <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
               <button
                 type="button"
                 onClick={() => setSelectedProfile('standard')}
-                className={`px-3 py-1 text-[11px] font-bold rounded-lg transition-all ${
-                  selectedProfile === 'standard' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500'
+                className={`px-3 py-1 text-[11px] font-bold rounded-lg transition-all cursor-pointer ${
+                  selectedProfile === 'standard'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+                    : 'text-slate-500'
                 }`}
               >
                 Tiêu chuẩn
@@ -324,8 +670,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <button
                 type="button"
                 onClick={() => setSelectedProfile('specialized')}
-                className={`px-3 py-1 text-[11px] font-bold rounded-lg transition-all ${
-                  selectedProfile === 'specialized' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500'
+                className={`px-3 py-1 text-[11px] font-bold rounded-lg transition-all cursor-pointer ${
+                  selectedProfile === 'specialized'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+                    : 'text-slate-500'
                 }`}
               >
                 Lớp Chuyên
@@ -333,8 +681,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <button
                 type="button"
                 onClick={() => setSelectedProfile('remedial')}
-                className={`px-3 py-1 text-[11px] font-bold rounded-lg transition-all ${
-                  selectedProfile === 'remedial' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500'
+                className={`px-3 py-1 text-[11px] font-bold rounded-lg transition-all cursor-pointer ${
+                  selectedProfile === 'remedial'
+                    ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+                    : 'text-slate-500'
                 }`}
               >
                 Phụ đạo
@@ -352,15 +702,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 min="1"
                 max="5"
                 value={profileConfigs[selectedProfile].maxAbsences}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], maxAbsences: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      maxAbsences: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Kích hoạt Cảnh báo P1 khi đạt ngưỡng.
-              </p>
             </div>
 
             <div>
@@ -373,15 +725,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 max="10"
                 step="0.5"
                 value={profileConfigs[selectedProfile].minTestScore}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], minTestScore: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      minTestScore: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Bài thi dưới ngưỡng này được coi là kém.
-              </p>
             </div>
 
             <div>
@@ -394,15 +748,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 max="10"
                 step="0.5"
                 value={profileConfigs[selectedProfile].minHomeworkScore}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], minHomeworkScore: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      minHomeworkScore: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Điểm BTVN dưới ngưỡng này được coi là kém.
-              </p>
             </div>
 
             <div>
@@ -414,15 +770,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 min="1"
                 max="5"
                 value={profileConfigs[selectedProfile].consecutiveLowTests}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], consecutiveLowTests: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      consecutiveLowTests: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Kích hoạt Cảnh báo P1 khi điểm thấp liên tiếp.
-              </p>
             </div>
 
             <div>
@@ -434,15 +792,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 min="1"
                 max="10"
                 value={profileConfigs[selectedProfile].consecutiveLowHomework}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], consecutiveLowHomework: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      consecutiveLowHomework: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Kích hoạt Cảnh báo P1 khi thiếu bài liên tiếp.
-              </p>
             </div>
 
             <div>
@@ -455,15 +815,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 max="5.0"
                 step="0.5"
                 value={profileConfigs[selectedProfile].scoreDropThreshold}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], scoreDropThreshold: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      scoreDropThreshold: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Cảnh báo P2 nếu điểm giảm sâu so với TB.
-              </p>
             </div>
 
             <div>
@@ -476,15 +838,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 max="10.0"
                 step="0.5"
                 value={profileConfigs[selectedProfile].excellentTestScore ?? 9.0}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], excellentTestScore: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      excellentTestScore: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Vinh danh học sinh đạt bài thi xuất sắc.
-              </p>
             </div>
 
             <div>
@@ -497,69 +861,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 max="4.0"
                 step="0.5"
                 value={profileConfigs[selectedProfile].progressIncreaseThreshold ?? 1.5}
-                onChange={(e) => setProfileConfigs(prev => ({
-                  ...prev,
-                  [selectedProfile]: { ...prev[selectedProfile], progressIncreaseThreshold: Number(e.target.value) }
-                }))}
-                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500"
+                onChange={(e) =>
+                  setProfileConfigs((prev) => ({
+                    ...prev,
+                    [selectedProfile]: {
+                      ...prev[selectedProfile],
+                      progressIncreaseThreshold: Number(e.target.value),
+                    },
+                  }))
+                }
+                className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2.5 rounded-xl outline-none focus:border-emerald-500 font-mono tabular-nums"
               />
-              <p className="text-[10px] text-slate-400 mt-1">
-                Vinh danh khi điểm tăng vượt bậc so với đầu kỳ.
-              </p>
-            </div>
-          </div>
-
-          {/* Rule engine criteria breakdown */}
-          <div className="mt-4 p-3.5 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700/80 space-y-2 text-xs">
-            <h4 className="font-bold text-slate-800 dark:text-slate-200 text-xs flex items-center gap-1.5">
-              <span>📋 Quy chế Kích hoạt Tự động (Module 2 Rules Engine):</span>
-            </h4>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] text-slate-600 dark:text-slate-300">
-              <div className="p-2 rounded-lg bg-rose-50/80 dark:bg-rose-950/30 border border-rose-200/80 dark:border-rose-900/60">
-                <span className="font-black text-rose-700 dark:text-rose-300">🔴 Cấp P1 (Khẩn cấp):</span>
-                <ul className="list-disc list-inside mt-0.5 space-y-0.5 text-[10.5px]">
-                  <li>Điểm KT kém liên tiếp ≥ {profileConfigs[selectedProfile].consecutiveLowTests} buổi</li>
-                  <li>Điểm TB tích lũy &lt; {profileConfigs[selectedProfile].minTestScore}đ (qua ≥ 2 buổi)</li>
-                  <li>Thiếu/Kém BTVN liên tiếp ≥ {profileConfigs[selectedProfile].consecutiveLowHomework} buổi</li>
-                  <li>Vắng không phép ≥ {profileConfigs[selectedProfile].maxAbsences} buổi</li>
-                </ul>
-              </div>
-
-              <div className="p-2 rounded-lg bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200/80 dark:border-amber-900/60">
-                <span className="font-black text-amber-700 dark:text-amber-300">🟠 Cấp P2 (Theo dõi / Nhắc nhở):</span>
-                <ul className="list-disc list-inside mt-0.5 space-y-0.5 text-[10.5px]">
-                  <li>1 buổi điểm kiểm tra yếu đơn lẻ (&lt; {profileConfigs[selectedProfile].minTestScore}đ)</li>
-                  <li>Phong độ sa sút giảm ≥ {profileConfigs[selectedProfile].scoreDropThreshold}đ</li>
-                  <li>Lệch phong độ: BTVN ≥ 8.5đ nhưng kiểm tra &lt; 6.0đ</li>
-                  <li>Chưa nộp BTVN rải rác ≥ 2 buổi | Đi muộn ≥ 3 buổi | Nghỉ học ≥ 3 buổi</li>
-                </ul>
-              </div>
-
-              <div className="p-2 rounded-lg bg-yellow-50/80 dark:bg-yellow-950/30 border border-yellow-200/80 dark:border-yellow-900/60">
-                <span className="font-black text-yellow-800 dark:text-yellow-300">🟡 Cấp P3 (Cảnh báo sớm):</span>
-                <ul className="list-disc list-inside mt-0.5 space-y-0.5 text-[10.5px]">
-                  <li>Vắng không phép 1 buổi đơn lẻ (lưu ý sớm)</li>
-                  <li>Đi muộn 2 buổi (sắp chạm ngưỡng P2)</li>
-                  <li>Chưa nộp BTVN 1 buổi đơn lẻ</li>
-                  <li>Điểm KT hoặc BTVN buổi gần nhất mấp mé chuẩn tối thiểu</li>
-                </ul>
-              </div>
-
-              <div className="p-2 rounded-lg bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200/80 dark:border-emerald-900/60">
-                <span className="font-black text-emerald-700 dark:text-emerald-300">🟢 Tuyên Dương Vinh Danh:</span>
-                <ul className="list-disc list-inside mt-0.5 space-y-0.5 text-[10.5px]">
-                  <li>Bài kiểm tra trực tiếp đạt ≥ {profileConfigs[selectedProfile].excellentTestScore ?? 9.0}đ</li>
-                  <li>Điểm TB tích lũy xuất sắc ≥ 8.5đ</li>
-                  <li>Tiến bộ bứt phá tăng ≥ +{profileConfigs[selectedProfile].progressIncreaseThreshold ?? 1.5}đ</li>
-                  <li>Chuyên cần 100% &amp; hoàn thành 100% BTVN (TB ≥ 8.0đ)</li>
-                </ul>
-              </div>
             </div>
           </div>
         </div>
 
         {/* Pronoun & Title Settings */}
-        <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
+        <div className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-4">
           <div className="flex items-center gap-2">
             <UserCheck className="w-4 h-4 text-emerald-600" />
             <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
@@ -610,25 +928,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         </div>
 
-        {/* Local Storage Info */}
-        <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-3">
-          <div className="flex items-center gap-2">
-            <HardDrive className="w-4 h-4 text-emerald-600" />
-            <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-              Lưu Trữ Dữ Liệu Cục Bộ (IndexedDB Offline)
-            </h3>
-          </div>
-
-          <p className="text-xs text-slate-500 leading-relaxed">
-            Ứng dụng hoạt động hoàn toàn ở chế độ <strong>Cục bộ Offline-First</strong>. Toàn bộ dữ liệu điểm số, lớp học, học sinh được lưu trữ bảo mật 100% trên trình duyệt của thiết bị này và không kết nối máy chủ Firebase bên ngoài.
-          </p>
-        </div>
-
         <div className="flex justify-end">
           <button
             type="submit"
             disabled={!isAdmin}
-            className={`px-6 py-3 rounded-xl font-bold text-xs shadow-md flex items-center gap-2 cursor-pointer ${
+            className={`px-6 py-3 rounded-xl font-bold text-xs flex items-center gap-2 cursor-pointer ${
               isAdmin
                 ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
                 : 'bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-500 cursor-not-allowed'
@@ -639,132 +943,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </button>
         </div>
       </form>
-
-      {/* Seed Demo Data Section */}
-      <div className="bg-emerald-50 dark:bg-emerald-950/20 p-5 rounded-2xl border border-emerald-200 dark:border-emerald-900/50 shadow-sm space-y-4">
-        <div className="flex items-center gap-2">
-          <Database className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
-          <h3 className="text-sm font-bold text-emerald-900 dark:text-emerald-100">
-            Dữ Liệu Thử Nghiệm (Demo Data)
-          </h3>
-        </div>
-
-        <p className="text-xs text-emerald-700 dark:text-emerald-300">
-          Nếu thầy cô đang thử nghiệm ứng dụng và muốn trải nghiệm đầy đủ các tính năng nhanh chóng, thầy cô có thể nhấn nút để nạp tự động danh sách lớp học mẫu (9A1, 9B2, 8A2), học sinh mẫu, phân phối chương trình môn Toán, điểm số kiểm tra, và các cảnh báo học tập tương ứng.
-          <br />
-          <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Ưu điểm:</span> Hệ thống nạp dữ liệu thông minh sẽ <strong>giữ nguyên vẹn tất cả dữ liệu thật do thầy cô tự tạo</strong> trước đó, chỉ ghi đè dữ liệu mẫu cũ.
-        </p>
-
-        <div className="flex flex-wrap gap-3">
-          <button
-            type="button"
-            disabled={!isAdmin}
-            onClick={async () => {
-              try {
-                await seedDemoData();
-                setDemoMessage('seed_success');
-              } catch (err) {
-                console.error("Failed to seed demo data:", err);
-              }
-            }}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50 flex items-center gap-1.5 cursor-pointer"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            Nạp Dữ Liệu Mẫu
-          </button>
-
-          <button
-            type="button"
-            disabled={!isAdmin}
-            onClick={async () => {
-              try {
-                await deleteOnlyDemoTestData();
-                setDemoMessage('delete_success');
-              } catch (err) {
-                console.error("Failed to delete demo data:", err);
-              }
-            }}
-            className="px-4 py-2 bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50 flex items-center gap-1.5 border border-slate-300 dark:border-slate-700 cursor-pointer"
-          >
-            <Trash2 className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
-            Xóa Dữ Liệu Thử Nghiệm
-          </button>
-        </div>
-      </div>
-
-      {/* Reset Database to Blank Slate */}
-      <div className="bg-rose-50 dark:bg-rose-950/20 p-5 rounded-2xl border border-rose-200 dark:border-rose-900/50 shadow-sm space-y-4">
-        <div className="flex items-center gap-2">
-          <Trash2 className="w-5 h-5 text-rose-600 dark:text-rose-400" />
-          <h3 className="text-sm font-bold text-rose-900 dark:text-rose-100">
-            Khởi Tạo Hệ Thống Sạch (Chuyển đổi sang App Trắng)
-          </h3>
-        </div>
-
-        <p className="text-xs text-rose-700 dark:text-rose-300">
-          Hành động này sẽ xóa vĩnh viễn toàn bộ dữ liệu chạy thử mẫu hiện tại bao gồm: <strong>Lớp học, danh sách học sinh, lịch sử các buổi học, điểm danh, điểm số, nhận xét và cảnh báo</strong>. 
-          Hệ thống sẽ giữ lại danh mục chuyên đề kiến thức Toán THCS (Đại số, Hình học) để thầy cô có thể bắt đầu sử dụng ngay mà không cần cấu hình lại từ đầu.
-        </p>
-
-        {!showResetConfirm ? (
-          <button
-            type="button"
-            disabled={!isAdmin}
-            onClick={() => setShowResetConfirm(true)}
-            className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50 cursor-pointer"
-          >
-            Chuyển đổi sang App Trắng
-          </button>
-        ) : (
-          <div className="bg-white dark:bg-slate-900 p-4 rounded-xl border border-rose-200 dark:border-rose-900 shadow-inner space-y-3">
-            <p className="text-xs font-bold text-slate-800 dark:text-slate-200">
-              Xác nhận hành động xóa: Nhập chính xác từ <span className="text-rose-600 font-extrabold">"XÓA"</span> vào ô dưới đây để xác nhận:
-            </p>
-            
-            <div className="flex flex-col sm:flex-row gap-2">
-              <input
-                type="text"
-                placeholder="XÓA"
-                value={resetConfirmText}
-                onChange={(e) => setResetConfirmText(e.target.value)}
-                className="px-3 py-2 text-xs border border-rose-300 dark:border-rose-800 rounded-xl bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100 outline-none focus:ring-1 focus:ring-rose-500 max-w-[120px]"
-              />
-              
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  disabled={resetConfirmText !== 'XÓA' || isResetting}
-                  onClick={async () => {
-                    setIsResetting(true);
-                    try {
-                      await clearFirestoreDatabase();
-                      await clearAllDataToBlankSlate();
-                      window.location.reload();
-                    } catch (err) {
-                      console.error('Failed to reset db:', err);
-                      setIsResetting(false);
-                    }
-                  }}
-                  className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-30 flex items-center gap-1 cursor-pointer"
-                >
-                  {isResetting ? 'Đang thực hiện...' : 'Xác Nhận Xóa Hết'}
-                </button>
-                
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowResetConfirm(false);
-                    setResetConfirmText('');
-                  }}
-                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-200 font-bold text-xs rounded-xl transition-colors cursor-pointer"
-                >
-                  Hủy
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
     </div>
   );
 };
+

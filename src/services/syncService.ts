@@ -98,12 +98,12 @@ const outboxMap = new Map<string, OutboxEntry>();
 const syncedSignatures = new Map<string, string>();
 
 const SUPABASE_CLEAN_SYNC_VERSION_KEY = 'smart_edu_supabase_sync_version';
-const SUPABASE_CLEAN_SYNC_VERSION = 'v5_supabase_clean_reset_2';
+const SUPABASE_CLEAN_SYNC_VERSION = 'v6_supabase_restored_safe';
 
 function loadPersistedSyncState() {
   if (typeof window === 'undefined') return;
   try {
-    // If browser has not run the v5 clean reset yet, do not load stale outbox/tombstones from localStorage
+    // If browser has not run the v6 clean reset yet, do not load stale outbox/tombstones from localStorage
     if (localStorage.getItem(SUPABASE_CLEAN_SYNC_VERSION_KEY) !== SUPABASE_CLEAN_SYNC_VERSION) {
       localStorage.removeItem(LOCAL_TOMBSTONE_KEY);
       localStorage.removeItem(LOCAL_OUTBOX_KEY);
@@ -251,7 +251,7 @@ let currentSyncStatus: SyncStatus = {
   supabaseNeedsSetup: false,
 };
 
-let sqlBackendAvailable: boolean | null = null;
+let sqlBackendAvailable: boolean | null = false;
 let sqlPollTimer: ReturnType<typeof setInterval> | null = null;
 let supabaseReady: boolean | null = true;
 let supabaseNeedsSchemaSetup = false;
@@ -1722,9 +1722,24 @@ export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boo
       }
     }
 
-    // Apply deletions & tombstones
+    // Apply deletions & tombstones (with Cloud Mass-Deletion Protection Guard)
+    const allowedTombstones: TombstoneRecord[] = [];
     for (const [tName, ids] of deletionsByTable.entries()) {
       if (ids.length > 0) {
+        const maxAllowed = MASS_DELETE_LIMITS[tName];
+        const unauthIds = ids.filter((id) => !authorizedCascadeDeletes.has(`${tName}/${id}`));
+        if (maxAllowed !== undefined && unauthIds.length > maxAllowed) {
+          console.warn(
+            `[Sync Safety Guard] Blocked unauthorized mass deletion of ${unauthIds.length} records in table "${tName}" (limit: ${maxAllowed}).`
+          );
+          unauthIds.forEach((id) => {
+            outboxMap.delete(`${tName}/${id}`);
+            tombstoneMap.delete(`${tName}_${id}`);
+          });
+          persistTombstones();
+          continue;
+        }
+
         const CHUNK_SIZE = 500;
         for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
           const chunkIds = ids.slice(i, i + CHUNK_SIZE);
@@ -1732,15 +1747,18 @@ export async function flushOutboxToSupabase(entries: OutboxEntry[]): Promise<boo
         }
         ids.forEach((id) => {
           const key = `${tName}/${id}`;
+          authorizedCascadeDeletes.delete(key);
           outboxMap.delete(key);
           syncedSignatures.delete(key);
+          const tomb = tombstoneMap.get(`${tName}_${id}`);
+          if (tomb) allowedTombstones.push(tomb);
         });
       }
     }
-    if (tombstonesToUpsert.length > 0) {
+    if (allowedTombstones.length > 0) {
       const CHUNK_SIZE = 500;
-      for (let i = 0; i < tombstonesToUpsert.length; i += CHUNK_SIZE) {
-        const chunk = tombstonesToUpsert.slice(i, i + CHUNK_SIZE);
+      for (let i = 0; i < allowedTombstones.length; i += CHUNK_SIZE) {
+        const chunk = allowedTombstones.slice(i, i + CHUNK_SIZE);
         await supabase.from(TOMBSTONE_COLLECTION).upsert(chunk, { onConflict: 'id' });
       }
     }
@@ -1815,7 +1833,7 @@ export async function pullAllFromSupabase(): Promise<{
   }
 
   try {
-    // One-time browser cache reset to purge ~2,500 stuck legacy/duplicate IndexedDB records
+    // One-time browser sync state reset to purge any stale outbox/tombstone cache from localStorage
     let isCleanResetBoot = false;
     if (
       typeof window !== 'undefined' &&
@@ -1886,22 +1904,10 @@ export async function pullAllFromSupabase(): Promise<{
       }
     }
 
-    // If this is the one-time clean reset boot and Supabase has data, clear all local IndexedDB tables first
-    if (isCleanResetBoot && totalRemoteRecords > 0) {
-      setRemoteSyncing(true);
+    if (isCleanResetBoot && totalRemoteRecords > 0 && typeof window !== 'undefined') {
       try {
-        for (const tName of ALL_TABLES) {
-          const dexieTable = (dexieDb as any)[tName];
-          if (dexieTable) {
-            await dexieTable.clear();
-          }
-        }
-        if (typeof window !== 'undefined') {
-          localStorage.setItem(SUPABASE_CLEAN_SYNC_VERSION_KEY, SUPABASE_CLEAN_SYNC_VERSION);
-        }
-      } finally {
-        setRemoteSyncing(false);
-      }
+        localStorage.setItem(SUPABASE_CLEAN_SYNC_VERSION_KEY, SUPABASE_CLEAN_SYNC_VERSION);
+      } catch (e) {}
     }
 
     // 3. Apply confirmed tombstone deletions only where records actually exist locally
@@ -2135,7 +2141,44 @@ export async function pullAllFromFirestore() {
   }
 }
 
-// Push all changed non-demo local records from Dexie to Supabase / Cloud SQL
+export const MASS_DELETE_LIMITS: Partial<Record<TableName, number>> = {
+  classes: 1,
+  students: 3,
+  sessions: 3,
+  school_years: 1,
+};
+
+const authorizedCascadeDeletes = new Set<string>();
+
+export function authorizeCascadeDeleteIds(
+  tableName: TableName,
+  ids: Array<string | number>
+) {
+  ids.forEach((id) => {
+    if (id !== undefined && id !== null) {
+      authorizedCascadeDeletes.add(`${tableName}/${String(id)}`);
+    }
+  });
+}
+
+export async function clearTombstoneForRecord(
+  tableName: TableName,
+  docId: string | number
+) {
+  const idStr = String(docId);
+  const tombKey = `${tableName}_${idStr}`;
+  tombstoneMap.delete(tombKey);
+  outboxMap.delete(`${tableName}/${idStr}`);
+  persistTombstones();
+  persistOutbox();
+  if (supabase && supabaseReady !== false) {
+    try {
+      await supabase.from(TOMBSTONE_COLLECTION).delete().eq('id', tombKey);
+    } catch (e) {}
+  }
+}
+
+// Push all changed non-demo local records from Dexie to Supabase using Dirty-Diff
 export async function pushAllToFirestore() {
   if (supabaseReady === false && sqlBackendAvailable === false) {
     updateSyncStatus({ isSyncing: false });
@@ -2153,7 +2196,7 @@ export async function pushAllToFirestore() {
         if (!item || item.is_demo === true) continue;
         const docId = getCanonicalDocId(tableName, item, item.id);
         if (!isRecordTombstoned(tableName, docId, item.updated_at)) {
-          enqueueSyncOperation(tableName, docId, { ...item, id: docId }, false, true);
+          enqueueSyncOperation(tableName, docId, { ...item, id: docId }, false, false);
         }
       }
     }
@@ -2202,49 +2245,17 @@ export async function forceFullSync() {
 
 export async function reconnectAndSyncCloud(): Promise<boolean> {
   supabaseReady = null;
-  if (sqlBackendAvailable === false) {
-    sqlBackendAvailable = null;
-  }
   const supaRes = await pullAllFromSupabase();
   if (supaRes.ok) {
-    await pushAllToFirestore();
-    return true;
-  }
-  const sqlRes = await pullAllFromSqlCloud();
-  if (sqlRes.ok) {
     await pushAllToFirestore();
     return true;
   }
   return false;
 }
 
-// Clear all Supabase & Cloud SQL collections for real-world blank slate deployment
+// Locked: Blank-slate cloud database wiping is permanently disabled to protect production data
 export async function clearFirestoreDatabase() {
-  try {
-    if (supabaseReady !== false && supabase) {
-      try {
-        for (const tableName of ALL_TABLES) {
-          if (tableName === 'knowledge_tags' || tableName === 'settings') continue;
-          await supabase.from(tableName).delete().neq('id', '');
-        }
-      } catch (e) {}
-    }
-
-    if (sqlBackendAvailable !== false) {
-      try {
-        const token = await getActiveAuthToken();
-        await fetch('/api/sql-sync/clear', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-        });
-      } catch (e) {}
-    }
-
-    outboxMap.clear();
-    persistOutbox();
-    updateSyncStatus({ pendingOutboxCount: 0, lastSyncedAt: new Date(), quotaExceeded: false });
-  } catch (err: any) {
-    console.warn('[SyncService] clearFirestoreDatabase error:', err);
-  }
+  console.warn('[Sync Safety Guard] clearFirestoreDatabase is locked to protect production data.');
 }
+
 

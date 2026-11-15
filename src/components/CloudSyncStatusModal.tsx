@@ -13,6 +13,8 @@ import {
   Wifi,
   WifiOff,
   AlertTriangle,
+  Download,
+  ClipboardCheck,
 } from 'lucide-react';
 import { db } from '../db/dexie';
 import { useLiveQuery } from 'dexie-react-hooks';
@@ -20,6 +22,10 @@ import { useCloudSync } from '../hooks/useCloudSync';
 import { getIsQuotaExceeded } from '../firebase';
 import { supabase, SUPABASE_SETUP_SQL } from '../lib/supabase';
 import { getSupabaseSyncState, ALL_TABLES } from '../services/syncService';
+import {
+  exportFullDatabaseBackupJson,
+  runComprehensiveDatabaseQA,
+} from '../utils/dbSafetyAndQA';
 
 interface CloudSyncStatusModalProps {
   isOpen: boolean;
@@ -323,25 +329,63 @@ export const CloudSyncStatusModal: React.FC<CloudSyncStatusModalProps> = ({ isOp
             )}
           </div>
 
-          {/* Kaizen Database Deduplication Action Card */}
+          {/* Kaizen Database Deduplication & 12-Table QA Action Card */}
           <div className="p-4 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
             <div>
               <h3 className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
                 <Sparkles className="w-4 h-4 text-emerald-600" />
-                <span>Chuẩn hóa Khóa Định Danh & Gộp Dữ Liệu Trùng (Kaizen DB)</span>
+                <span>Kiểm Thử Toàn Diện 12 Bảng (QA Suite) & Sao Lưu JSON</span>
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Tự động gộp các bản ghi Điểm buổi học, Phân lớp, Năm học và Cài đặt bị trùng UUID, giữ lại bản mới nhất.
+                Chạy 6 kịch bản kiểm thử toàn vẹn khóa ngoại, chuẩn hóa khóa Kaizen và tải bản sao lưu dự phòng .JSON 12 bảng.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={handleKaizenClean}
-              disabled={isManualSyncing || isSyncing}
-              className="px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:hover:bg-white text-white dark:text-slate-900 text-xs font-bold transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap shrink-0"
-            >
-              Chạy Kaizen Chuẩn Hóa
-            </button>
+            <div className="flex items-center flex-wrap gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    setIsManualSyncing(true);
+                    setActionMessage('Đang xuất file sao lưu .JSON toàn bộ 12 bảng...');
+                    const res = await exportFullDatabaseBackupJson();
+                    setActionMessage(
+                      `Đã tải xuống ${res.filename} (${res.totalRecords.toLocaleString()} bản ghi)!`
+                    );
+                  } finally {
+                    setIsManualSyncing(false);
+                    setTimeout(() => setActionMessage(null), 5000);
+                  }
+                }}
+                disabled={isManualSyncing || isSyncing}
+                className="px-3 py-2 rounded-lg bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/60 dark:hover:bg-emerald-900/80 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Sao lưu .JSON</span>
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    setIsManualSyncing(true);
+                    setActionMessage(
+                      'Đang chạy 6 kịch bản kiểm thử & tự động sửa lỗi toàn diện 12 bảng...'
+                    );
+                    const report = await runComprehensiveDatabaseQA();
+                    setActionMessage(
+                      `QA Hoàn tất (${report.scenarios.length}/6 kịch bản ĐẠT): Đã tự động chuẩn hóa ${report.totalAutoFixed} mục · Local ${report.totalLocalRecords.toLocaleString()} ↔ Supabase ${report.totalSupabaseRecords.toLocaleString()} bản ghi!`
+                    );
+                  } finally {
+                    setIsManualSyncing(false);
+                    setTimeout(() => setActionMessage(null), 6000);
+                  }
+                }}
+                disabled={isManualSyncing || isSyncing}
+                className="px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:hover:bg-white text-white dark:text-slate-900 text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+              >
+                <ClipboardCheck className="w-3.5 h-3.5" />
+                <span>Kiểm Thử & Tự Sửa 12 Bảng</span>
+              </button>
+            </div>
           </div>
 
           {/* Summary Metrics */}

@@ -3,6 +3,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { ClassItem, GradeLevel, ClassStatus, ClassType, UserRole, Session, Warning, StudentSession } from '../types';
 import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { logAudit } from '../utils/auditLogger';
+import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
 import { compareVietnameseNames } from '../utils/sortUtils';
 import * as XLSX from 'xlsx';
 import {
@@ -229,7 +230,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     onRefresh();
   };
 
-  // Safe Cascade Delete Guard
+  // Safe Cascade Delete Guard (with Automatic Pre-Delete Safety Snapshot)
   const handleConfirmDelete = async () => {
     if (!deletingClass || !deletingClass.id) return;
     if ((deleteConfirmText || '').trim() !== (deletingClass.class_name || '').trim()) {
@@ -238,6 +239,14 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     }
 
     const targetClassIdStr = String(deletingClass.id);
+
+    // Automatically capture full relational Pre-Delete Safety Snapshot before deleting
+    await createPreDeleteSnapshot(
+      'class',
+      targetClassIdStr,
+      `Lớp ${deletingClass.class_name} (Khối ${deletingClass.grade_level})`
+    );
+
     const classSessions = sessions.filter((s) => String(s.class_id) === targetClassIdStr);
     const sessionIdSet = new Set(classSessions.map((s) => String(s.id)).filter(Boolean));
 
@@ -266,7 +275,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
 
     await db.classes.delete(String(deletingClass.id));
 
-    await logAudit(currentRole as UserRole, 'Xóa lớp học', `Xóa vĩnh viễn lớp ${deletingClass.class_name}`);
+    await logAudit(currentRole as UserRole, 'Xóa lớp học', `Xóa vĩnh viễn lớp ${deletingClass.class_name} (Đã lưu bản sao dự phòng tự động)`);
 
     setDeletingClass(null);
     setDeleteConfirmText('');
@@ -277,10 +286,10 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     if (!sess || !sess.id) return;
     if (
       !confirm(
-        `XÁC NHẬN XÓA BUỔI HỌC VĨNH VIỄN?\n\n` +
+        `XÁC NHẬN XÓA BUỔI HỌC?\n\n` +
           `- Buổi học: "${sess.lesson_title}" (${sess.session_date})\n` +
           `- Thuộc lớp: ${viewingClassDetails?.class_name}\n\n` +
-          `Hành động này sẽ xóa toàn bộ điểm số, điểm danh và nhận xét của học sinh trong buổi học này khỏi cơ sở dữ liệu. Không thể hoàn tác!`
+          `Hệ thống sẽ tự động tạo bản sao lưu dự phòng trước khi xóa để Thầy/Cô có thể hoàn tác trong mục Cài đặt nếu cần.`
       )
     ) {
       return;
@@ -288,6 +297,14 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
 
     try {
       const sessIdStr = String(sess.id);
+
+      // Automatically capture Pre-Delete Safety Snapshot before deleting session
+      await createPreDeleteSnapshot(
+        'session',
+        sessIdStr,
+        `Buổi học "${sess.lesson_title}" (${sess.session_date}) - Lớp ${viewingClassDetails?.class_name || ''}`
+      );
+
       const allStudSessions = await db.student_sessions.toArray();
       const matchedStudentSess = allStudSessions.filter(
         (ss) => String(ss.session_id) === sessIdStr
@@ -305,7 +322,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
       await logAudit(
         currentRole as UserRole,
         'Xóa buổi học',
-        `Xóa vĩnh viễn buổi học "${sess.lesson_title}" (${sess.session_date}) khỏi lớp ${viewingClassDetails?.class_name}`
+        `Xóa buổi học "${sess.lesson_title}" (${sess.session_date}) khỏi lớp ${viewingClassDetails?.class_name} (Đã lưu bản sao dự phòng tự động)`
       );
 
       onRefresh();
