@@ -21,6 +21,7 @@ import { KnowledgeMap } from './components/KnowledgeMap';
 import { StudentRoster } from './components/StudentRoster';
 import { AuditAndReports } from './components/AuditAndReports';
 import { SettingsModal } from './components/SettingsModal';
+import { CustomerCRM } from './components/CustomerCRM';
 import { useCloudSync } from './hooks/useCloudSync';
 import { useAuth } from './lib/AuthContext';
 import { LoginPage } from './components/LoginPage';
@@ -101,6 +102,18 @@ export default function App() {
 
   const p1Count = warnings.filter((w) => !w.resolved && w.priority === 'P1').length;
 
+  const crmDueCount = React.useMemo(() => {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    return students.filter((s) => {
+      if (s.status === 'stopped') return false;
+      if (s.crm_status === 'at_risk') return true;
+      if (s.crm_next_followup_date && s.crm_next_followup_date <= todayStr) {
+        return true;
+      }
+      return false;
+    }).length;
+  }, [students]);
+
   const handleSelectClassForGradeEntry = (classId: string) => {
     setGradeEntryClassId(classId);
     setActiveTab('grade-entry');
@@ -143,7 +156,12 @@ export default function App() {
       {/* Main Content Layout */}
       <div className="flex-1 max-w-7xl w-full mx-auto flex flex-col lg:flex-row gap-0">
         {/* Left Fixed Navigation Sidebar */}
-        <Sidebar activeTab={activeTab} onTabChange={setActiveTab} p1Count={p1Count} />
+        <Sidebar
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          p1Count={p1Count}
+          crmDueCount={crmDueCount}
+        />
 
         {/* Main View Area */}
         <main className="flex-1 p-4 lg:p-6 overflow-y-auto">
@@ -191,6 +209,15 @@ export default function App() {
               students={students}
               classes={classes}
               onRefresh={() => {}}
+            />
+          )}
+
+          {activeTab === 'crm' && (
+            <CustomerCRM
+              students={students}
+              classes={classes}
+              warnings={warnings}
+              knowledgeTags={knowledgeTags}
             />
           )}
 

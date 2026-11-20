@@ -46,6 +46,39 @@ export interface ClassItem {
   updated_at: string;
 }
 
+export type CRMCustomerStatus = 'satisfied' | 'attention' | 'at_risk';
+
+export type CRMContactChannel = 'zalo' | 'call' | 'sms' | 'meeting';
+
+export type CRMTemplateCategory =
+  | 'periodic_report'
+  | 'praise_progress'
+  | 'homework_attendance'
+  | 'knowledge_remedial'
+  | 'retention_care';
+
+export interface CRMInteractionLog {
+  id: string;
+  created_at: string;
+  channel: CRMContactChannel;
+  template_category?: CRMTemplateCategory;
+  summary: string;
+  message_sent?: string;
+  parent_feedback?: string;
+  status_snapshot?: CRMCustomerStatus;
+  next_followup_date?: string;
+  created_by?: string;
+}
+
+export interface CRMMessageTemplate {
+  id: string;
+  category: CRMTemplateCategory;
+  title: string;
+  description: string;
+  body: string;
+  isCustom?: boolean;
+}
+
 export interface Student {
   id?: string;
   full_name: string;
@@ -58,6 +91,14 @@ export interface Student {
   note?: string;
   status: StudentStatus;
   leave_reason?: string;
+  // CRM & Customer Experience Fields (persisted via Supabase JSONB & Dexie)
+  crm_status?: CRMCustomerStatus;
+  crm_status_reason?: string;
+  crm_status_updated_at?: string;
+  crm_last_contacted_at?: string;
+  crm_next_followup_date?: string; // YYYY-MM-DD
+  crm_parent_notes?: string;
+  crm_interactions?: CRMInteractionLog[];
   is_demo?: boolean;
   created_at: string;
   updated_at: string;
@@ -256,6 +297,7 @@ export interface Settings {
     remedial: WarningRuleConfig;
   };
   pronoun_config: PronounConfig;
+  crm_message_templates?: CRMMessageTemplate[];
   theme: 'light' | 'dark';
   updated_at: string;
 }

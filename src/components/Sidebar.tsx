@@ -8,6 +8,7 @@ import {
   UserSquare2,
   FileSpreadsheet,
   Settings,
+  HeartHandshake,
 } from 'lucide-react';
 
 export type TabKey =
@@ -15,6 +16,7 @@ export type TabKey =
   | 'classes'
   | 'grade-entry'
   | 'warnings'
+  | 'crm'
   | 'knowledge-map'
   | 'students'
   | 'audit-reports'
@@ -24,9 +26,15 @@ interface SidebarProps {
   activeTab: TabKey;
   onTabChange: (tab: TabKey) => void;
   p1Count: number;
+  crmDueCount?: number;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onTabChange, p1Count }) => {
+export const Sidebar: React.FC<SidebarProps> = ({
+  activeTab,
+  onTabChange,
+  p1Count,
+  crmDueCount = 0,
+}) => {
   const navItems = [
     {
       key: 'dashboard' as TabKey,
@@ -49,6 +57,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onTabChange, p1Coun
       label: 'Cảnh báo Học tập',
       icon: ShieldAlert,
       count: p1Count,
+    },
+    {
+      key: 'crm' as TabKey,
+      label: 'CRM & CSKH Phụ huynh',
+      icon: HeartHandshake,
+      count: crmDueCount > 0 ? crmDueCount : undefined,
+      badge: crmDueCount === 0 ? '1-Click' : undefined,
     },
     {
       key: 'knowledge-map' as TabKey,

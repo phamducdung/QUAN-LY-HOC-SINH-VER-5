@@ -5,6 +5,7 @@ import { db, deleteStudent } from '../db/dexie';
 import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { StudentPerformanceTrend } from './student/StudentPerformanceTrend';
+import { StudentDuplicateAuditorModal } from './student/StudentDuplicateAuditorModal';
 import {
   ResponsiveContainer,
   LineChart,
@@ -72,6 +73,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
 
   // Add / Edit Modal
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isAuditorModalOpen, setIsAuditorModalOpen] = useState(false);
   const [editingStudent, setEditingStudent] = useState<Student | null>(null);
 
   // Form Inputs
@@ -539,24 +541,36 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
           </p>
         </div>
 
-        <button
-          onClick={() => {
-            if (!isAdmin && currentRole !== 'TA') {
-              alert('Chỉ Giáo viên chính hoặc Trợ giảng (TA) mới có quyền thêm học sinh mới!');
-              return;
-            }
-            handleOpenAddModal();
-          }}
-          className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-md shrink-0 ${
-            (isAdmin || currentRole === 'TA')
-              ? 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-600/20'
-              : 'bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-500 cursor-not-allowed'
-          }`}
-          title={(isAdmin || currentRole === 'TA') ? 'Thêm học sinh mới' : 'Chỉ Giáo viên hoặc Trợ giảng (TA) được thêm học sinh mới'}
-        >
-          {(isAdmin || currentRole === 'TA') ? <Plus className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
-          <span>Thêm Học Sinh Mới</span>
-        </button>
+        <div className="flex items-center flex-wrap gap-2.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => setIsAuditorModalOpen(true)}
+            className="px-3.5 py-2.5 rounded-xl bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/60 dark:hover:bg-amber-900/70 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800 text-xs font-bold transition-all flex items-center gap-2 cursor-pointer"
+            title="Quét và gộp các hồ sơ học sinh trùng tên hoặc lọc các học sinh ảo / đã nghỉ từ tháng 8-10"
+          >
+            <AlertTriangle className="w-4 h-4 text-amber-600" />
+            <span>Rà Soát Trùng Lặp & Học Sinh Ảo</span>
+          </button>
+
+          <button
+            onClick={() => {
+              if (!isAdmin && currentRole !== 'TA') {
+                alert('Chỉ Giáo viên chính hoặc Trợ giảng (TA) mới có quyền thêm học sinh mới!');
+                return;
+              }
+              handleOpenAddModal();
+            }}
+            className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-md shrink-0 cursor-pointer ${
+              (isAdmin || currentRole === 'TA')
+                ? 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-600/20'
+                : 'bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-500 cursor-not-allowed'
+            }`}
+            title={(isAdmin || currentRole === 'TA') ? 'Thêm học sinh mới' : 'Chỉ Giáo viên hoặc Trợ giảng (TA) được thêm học sinh mới'}
+          >
+            {(isAdmin || currentRole === 'TA') ? <Plus className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
+            <span>Thêm Học Sinh Mới</span>
+          </button>
+        </div>
       </div>
 
       {/* Sticky Filter Bar & Filters */}
@@ -2008,6 +2022,15 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
           </div>
         </div>
       )}
+
+      {/* Duplicate & Ghost Student Auditor Modal */}
+      <StudentDuplicateAuditorModal
+        isOpen={isAuditorModalOpen}
+        onClose={() => setIsAuditorModalOpen(false)}
+        students={students}
+        classes={classes}
+        onRefresh={onRefresh}
+      />
     </div>
   );
 };
