@@ -857,10 +857,15 @@ export async function runWarningScanForClass(
 
   const warningsToPut: Warning[] = [];
   const warningIdsToDelete: string[] = [];
+  const activeStudentIdSet = new Set(studentIds.map((id) => String(id)));
 
-  // Xóa mọi thẻ P3 cũ còn tồn đọng trong lớp này
+  // Xóa mọi thẻ P3 cũ VÀ mọi thẻ cảnh báo của học sinh đã Tạm nghỉ ('paused'), Nghỉ hẳn ('stopped') hoặc đã rời lớp
   classWarnings.forEach((w) => {
-    if (w.priority === 'P3' && w.id) {
+    if (!w.id) return;
+    const st = studentMap.get(String(w.student_id));
+    const isNotStudying = !st || st.status !== 'studying';
+    const hasLeftClass = !activeStudentIdSet.has(String(w.student_id));
+    if (w.priority === 'P3' || isNotStudying || hasLeftClass) {
       warningIdsToDelete.push(String(w.id));
     }
   });
@@ -868,30 +873,14 @@ export async function runWarningScanForClass(
   for (const studentId of studentIds) {
     const studentIdStr = String(studentId);
     const student = studentMap.get(studentIdStr);
-    if (!student) continue;
+    if (!student || student.status !== 'studying') {
+      continue;
+    }
 
     const canonicalId = `warn_${classIdStr}_${studentIdStr}`;
     const existingWarnings = (warningsByStudent.get(studentIdStr) || []).filter(
       (w) => w.priority !== 'P3'
     );
-
-    // Nếu học sinh đã Tạm nghỉ hoặc Nghỉ hẳn -> Tự động đóng mọi cảnh báo chưa xử lý
-    if (student.status !== 'studying') {
-      const activeWarnings = existingWarnings.filter((w) => !w.resolved);
-      for (const w of activeWarnings) {
-        const resolveAction = `Tự động đóng cảnh báo do học sinh chuyển trạng thái: ${
-          student.status === 'paused' ? 'Tạm nghỉ' : 'Nghỉ hẳn'
-        }`;
-        warningsToPut.push({
-          ...w,
-          resolved: true,
-          resolved_action: resolveAction,
-          resolved_at: now,
-          updated_at: now,
-        });
-      }
-      continue;
-    }
 
     // 1. Lấy mốc Giải quyết gần nhất để khóa toàn bộ các buổi học cũ trước khi Giải quyết
     const { afterSessionDate, excludeSessionIds } = getStudentResolutionAnchor(

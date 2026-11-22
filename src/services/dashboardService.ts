@@ -228,10 +228,14 @@ export function computeDashboardMetrics(
       ? Math.round((stoppedStudentsCount / activeStudentsCount) * 1000) / 10
       : 0;
 
-  // 3. Module 2: Smart Warning Engine (Thống kê theo SỐ HỌC SINH DUY NHẤT)
-  const unresolvedWarnings = warnings.filter((w) => !w.resolved);
+  // 3. Module 2: Smart Warning Engine (Thống kê theo SỐ HỌC SINH DUY NHẤT ĐANG HỌC)
+  const studyingStudentIdSet = new Set(
+    activeStudents.filter((s) => s.id).map((s) => String(s.id))
+  );
+  const studyingWarnings = warnings.filter((w) => studyingStudentIdSet.has(String(w.student_id)));
+  const unresolvedWarnings = studyingWarnings.filter((w) => !w.resolved);
   const totalActiveWarningsCount = unresolvedWarnings.length;
-  const resolvedWarningsCount = warnings.filter((w) => w.resolved).length;
+  const resolvedWarningsCount = studyingWarnings.filter((w) => w.resolved).length;
 
   // Gom theo student_id để xác định mức độ ưu tiên cao nhất của từng học sinh
   // Thứ tự ưu tiên: P1 (Khẩn cấp) > P2 (Theo dõi) > P3 (Nhắc nhở)
@@ -265,8 +269,8 @@ export function computeDashboardMetrics(
 
   const uniqueStudentsWithWarningsCount = studentHighestPriorityMap.size;
 
-  // Tuyên Dương & Bứt Phá (Thống kê theo SỐ HỌC SINH DUY NHẤT)
-  const praiseWarnings = warnings.filter((w) => w.priority === 'Praise');
+  // Tuyên Dương & Bứt Phá (Thống kê theo SỐ HỌC SINH DUY NHẤT ĐANG HỌC)
+  const praiseWarnings = studyingWarnings.filter((w) => w.priority === 'Praise');
   const praisedStudentIds = new Set<string>();
   const topScoreStudentIds = new Set<string>();
   const breakthroughStudentIds = new Set<string>();
@@ -603,17 +607,21 @@ export function computeInterClassBenchmarks(
   
   // Student counts map (active students only)
   const activeStudentCountMap = new Map<string, number>();
+  const activeClassStudentIds = new Set<string>();
   classStudents.forEach((cs) => {
     if (!cs.leave_date) {
       const count = activeStudentCountMap.get(cs.class_id) || 0;
       activeStudentCountMap.set(cs.class_id, count + 1);
+      activeClassStudentIds.add(String(cs.student_id));
     }
   });
 
-  // P1 warnings count per class
+  // P1 warnings count per class (chỉ tính học sinh đang học 'studying')
   const p1WarningsByClass = new Map<string, number>();
   warnings.forEach((w) => {
-    if (!w.resolved && w.priority === 'P1') {
+    const isActiveInClass =
+      activeClassStudentIds.size === 0 || activeClassStudentIds.has(String(w.student_id));
+    if (!w.resolved && w.priority === 'P1' && isActiveInClass) {
       const count = p1WarningsByClass.get(w.class_id) || 0;
       p1WarningsByClass.set(w.class_id, count + 1);
     }

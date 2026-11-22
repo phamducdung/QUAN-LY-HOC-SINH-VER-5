@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { Student, StudentStatus, ClassItem, StudentSession, Session, Warning, CRMCustomerStatus, CRMInteractionLog } from '../types';
-import { db, deleteStudent } from '../db/dexie';
+import { db, deleteStudent, pushSingleDocToFirestore } from '../db/dexie';
 import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { StudentPerformanceTrend } from './student/StudentPerformanceTrend';
@@ -418,6 +418,21 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
           await db.class_students.delete(link.id);
         }
       }
+
+      // Nếu học sinh chuyển sang Tạm nghỉ ('paused') hoặc Nghỉ hẳn ('stopped'),
+      // tự động xóa toàn bộ cảnh báo học tập của học sinh này khỏi hệ thống
+      if (statusInput !== 'studying') {
+        const allWarns = await db.warnings.toArray();
+        const studentWarnIds = allWarns
+          .filter((w) => String(w.student_id) === studentIdStr && w.id)
+          .map((w) => String(w.id!));
+        if (studentWarnIds.length > 0) {
+          await db.warnings.bulkDelete(studentWarnIds);
+          for (const delId of studentWarnIds) {
+            pushSingleDocToFirestore('warnings', delId, null, true).catch(() => {});
+          }
+        }
+      }
     } else {
       const addPayload = {
         full_name: fullName,
@@ -491,10 +506,21 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
       setAiDiagnosis(savedDiag[0].diagnosis_json);
     }
 
-    // Fetch student's warnings
+    // Fetch student's warnings (chỉ giữ cảnh báo nếu học sinh đang học 'studying')
     const allWarns = await db.warnings.toArray();
     const warns = allWarns.filter((w) => String(w.student_id) === stIdStr);
-    setStudentWarnings(warns);
+    if (st.status !== 'studying') {
+      const warnIds = warns.map((w) => String(w.id || '')).filter(Boolean);
+      if (warnIds.length > 0) {
+        await db.warnings.bulkDelete(warnIds);
+        for (const delId of warnIds) {
+          pushSingleDocToFirestore('warnings', delId, null, true).catch(() => {});
+        }
+      }
+      setStudentWarnings([]);
+    } else {
+      setStudentWarnings(warns);
+    }
   };
 
   const handleTriggerAiDiagnosis = async () => {

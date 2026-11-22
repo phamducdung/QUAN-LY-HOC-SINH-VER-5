@@ -96,7 +96,13 @@ export default function App() {
   const classes = useLiveQuery(() => db.classes.toArray()) ?? (EMPTY_ARRAY as ClassItem[]);
   const rawStudents = useLiveQuery(() => db.students.toArray()) ?? (EMPTY_ARRAY as Student[]);
   const students = React.useMemo(() => sortStudentsByName(rawStudents), [rawStudents]);
-  const warnings = useLiveQuery(() => db.warnings.toArray()) ?? (EMPTY_ARRAY as Warning[]);
+  const rawWarnings = useLiveQuery(() => db.warnings.toArray()) ?? (EMPTY_ARRAY as Warning[]);
+  const warnings = React.useMemo(() => {
+    const studyingIds = new Set(
+      students.filter((s) => s.status === 'studying' && s.id).map((s) => String(s.id))
+    );
+    return rawWarnings.filter((w) => studyingIds.has(String(w.student_id)));
+  }, [rawWarnings, students]);
   const knowledgeTags =
     useLiveQuery(() => db.knowledge_tags.toArray()) ?? (EMPTY_ARRAY as KnowledgeTag[]);
 

@@ -18,12 +18,16 @@ export const UrgentWarningsCard: React.FC<UrgentWarningsCardProps> = ({
   onResolveWarning,
 }) => {
   const studentMap = new Map<string, Student>();
-  students.forEach((s) => s.id && studentMap.set(s.id, s));
+  students.forEach((s) => s.id && studentMap.set(String(s.id), s));
 
   const classMap = new Map<string, ClassItem>();
-  classes.forEach((c) => c.id && classMap.set(c.id, c));
+  classes.forEach((c) => c.id && classMap.set(String(c.id), c));
 
-  const unresolvedWarnings = warnings.filter((w) => !w.resolved);
+  const unresolvedWarnings = warnings.filter((w) => {
+    if (w.resolved) return false;
+    const st = studentMap.get(String(w.student_id));
+    return st && st.status === 'studying';
+  });
   const p1Warnings = unresolvedWarnings.filter((w) => w.priority === 'P1');
   const p2Warnings = unresolvedWarnings.filter((w) => w.priority === 'P2');
   const p3Warnings = unresolvedWarnings.filter((w) => w.priority === 'P3');

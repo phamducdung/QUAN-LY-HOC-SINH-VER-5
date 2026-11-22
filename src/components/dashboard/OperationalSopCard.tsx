@@ -98,9 +98,20 @@ export const OperationalSopCard: React.FC<OperationalSopCardProps> = ({
     [sessions, todayKey]
   );
 
+  const studyingStudentIds = useMemo(
+    () => new Set(students.filter((s) => s.status === 'studying' && s.id).map((s) => String(s.id))),
+    [students]
+  );
+
   const unresolvedWarnings = useMemo(
-    () => warnings.filter((w) => !w.resolved && (w.priority === 'P1' || w.priority === 'P2')),
-    [warnings]
+    () =>
+      warnings.filter(
+        (w) =>
+          !w.resolved &&
+          (w.priority === 'P1' || w.priority === 'P2') &&
+          studyingStudentIds.has(String(w.student_id))
+      ),
+    [warnings, studyingStudentIds]
   );
   const p1Count = useMemo(
     () => unresolvedWarnings.filter((w) => w.priority === 'P1').length,

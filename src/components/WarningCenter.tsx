@@ -11,7 +11,7 @@ import {
   CRMInteractionLog,
   PronounConfig,
 } from '../types';
-import { db, pushBatchDocsToFirestore } from '../db/dexie';
+import { db, pushBatchDocsToFirestore, pushSingleDocToFirestore } from '../db/dexie';
 import { logAudit } from '../utils/auditLogger';
 import { exportCycleReportPDF } from '../utils/pdfGenerator';
 import { PrintableCycleReport } from './PrintableCycleReport';
@@ -205,7 +205,10 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
         (r) => String(r.class_id) === String(reportClassId) && !r.leave_date
       );
       const studentIdsInClass = new Set(classStudentRelations.map(cs => String(cs.student_id)));
-      const classStudents = students.filter(s => s.id && studentIdsInClass.has(String(s.id)));
+      // Loại bỏ hoàn toàn học sinh Tạm nghỉ ('paused') hoặc Nghỉ hẳn ('stopped') khỏi Báo cáo & Cảnh báo chu kỳ
+      const classStudents = students.filter(
+        (s) => s.id && s.status === 'studying' && studentIdsInClass.has(String(s.id))
+      );
 
       let totalAttendanceRateSum = 0;
       let totalHwSum = 0;
@@ -634,8 +637,37 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
     loadConfig();
   }, []);
 
-  // Auto-clean legacy multi-cards or P3 warnings once on mount so the list is immediately unified
+  // Tập ID các học sinh đang theo học thực tế (status === 'studying')
+  // Học sinh Tạm nghỉ ('paused') hoặc Nghỉ hẳn ('stopped') bị loại hoàn toàn khỏi Cảnh báo học tập
+  const studyingStudentIdSet = React.useMemo(
+    () =>
+      new Set(
+        students
+          .filter((s) => s.status === 'studying' && s.id !== undefined)
+          .map((s) => String(s.id))
+      ),
+    [students]
+  );
+
+  // Tự động dọn sạch các thẻ cảnh báo của học sinh đã Tạm nghỉ / Nghỉ hẳn, hoặc thẻ P3 / thẻ lẻ cũ
   useEffect(() => {
+    if (students.length === 0) return;
+
+    const inactiveStudentWarningIds = warnings
+      .filter((w) => w.id && !studyingStudentIdSet.has(String(w.student_id)))
+      .map((w) => String(w.id!));
+
+    if (inactiveStudentWarningIds.length > 0) {
+      (async () => {
+        await db.warnings.bulkDelete(inactiveStudentWarningIds);
+        for (const delId of inactiveStudentWarningIds) {
+          await pushSingleDocToFirestore('warnings', delId, null, true);
+        }
+        onRefresh();
+      })();
+      return;
+    }
+
     if (hasAutoCleanedRef.current || classes.length === 0) return;
     const hasLegacyP3OrMultiCards = (() => {
       const seenActive = new Set<string>();
@@ -662,7 +694,7 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
         onRefresh();
       })();
     }
-  }, [warnings, classes]);
+  }, [warnings, classes, students, studyingStudentIdSet]);
 
   // Modal State for Resolve Warning
   const [resolvingWarning, setResolvingWarning] = useState<Warning | null>(null);
@@ -749,9 +781,10 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
     await pushBatchDocsToFirestore('students', [updatedStudent]);
   };
 
-  // Lọc danh sách cảnh báo: Loại bỏ hoàn toàn P3 và đảm bảo mỗi Học sinh / Lớp chỉ hiển thị 1 thẻ hợp nhất ưu tiên cao nhất
+  // Lọc danh sách cảnh báo: Loại bỏ hoàn toàn học sinh Tạm nghỉ ('paused') / Nghỉ hẳn ('stopped'), thẻ P3 và đảm bảo mỗi Học sinh / Lớp chỉ hiển thị 1 thẻ hợp nhất
   const filteredWarnings = (() => {
     const baseList = warnings.filter((w) => {
+      if (!studyingStudentIdSet.has(String(w.student_id))) return false;
       if (w.priority === 'P3') return false;
       if (statusFilter === 'unresolved' && w.resolved) return false;
       if (statusFilter === 'resolved' && !w.resolved) return false;
@@ -792,11 +825,12 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
     });
   })();
 
-  // Đếm số lượng thẻ hợp nhất chưa xử lý theo từng nhóm
+  // Đếm số lượng thẻ hợp nhất chưa xử lý theo từng nhóm (Chỉ tính học sinh Đang học - 'studying')
   const activeUnifiedCounts = (() => {
     const map = new Map<string, Warning>();
     const rankPriority = (p: string) => (p === 'P1' ? 3 : p === 'P2' ? 2 : 1);
     warnings.forEach((w) => {
+      if (!studyingStudentIdSet.has(String(w.student_id))) return;
       if (w.resolved || w.priority === 'P3') return;
       const key = `${w.class_id}__${w.student_id}`;
       const ex = map.get(key);
