@@ -19,6 +19,7 @@
     "@vitejs/plugin-react": "^5.0.4",
     "dexie": "^4.4.5",
     "dexie-react-hooks": "^4.4.0",
+    "docx": "^9.16.0",
     "dotenv": "^17.2.3",
     "drizzle-kit": "^0.31.11",
     "drizzle-orm": "^0.45.4",

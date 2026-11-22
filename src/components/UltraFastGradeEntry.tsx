@@ -3,16 +3,6 @@ import * as XLSX from 'xlsx';
 import { toPng } from 'html-to-image';
 import { jsPDF } from 'jspdf';
 import { useLiveQuery } from 'dexie-react-hooks';
-import {
-  ResponsiveContainer,
-  RadarChart,
-  PolarGrid,
-  PolarAngleAxis,
-  PolarRadiusAxis,
-  Radar,
-  Tooltip,
-  Legend,
-} from 'recharts';
 import { ClassItem, Session, Student, StudentSession, AttendanceStatus, KnowledgeTag, Warning } from '../types';
 import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { markUserActivity } from '../services/syncService';
@@ -21,6 +11,7 @@ import { logAudit } from '../utils/auditLogger';
 import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
 import { computeGradeDiffs, logDetailedGradeAudit } from '../utils/gradeHistoryLogger';
 import { SessionHistoryModal } from './audit/SessionHistoryModal';
+import { PostSessionCustomerCareModal } from './reports/PostSessionCustomerCareModal';
 import { exportSessionReportPDF } from '../utils/pdfGenerator';
 import { recalculateKnowledgeResultsForClass } from '../utils/knowledgeEngine';
 import { runWarningScanForClass } from '../utils/warningEngine';
@@ -68,6 +59,9 @@ import {
   Zap,
   Loader2,
   Wand2,
+  HeartHandshake,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
 interface UltraFastGradeEntryProps {
@@ -290,8 +284,13 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   const [printIncludePrevTest, setPrintIncludePrevTest] = useState<boolean>(true);
   const [printIncludeCurrentTest, setPrintIncludeCurrentTest] = useState<boolean>(true);
 
-  // Active view tab: 'entry', 'knowledge_map', or 'gradebook'
-  const [activeTab, setActiveTab] = useState<'entry' | 'knowledge_map' | 'gradebook'>('entry');
+  // Active view tab: 'entry' or 'gradebook' (Removed mock Radar chart tab)
+  const [activeTab, setActiveTab] = useState<'entry' | 'gradebook'>('entry');
+  const [isPresetPaletteExpanded, setIsPresetPaletteExpanded] = useState<boolean>(false);
+  const [isPostSessionCSKHOpen, setIsPostSessionCSKHOpen] = useState<boolean>(false);
+  const [postSessionCSKHInitialTab, setPostSessionCSKHInitialTab] = useState<
+    'group_zalo' | 'reminder_list' | 'praise_list'
+  >('group_zalo');
 
   const selectedSession = useMemo(
     () => sessions.find((s) => String(s.id) === String(selectedSessionId)),
@@ -652,9 +651,6 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 
   // Knowledge Tag for current session
   const [currentKnowledgeTag, setCurrentKnowledgeTag] = useState<string>('');
-
-  // Selected Student for Radar Chart in Knowledge Map
-  const [selectedRadarStudentId, setSelectedRadarStudentId] = useState<string | number | 'class_avg'>('class_avg');
 
   // History & Audit Rollback Modal
   const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
@@ -1938,64 +1934,160 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     );
   };
 
-  // Generate Radar Data for Knowledge Map
-  const generateRadarData = () => {
-    const topics = [
-      'Căn thức & Rút gọn',
-      'Hệ thức lượng',
-      'Tứ giác nội tiếp',
-      'Đường tròn & Tiếp tuyến',
-      'Phương trình bậc 2 & Vi-ét',
-      'Hằng đẳng thức & BĐS',
-    ];
-
-    if (selectedRadarStudentId === 'class_avg') {
-      // Average across class
-      return topics.map((topic, i) => {
-        const scores = (Object.values(studentSessions) as StudentSession[])
-          .map((ss) => ss.test_score)
-          .filter((s): s is number => typeof s === 'number' && s >= 0);
-        const avg = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 7.5;
-        // Mock variations per topic for realistic display
-        const val = Math.min(10, Math.max(4, avg + (i % 2 === 0 ? 0.8 : -0.6)));
-        return {
-          topic,
-          'Mức độ làm chủ': parseFloat(val.toFixed(1)),
-          'Mục tiêu Lớp 10': 8.5,
-        };
-      });
-    } else {
-      const rec = studentSessions[selectedRadarStudentId as number];
-      const hwScore = rec?.homework_score || 7.0;
-      const testScore = rec?.test_score || 6.5;
-
-      return topics.map((topic, i) => {
-        const val = Math.min(10, Math.max(3, (hwScore * 0.4 + testScore * 0.6) + (i % 3 === 0 ? 1.0 : -0.8)));
-        return {
-          topic,
-          'Mức độ làm chủ': parseFloat(val.toFixed(1)),
-          'Mục tiêu Lớp 10': 8.5,
-        };
-      });
+  // Compute real-time Post-Session CSKH counts (Reminders vs Praise) & Dirty Unsaved Edits count
+  const cskhSessionSummary = useMemo(() => {
+    if (!selectedSession) {
+      return { reminderCount: 0, praiseCount: 0 };
     }
-  };
+    let reminderCount = 0;
+    let praiseCount = 0;
+
+    students.forEach((st) => {
+      const stId = String(st.id);
+      const rec = studentSessions[stId];
+      const prevRec = previousSession ? prevStudentSessions[stId] : undefined;
+      if (!rec) return;
+
+      const att = rec.attendance || 'present';
+      const isAbsentOrLate = att !== 'present';
+      const isHwExempt = !!(rec.exempt || rec.exempt_homework);
+      const isTestExempt = !!(rec.exempt || rec.exempt_test);
+
+      const hasHwIssue =
+        selectedSession.has_homework !== false &&
+        !isHwExempt &&
+        !att.startsWith('absent') &&
+        (rec.homework_submitted === false ||
+          rec.late_submit === true ||
+          (typeof rec.homework_score === 'number' && rec.homework_score < 5));
+
+      const hasTestIssue =
+        selectedSession.has_test !== false &&
+        !isTestExempt &&
+        !att.startsWith('absent') &&
+        typeof rec.test_score === 'number' &&
+        rec.test_score < 5;
+
+      const hasPrevTestIssue =
+        previousSession &&
+        prevRec &&
+        !prevRec.exempt &&
+        !prevRec.exempt_test &&
+        typeof prevRec.test_score === 'number' &&
+        prevRec.test_score < 5 &&
+        (rec.test_score === undefined || rec.test_score === null);
+
+      if (isAbsentOrLate || hasHwIssue || hasTestIssue || hasPrevTestIssue) {
+        reminderCount++;
+      } else if (!att.startsWith('absent')) {
+        const highTest =
+          selectedSession.has_test !== false &&
+          !isTestExempt &&
+          typeof rec.test_score === 'number' &&
+          rec.test_score >= 8.0;
+        const highHw =
+          selectedSession.has_homework !== false &&
+          !isHwExempt &&
+          typeof rec.homework_score === 'number' &&
+          rec.homework_score >= 8.5;
+        const strongProgress =
+          typeof rec.test_score === 'number' &&
+          rec.test_score >= 6.5 &&
+          typeof prevRec?.test_score === 'number' &&
+          rec.test_score - prevRec.test_score >= 1.0;
+
+        if (highTest || highHw || strongProgress) {
+          praiseCount++;
+        }
+      }
+    });
+
+    return { reminderCount, praiseCount };
+  }, [students, studentSessions, prevStudentSessions, selectedSession, previousSession]);
+
+  const dirtyGradesCount = useMemo(() => {
+    const initialMap = initialStudentSessionsRef.current;
+    let count = 0;
+    (Object.values(studentSessions) as StudentSession[]).forEach((rec) => {
+      if (!rec) return;
+      const initRec = initialMap[rec.student_id];
+      if (!initRec) return;
+      const changed =
+        rec.attendance !== initRec.attendance ||
+        rec.homework_score !== initRec.homework_score ||
+        rec.test_score !== initRec.test_score ||
+        rec.homework_submitted !== initRec.homework_submitted ||
+        rec.late_submit !== initRec.late_submit ||
+        rec.makeup_test !== initRec.makeup_test ||
+        rec.exempt !== initRec.exempt ||
+        rec.exempt_homework !== initRec.exempt_homework ||
+        rec.exempt_test !== initRec.exempt_test ||
+        (rec.custom_comment || '') !== (initRec.custom_comment || '') ||
+        JSON.stringify(rec.quick_preset_comments || []) !==
+          JSON.stringify(initRec.quick_preset_comments || []);
+      if (changed) count++;
+    });
+    return count;
+  }, [studentSessions]);
 
   const activeStudentForPreset = students[activeRow];
 
+  const handleOpenPostSessionCSKH = (
+    tab: 'group_zalo' | 'reminder_list' | 'praise_list' = 'group_zalo'
+  ) => {
+    setPostSessionCSKHInitialTab(tab);
+    setIsPostSessionCSKHOpen(true);
+  };
+
   return (
-    <div id="ultra-fast-grade-entry-container" className="space-y-6">
+    <div id="ultra-fast-grade-entry-container" className="space-y-5">
       {/* Top Navigation & Class / Session Toolbar */}
       <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div>
             <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <Keyboard className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
-              <span>Nhập Điểm Tốc Độ Cao</span>
+              <span>Nhập Điểm &amp; Chăm Sóc Phụ Huynh Sau Buổi Học</span>
             </h2>
           </div>
 
           {/* Action Buttons */}
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={handleSaveAllGrades}
+              disabled={!selectedSessionId || syncStatus === 'saving'}
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm disabled:opacity-50 ${
+                dirtyGradesCount > 0
+                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white ring-2 ring-emerald-400/50'
+                  : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100'
+              }`}
+              title="Lưu toàn bộ điểm số và nhận xét của buổi học này"
+            >
+              <Save className="w-4 h-4" />
+              <span>
+                {syncStatus === 'saving'
+                  ? 'Đang lưu...'
+                  : dirtyGradesCount > 0
+                  ? `Lưu Điểm (${dirtyGradesCount} thay đổi)`
+                  : 'Lưu Điểm'}
+              </span>
+            </button>
+
+            <button
+              onClick={() => handleOpenPostSessionCSKH('group_zalo')}
+              disabled={!selectedSessionId}
+              className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm shadow-indigo-600/20 disabled:opacity-50"
+              title="Mở Trạm CSKH Sau Buổi Học: Gửi Zalo Nhóm Lớp, Nhắc nhở HS vắng/điểm thấp & Khen ngợi HS điểm cao"
+            >
+              <HeartHandshake className="w-4 h-4" />
+              <span>Trạm CSKH Sau Buổi Học</span>
+              {(cskhSessionSummary.reminderCount > 0 || cskhSessionSummary.praiseCount > 0) && (
+                <span className="px-1.5 py-0.2 rounded-md bg-white/20 text-white text-[10px] font-black">
+                  {cskhSessionSummary.reminderCount} nhắc • {cskhSessionSummary.praiseCount} khen
+                </span>
+              )}
+            </button>
+
             <button
               onClick={() => setIsHistoryModalOpen(true)}
               disabled={!selectedSessionId}
@@ -2113,7 +2205,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       </div>
 
       {/* Main View Mode Selector Tabs */}
-      <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-2">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-2">
         <div className="flex items-center gap-2">
           <button
             onClick={() => setActiveTab('entry')}
@@ -2128,18 +2220,6 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
           </button>
 
           <button
-            onClick={() => setActiveTab('knowledge_map')}
-            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
-              activeTab === 'knowledge_map'
-                ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/20'
-                : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
-            }`}
-          >
-            <Target className="w-4 h-4" />
-            <span>2. Bản Đồ Kiến Thức (Radar Chart)</span>
-          </button>
-
-          <button
             onClick={() => setActiveTab('gradebook')}
             className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
               activeTab === 'gradebook'
@@ -2148,14 +2228,22 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
             }`}
           >
             <FileSpreadsheet className="w-4 h-4" />
-            <span>3. Bảng Điểm Tổng Hợp & Miễn Trừ</span>
+            <span>2. Bảng Điểm Tổng Hợp &amp; Miễn Trừ</span>
           </button>
         </div>
 
         {saveSuccessMsg && (
-          <div className="px-3 py-1.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-200 border border-emerald-200 dark:border-emerald-800/80 rounded-xl text-xs font-bold flex items-center gap-1.5 animate-bounce">
-            <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-            <span>Đã lưu thành công dữ liệu vào cơ sở dữ liệu IndexedDB!</span>
+          <div className="px-3.5 py-1.5 bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-200 border border-emerald-200 dark:border-emerald-800 rounded-xl text-xs font-bold flex flex-wrap items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+            <span>Đã lưu điểm thành công!</span>
+            <button
+              type="button"
+              onClick={() => handleOpenPostSessionCSKH('group_zalo')}
+              className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-extrabold transition-all flex items-center gap-1 shadow-xs"
+            >
+              <HeartHandshake className="w-3.5 h-3.5" />
+              <span>Mở Trạm CSKH Gửi Báo Cáo Zalo Ngay</span>
+            </button>
           </div>
         )}
       </div>
@@ -2249,225 +2337,215 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
               </div>
             </div>
 
-            <div className="p-3.5 bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
-              <div>
-                <div className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">Trạng thái Sync</div>
-                <div className="text-xs font-bold mt-1 flex items-center gap-1.5">
-                  {syncStatus === 'saving' ? (
-                    <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Đang đồng bộ Cloud...
-                    </span>
-                  ) : syncStatus === 'synced' ? (
-                    <span className="text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Đã lưu cục bộ IndexedDB {lastSyncedTime && `(${lastSyncedTime})`}
-                    </span>
-                  ) : (
-                    <span className="text-slate-500 flex items-center gap-1">
-                      <Clock className="w-3.5 h-3.5" /> Lưu Cục bộ (Offline)
-                    </span>
-                  )}
+            <div className="p-3.5 bg-indigo-50/70 dark:bg-indigo-950/30 rounded-2xl border border-indigo-200 dark:border-indigo-800/80 shadow-sm flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] font-extrabold text-indigo-700 dark:text-indigo-300 uppercase tracking-wider">
+                  Trạm CSKH Buổi Này
                 </div>
+                <HeartHandshake className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
               </div>
-              <div className={`p-2 rounded-xl ${
-                syncStatus === 'synced'
-                  ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400'
-                  : syncStatus === 'saving'
-                  ? 'bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400'
-                  : 'bg-slate-100 dark:bg-slate-800 text-slate-500'
-              }`}>
-                <Zap className="w-5 h-5" />
+              <div className="flex items-center gap-1.5 mt-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleOpenPostSessionCSKH('reminder_list')}
+                  className="flex-1 px-2 py-1 rounded-lg bg-amber-100/90 hover:bg-amber-200 text-amber-900 dark:bg-amber-950/80 dark:text-amber-300 text-[10.5px] font-extrabold text-center transition-all"
+                  title="Xem danh sách học sinh Vắng / Thiếu BTVN / Điểm KT < 5 cần nhắn Phụ huynh"
+                >
+                  Nhắc: {cskhSessionSummary.reminderCount} HS
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOpenPostSessionCSKH('praise_list')}
+                  className="flex-1 px-2 py-1 rounded-lg bg-emerald-100/90 hover:bg-emerald-200 text-emerald-900 dark:bg-emerald-950/80 dark:text-emerald-300 text-[10.5px] font-extrabold text-center transition-all"
+                  title="Xem danh sách học sinh Điểm cao / Tiến bộ cần gửi thư khen ngợi"
+                >
+                  Khen: {cskhSessionSummary.praiseCount} HS
+                </button>
               </div>
             </div>
           </div>
 
-          {/* Quick Preset Comments Header bar for Middle School Math */}
-          <div className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-3">
-            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
+          {/* Collapsible Smart Preset Palette for Middle School Math */}
+          <div className="bg-white dark:bg-slate-900 px-4 py-2.5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 <Sparkles className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                <h3 className="text-xs font-bold text-slate-900 dark:text-slate-100 uppercase tracking-wider">
-                  Bảng Nhận Xét Ngữ Cảnh Tự Động (Smart Preset Palette)
-                </h3>
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  Bảng Chip Nhận Xét Nhanh (1-Click Preset)
+                </span>
                 {activeStudentForPreset && (
-                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">
-                    HS #{activeRow + 1}: {activeStudentForPreset.full_name}
+                  <span className="px-2.5 py-0.5 rounded-md text-[10px] font-extrabold bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">
+                    Đang chọn HS #{activeRow + 1}: {activeStudentForPreset.full_name}
                   </span>
                 )}
+                <span className="text-[11px] text-slate-400 hidden sm:inline">
+                  (Mẹo: Gõ trực tiếp dấu <kbd className="px-1 py-0.2 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded font-mono font-bold text-indigo-600">/</kbd> tại ô Nhận xét để chèn nhanh)
+                </span>
               </div>
 
-              {/* Category Selector & Customization Controls */}
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
-                  <button
-                    onClick={() => setActivePresetCategory('smart_ai')}
-                    className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
-                      activePresetCategory === 'smart_ai'
-                        ? 'bg-emerald-600 text-white shadow-sm font-extrabold'
-                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                    }`}
-                  >
-                    <Zap className="w-3.5 h-3.5 text-amber-300" />
-                    <span>Gợi Ý Ngữ Cảnh AI</span>
-                  </button>
-
-                  <button
-                    onClick={() => setActivePresetCategory('session')}
-                    className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
-                      activePresetCategory === 'session'
-                        ? 'bg-amber-600 text-white shadow-sm font-extrabold'
-                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                    }`}
-                  >
-                    <Tag className="w-3.5 h-3.5" />
-                    <span>BTVN ({bTvnPresets.length})</span>
-                  </button>
-
-                  <button
-                    onClick={() => setActivePresetCategory('test')}
-                    className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
-                      activePresetCategory === 'test'
-                        ? 'bg-indigo-600 text-white shadow-sm font-extrabold'
-                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                    }`}
-                  >
-                    <Award className="w-3.5 h-3.5" />
-                    <span>Bài Kiểm Tra ({testPresets.length})</span>
-                  </button>
-                </div>
-
-                {/* Inline Controls */}
-                <button
-                  onClick={() => setIsAddingPresetInline(!isAddingPresetInline)}
-                  className="px-2.5 py-1.5 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 rounded-xl text-xs font-bold hover:bg-emerald-100 transition-all flex items-center gap-1"
-                  title="Thêm nhận xét nhanh mới cho buổi học / danh mục đang chọn"
-                >
-                  <PlusCircle className="w-3.5 h-3.5" />
-                  <span>Thêm Mới</span>
-                </button>
-
-                <button
-                  onClick={() => setIsDeleteModeActive(!isDeleteModeActive)}
-                  className={`px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1 border ${
-                    isDeleteModeActive
-                      ? 'bg-rose-600 text-white border-rose-600 shadow-sm'
-                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-200'
-                  }`}
-                  title="Bật/Tắt chế độ xóa bớt nhận xét"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>{isDeleteModeActive ? 'Xong Xóa' : 'Xóa Bớt'}</span>
-                </button>
-
-                <button
-                  onClick={() => setIsManagePresetsModalOpen(true)}
-                  className="p-1.5 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-emerald-600 rounded-xl border border-slate-200 dark:border-slate-700 transition-all"
-                  title="Tùy chỉnh toàn bộ bộ nhận xét"
-                >
-                  <SlidersHorizontal className="w-4 h-4" />
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => setIsPresetPaletteExpanded(!isPresetPaletteExpanded)}
+                className="px-3 py-1 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5"
+              >
+                {isPresetPaletteExpanded ? (
+                  <>
+                    <ChevronUp className="w-3.5 h-3.5" />
+                    <span>Thu gọn Bảng Chip</span>
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="w-3.5 h-3.5" />
+                    <span>Mở Bảng Chip Nhận Xét ({getCurrentActivePresetsList().length})</span>
+                  </>
+                )}
+              </button>
             </div>
 
-            {/* Inline Add Input */}
-            {isAddingPresetInline && (
-              <div className="p-2.5 bg-emerald-50/80 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-xl flex items-center gap-2 animate-fadeIn">
-                <span className="text-xs font-bold text-emerald-800 dark:text-emerald-300 whitespace-nowrap">
-                  Thêm nhận xét [{activePresetCategory === 'session' ? 'BTVN' : activePresetCategory === 'test' ? 'Bài Kiểm Tra' : 'Chung'}]:
-                </span>
-                <input
-                  type="text"
-                  value={newPresetTextInput}
-                  onChange={(e) => setNewPresetTextInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleAddPreset();
-                    if (e.key === 'Escape') setIsAddingPresetInline(false);
-                  }}
-                  placeholder="Gõ nhận xét tùy chỉnh cho buổi học..."
-                  className="flex-1 px-3 py-1 bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-700 rounded-lg text-xs text-slate-900 dark:text-slate-100 outline-none font-medium"
-                  autoFocus
-                />
-                <button
-                  onClick={() => handleAddPreset()}
-                  className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-all shadow-sm"
-                >
-                  Thêm
-                </button>
-                <button
-                  onClick={() => setIsAddingPresetInline(false)}
-                  className="p-1 text-slate-400 hover:text-slate-600"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+            {isPresetPaletteExpanded && (
+              <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+                    <button
+                      onClick={() => setActivePresetCategory('smart_ai')}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                        activePresetCategory === 'smart_ai'
+                          ? 'bg-emerald-600 text-white shadow-sm font-extrabold'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      <Zap className="w-3.5 h-3.5 text-amber-300" />
+                      <span>Gợi Ý Ngữ Cảnh AI</span>
+                    </button>
+
+                    <button
+                      onClick={() => setActivePresetCategory('session')}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                        activePresetCategory === 'session'
+                          ? 'bg-amber-600 text-white shadow-sm font-extrabold'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      <Tag className="w-3.5 h-3.5" />
+                      <span>BTVN ({bTvnPresets.length})</span>
+                    </button>
+
+                    <button
+                      onClick={() => setActivePresetCategory('test')}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                        activePresetCategory === 'test'
+                          ? 'bg-indigo-600 text-white shadow-sm font-extrabold'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      <Award className="w-3.5 h-3.5" />
+                      <span>Bài Kiểm Tra ({testPresets.length})</span>
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setIsAddingPresetInline(!isAddingPresetInline)}
+                      className="px-2.5 py-1.5 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 rounded-xl text-xs font-bold hover:bg-emerald-100 transition-all flex items-center gap-1"
+                    >
+                      <PlusCircle className="w-3.5 h-3.5" />
+                      <span>Thêm Mới</span>
+                    </button>
+
+                    <button
+                      onClick={() => setIsDeleteModeActive(!isDeleteModeActive)}
+                      className={`px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1 border ${
+                        isDeleteModeActive
+                          ? 'bg-rose-600 text-white border-rose-600 shadow-sm'
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-200'
+                      }`}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>{isDeleteModeActive ? 'Xong Xóa' : 'Xóa Bớt'}</span>
+                    </button>
+
+                    <button
+                      onClick={() => setIsManagePresetsModalOpen(true)}
+                      className="p-1.5 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-emerald-600 rounded-xl border border-slate-200 dark:border-slate-700 transition-all"
+                      title="Tùy chỉnh toàn bộ bộ nhận xét"
+                    >
+                      <SlidersHorizontal className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {isAddingPresetInline && (
+                  <div className="p-2.5 bg-emerald-50/80 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-xl flex items-center gap-2">
+                    <span className="text-xs font-bold text-emerald-800 dark:text-emerald-300 whitespace-nowrap">
+                      Thêm nhận xét [{activePresetCategory === 'session' ? 'BTVN' : activePresetCategory === 'test' ? 'Bài Kiểm Tra' : 'Chung'}]:
+                    </span>
+                    <input
+                      type="text"
+                      value={newPresetTextInput}
+                      onChange={(e) => setNewPresetTextInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleAddPreset();
+                        if (e.key === 'Escape') setIsAddingPresetInline(false);
+                      }}
+                      placeholder="Gõ nhận xét tùy chỉnh cho buổi học..."
+                      className="flex-1 px-3 py-1 bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-700 rounded-lg text-xs text-slate-900 dark:text-slate-100 outline-none font-medium"
+                      autoFocus
+                    />
+                    <button
+                      onClick={() => handleAddPreset()}
+                      className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-all shadow-sm"
+                    >
+                      Thêm
+                    </button>
+                    <button
+                      onClick={() => setIsAddingPresetInline(false)}
+                      className="p-1 text-slate-400 hover:text-slate-600"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-1.5">
+                  {getCurrentActivePresetsList().map((presetText) => {
+                    const currentRec = activeStudentForPreset
+                      ? studentSessions[activeStudentForPreset.id!]
+                      : null;
+                    const isSelected = currentRec?.quick_preset_comments?.includes(presetText);
+
+                    return (
+                      <div key={presetText} className="relative group inline-flex items-center">
+                        <button
+                          onClick={() => {
+                            if (isDeleteModeActive) {
+                              handleDeletePreset(presetText);
+                            } else if (activeStudentForPreset?.id) {
+                              handleTogglePresetComment(activeStudentForPreset.id, presetText);
+                            }
+                          }}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-medium transition-all flex items-center gap-1 ${
+                            isSelected
+                              ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30 font-bold'
+                              : isDeleteModeActive
+                              ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
+                              : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 hover:text-emerald-700'
+                          }`}
+                        >
+                          {isDeleteModeActive ? (
+                            <X className="w-3.5 h-3.5 text-rose-600" />
+                          ) : isSelected ? (
+                            <Check className="w-3.5 h-3.5" />
+                          ) : (
+                            <Plus className="w-3.5 h-3.5" />
+                          )}
+                          <span>{presetText}</span>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
-
-            {/* Presets Chips */}
-            <div className="flex flex-wrap gap-1.5 pt-1">
-              {getCurrentActivePresetsList().length === 0 ? (
-                <div className="text-xs text-slate-400 italic py-1 flex items-center gap-2">
-                  <span>Chưa có nhận xét riêng nào cho danh mục này. Bấm </span>
-                  <button
-                    onClick={() => setIsAddingPresetInline(true)}
-                    className="font-bold text-emerald-600 hover:underline inline-flex items-center gap-1"
-                  >
-                    <PlusCircle className="w-3.5 h-3.5" />
-                    <span>Thêm Mới</span>
-                  </button>
-                  <span> để tạo nhận xét nhanh cho buổi học này!</span>
-                </div>
-              ) : (
-                getCurrentActivePresetsList().map((presetText) => {
-                  const currentRec = activeStudentForPreset
-                    ? studentSessions[activeStudentForPreset.id!]
-                    : null;
-                  const isSelected = currentRec?.quick_preset_comments?.includes(presetText);
-
-                  return (
-                    <div key={presetText} className="relative group inline-flex items-center">
-                      <button
-                        onClick={() => {
-                          if (isDeleteModeActive) {
-                            handleDeletePreset(presetText);
-                          } else if (activeStudentForPreset?.id) {
-                            handleTogglePresetComment(activeStudentForPreset.id, presetText);
-                          }
-                        }}
-                        className={`px-3 py-1.5 rounded-xl text-xs font-medium transition-all flex items-center gap-1 ${
-                          isSelected
-                            ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30 font-bold'
-                            : isDeleteModeActive
-                            ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
-                            : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 hover:text-emerald-700'
-                        }`}
-                      >
-                        {isDeleteModeActive ? (
-                          <X className="w-3.5 h-3.5 text-rose-600" />
-                        ) : isSelected ? (
-                          <Check className="w-3.5 h-3.5" />
-                        ) : (
-                          <Plus className="w-3.5 h-3.5" />
-                        )}
-                        <span>{presetText}</span>
-                      </button>
-
-                      {/* Hover delete button when delete mode is off */}
-                      {!isDeleteModeActive && activePresetCategory !== 'smart_ai' && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeletePreset(presetText);
-                          }}
-                          className="opacity-0 group-hover:opacity-100 transition-opacity ml-0.5 p-1 text-slate-400 hover:text-rose-600"
-                          title="Xóa nhận xét này"
-                        >
-                          <X className="w-3 h-3" />
-                        </button>
-                      )}
-                    </div>
-                  );
-                })
-              )}
-            </div>
           </div>
 
           {/* Focus Filters & Search Bar */}
@@ -2704,98 +2782,37 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                 Sĩ số: <strong className="text-slate-900 dark:text-slate-100">{students.length}</strong> học sinh | Buổi học: <strong className="text-emerald-600">{selectedSession?.lesson_title || 'Chưa chọn'}</strong>
               </div>
 
-              <button
-                id="btn-save-grades-bottom"
-                onClick={handleSaveAllGrades}
-                disabled={!selectedSessionId}
-                className="w-full sm:w-auto px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-md shadow-emerald-600/20 disabled:opacity-50"
-              >
-                <Save className="w-4 h-4" />
-                <span>Hoàn Tất & Lưu Điểm</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* TAB 2: KNOWLEDGE MAP RADAR CHART */}
-      {activeTab === 'knowledge_map' && (
-        <div className="space-y-6">
-          <div className="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-6">
-            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-              <div>
-                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                  <Award className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
-                  <span>Chẩn Đoán Đa Chiều Năng Lực Môn Toán THCS</span>
-                </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Biểu đồ Radar chẩn đoán độ vững các chuyên đề Toán (Căn thức, Tứ giác nội tiếp, Vi-ét...) dựa trên điểm kiểm tra tích lũy.
-                </p>
-              </div>
-
-              {/* Student Filter Selector for Radar */}
-              <div className="w-full sm:w-auto">
-                <label className="block text-[10px] font-extrabold uppercase text-slate-400 mb-1">
-                  Chọn Học Sinh Phân Tích
-                </label>
-                <select
-                  value={selectedRadarStudentId}
-                  onChange={(e) =>
-                    setSelectedRadarStudentId(
-                      e.target.value === 'class_avg' ? 'class_avg' : e.target.value
-                    )
-                  }
-                  className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-bold text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
+                <button
+                  type="button"
+                  onClick={() => handleOpenPostSessionCSKH('group_zalo')}
+                  disabled={!selectedSessionId}
+                  className="px-4 py-2.5 bg-indigo-50 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-100 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-50"
                 >
-                  <option value="class_avg">📊 Trung Bình Toàn Lớp</option>
-                  {students.map((st, idx) => (
-                    <option key={st.id ? `${st.id}-${idx}` : idx} value={st.id}>
-                      👤 {st.full_name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
+                  <HeartHandshake className="w-4 h-4" />
+                  <span>Mở Trạm CSKH Sau Buổi Học</span>
+                </button>
 
-            {/* Radar Chart Display */}
-            <div className="h-[380px] w-full pt-4">
-              <ResponsiveContainer width="100%" height="100%">
-                <RadarChart cx="50%" cy="50%" outerRadius="80%" data={generateRadarData()}>
-                  <PolarGrid stroke="#e2e8f0" />
-                  <PolarAngleAxis dataKey="topic" tick={{ fill: '#64748b', fontSize: 11, fontWeight: 600 }} />
-                  <PolarRadiusAxis angle={30} domain={[0, 10]} stroke="#cbd5e1" />
-                  <Radar
-                    name="Mức độ làm chủ"
-                    dataKey="Mức độ làm chủ"
-                    stroke="#10b981"
-                    fill="#10b981"
-                    fillOpacity={0.4}
-                  />
-                  <Radar
-                    name="Mục tiêu Lớp 10"
-                    dataKey="Mục tiêu Lớp 10"
-                    stroke="#0284c7"
-                    fill="#0284c7"
-                    fillOpacity={0.1}
-                    strokeDasharray="4 4"
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: '#0f172a',
-                      borderRadius: '12px',
-                      color: '#fff',
-                      fontSize: '12px',
-                    }}
-                  />
-                  <Legend />
-                </RadarChart>
-              </ResponsiveContainer>
+                <button
+                  id="btn-save-grades-bottom"
+                  onClick={handleSaveAllGrades}
+                  disabled={!selectedSessionId}
+                  className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-md shadow-emerald-600/20 disabled:opacity-50"
+                >
+                  <Save className="w-4 h-4" />
+                  <span>
+                    {dirtyGradesCount > 0
+                      ? `Hoàn Tất & Lưu Điểm (${dirtyGradesCount} thay đổi)`
+                      : 'Hoàn Tất & Lưu Điểm'}
+                  </span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* TAB 3: GRADEBOOK & CYCLE ANALYTICS */}
+      {/* TAB 2: GRADEBOOK & CYCLE ANALYTICS */}
       {activeTab === 'gradebook' && (
         <GradebookView
           currentClass={currentClass}
@@ -3558,6 +3575,24 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
           onRefreshData();
         }}
       />
+
+      {/* POST-SESSION CUSTOMER CARE HUB 1-CLICK MODAL */}
+      {currentClass && selectedSession && (
+        <PostSessionCustomerCareModal
+          isOpen={isPostSessionCSKHOpen}
+          onClose={() => setIsPostSessionCSKHOpen(false)}
+          currentClass={currentClass}
+          selectedSession={selectedSession}
+          previousSession={previousSession}
+          allClassSessions={sessions}
+          students={students}
+          studentSessions={studentSessions}
+          prevStudentSessions={prevStudentSessions}
+          allStudentSessions={liveStudentSessions}
+          sessionStats={sessionStats}
+          initialTab={postSessionCSKHInitialTab}
+        />
+      )}
     </div>
   );
 };

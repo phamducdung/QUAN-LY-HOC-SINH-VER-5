@@ -69,6 +69,39 @@ async function startServer() {
     }
   });
 
+  // Helper: Call Gemini API with primary model gemini-3.8-flash and automatic fallback
+  async function generateWithModelFallback(
+    ai: GoogleGenAI,
+    contents: any,
+    temperature: number = 0.3
+  ): Promise<string> {
+    const candidateModels = [
+      "gemini-3.8-flash",
+      "gemini-4-hydrogen",
+      "gemini-3.1-flash-lite",
+    ];
+    let lastErr: any = null;
+    for (const modelName of candidateModels) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents,
+          config: {
+            responseMimeType: "application/json",
+            temperature,
+          },
+        });
+        if (response && response.text) {
+          return response.text;
+        }
+      } catch (err: any) {
+        lastErr = err;
+        console.warn(`[Gemini Fallback] Model ${modelName} error:`, err?.message || err);
+      }
+    }
+    throw lastErr || new Error("Không thể kết nối với Gemini AI.");
+  }
+
   // Module 4: Server-side Gemini AI Engine - AI Personalized Comments for Math Sessions
   app.post("/api/ai/generate-comments", async (req, res) => {
     try {
@@ -132,21 +165,12 @@ Trả về kết quả chuẩn định dạng JSON nguyên bản (JSON object ON
 }
 `;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.7-flash",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          temperature: 0.3,
-        }
-      });
-
-      const jsonText = response.text || "{}";
       let parsedData;
       try {
+        const jsonText = await generateWithModelFallback(ai, prompt, 0.3);
         parsedData = JSON.parse(jsonText);
       } catch (err) {
-        console.error("JSON parse error from Gemini:", err);
+        console.warn("Generate AI Comments fallback:", err);
         parsedData = {
           comments: studentsData.map((st: any) => ({
             student_id: st.student_id,
@@ -172,10 +196,20 @@ Trả về kết quả chuẩn định dạng JSON nguyên bản (JSON object ON
     }
   });
 
-  // AI Diagnostic endpoint using Gemini 3.6 Flash
+  // AI Diagnostic endpoint using Gemini 3.8 Flash (Supports Multimodal Input: Text, Image PNG/JPG/WebP, PDF application/pdf)
   app.post("/api/ai-diagnose", async (req, res) => {
     try {
-      const { studentName, gradeLevel, targetScore, recentSessions, knowledgeScores, userApiKey } = req.body;
+      const {
+        studentName,
+        gradeLevel,
+        targetScore,
+        recentSessions,
+        knowledgeScores,
+        teacherNotes,
+        attachmentBase64,
+        attachmentMimeType,
+        userApiKey,
+      } = req.body;
 
       const apiKey = userApiKey || process.env.GEMINI_API_KEY;
       if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
@@ -195,47 +229,54 @@ Trả về kết quả chuẩn định dạng JSON nguyên bản (JSON object ON
 
       const prompt = `
 Bạn là Chuyên gia Cố vấn Giáo dục Môn Toán THCS (Lớp 6 đến Lớp 9) hàng đầu tại Việt Nam.
-Hãy chẩn đoán tình hình học tập và phân tích lỗ hổng kiến thức của học sinh sau:
+Hãy chẩn đoán tình hình học tập và phân tích lỗ hổng kiến thức của học sinh dựa trên chuẩn 100% Điểm Kiểm Tra Chuyên Đề (và tệp Ảnh/PDF bài kiểm tra đính kèm nếu có):
 
 THÔNG TIN HỌC SINH:
 - Họ và tên: ${studentName || "Học sinh"}
 - Khối lớp: Lớp ${gradeLevel || 9}
 - Mục tiêu điểm số: ${targetScore || "Thi vào 10 đạt 8.0+"}
+- Ghi chú thêm của Giáo viên: ${teacherNotes || "Không có"}
 
 DỮ LIỆU BÀI HỌC VÀ ĐIỂM SỐ GẦN ĐÂY:
 ${JSON.stringify(recentSessions || [], null, 2)}
 
-ĐIỂM NẮM BẮT CHUYÊN ĐỀ (0-10):
+ĐIỂM NẮM BẮT CHUYÊN ĐỀ QUA BÀI KIỂM TRA (100% ĐIỂM KT, THANG 0-10):
 ${JSON.stringify(knowledgeScores || [], null, 2)}
 
 Nhiệm vụ: Trả về kết quả phân tích theo cấu trúc JSON nguyên bản (JSON object ONLY, không chứa markdown formatting \`\`\`json):
 {
-  "knowledge_gap": "Phân tích cụ thể lỗ hổng kiến thức Toán (Đại số, Hình học) cần khắc phục gấp",
-  "learning_trend": "Đánh giá xu hướng phong độ (Tiến bộ, Sa sút, Thất thường, Ổn định) và thái độ làm BTVN",
-  "actionable_advice": "3 hành động cụ thể dành cho Giáo viên / Trợ giảng để phụ đạo cấp tốc cho học sinh",
-  "parent_summary": "Đoạn tóm tắt lịch sự, tinh tế, giàu động viên gửi cho Phụ huynh qua Zalo/SĐT (viết bằng giọng Thầy/Cô giáo)"
+  "knowledge_gap": "Phân tích cụ thể lỗ hổng kiến thức Toán (Đại số, Hình học) cần khắc phục gấp qua các bài kiểm tra (và từ bài làm trong ảnh/PDF đính kèm nếu có)",
+  "learning_trend": "Đánh giá xu hướng phong độ 2 bài kiểm tra gần nhất của các chuyên đề",
+  "actionable_advice": "3 hành động cụ thể dành cho Giáo viên / Trợ giảng để phụ đạo cấp tốc và giao phiếu bài tập bù lỗ hổng cho học sinh",
+  "parent_summary": "Đoạn tóm tắt lịch sự, tinh tế, giàu động viên gửi cho Phụ huynh qua Zalo (viết bằng giọng Thầy/Cô giáo, nêu rõ lộ trình bù lỗ hổng chuyên đề)"
 }
 `;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          temperature: 0.3,
-        }
-      });
+      const contentsParts: any[] = [{ text: prompt }];
+      if (attachmentBase64 && attachmentMimeType) {
+        const cleanBase64 = String(attachmentBase64).includes(",")
+          ? String(attachmentBase64).split(",")[1]
+          : String(attachmentBase64);
+        contentsParts.push({
+          inlineData: {
+            data: cleanBase64,
+            mimeType: attachmentMimeType,
+          },
+        });
+      }
 
-      const jsonText = response.text || "{}";
       let diagnosisData;
       try {
+        if (!ai) throw new Error("No custom API key provided, using built-in pedagogical engine");
+        const jsonText = await generateWithModelFallback(ai, contentsParts, 0.3);
         diagnosisData = JSON.parse(jsonText);
       } catch (err) {
+        console.warn("AI Diagnose fallback used:", err);
         diagnosisData = {
-          knowledge_gap: "Học sinh cần rèn luyện thêm kỹ năng biến đổi Đại số và kỹ năng vẽ hình chứng minh Tứ giác nội tiếp.",
-          learning_trend: "Phong độ có dấu hiệu biến động ở các bài kiểm tra áp lực thời gian.",
-          actionable_advice: "1. Cho làm lại 5 câu bài tập Căn thức. 2. Kiểm tra trực tiếp công thức Hình học trước buổi học. 3. Nhắc nhở nộp BTVN đúng hạn.",
-          parent_summary: "Kính gửi Phụ huynh, con nắm khá tốt kiến thức lý thuyết cơ bản. Thầy Cô sẽ tăng cường hỗ trợ con bài tập vận dụng để con tự tin đạt mục tiêu đề ra."
+          knowledge_gap: "Học sinh cần rèn luyện thêm kỹ năng biến đổi Đại số và kỹ năng vẽ hình chứng minh Hình học ở các chuyên đề điểm kiểm tra dưới 7.0đ.",
+          learning_trend: "Phong độ kiểm tra cần được củng cố qua phiếu bài tập bù lỗ hổng theo từng dạng bài.",
+          actionable_advice: "1. Giao phiếu bài tập bù lỗ hổng 5 câu phân bậc. 2. Kiểm tra lại 15 phút công thức trọng tâm. 3. Gửi báo cáo lộ trình qua Zalo cho Phụ huynh.",
+          parent_summary: "Kính gửi Phụ huynh, qua kết quả các bài kiểm tra chuyên đề, Thầy Cô đã khoanh vùng các dạng bài con còn hổng và biên soạn phiếu bài tập bù lỗ hổng riêng để kèm con bứt phá trong 2 buổi tới."
         };
       }
 
@@ -248,7 +289,178 @@ Nhiệm vụ: Trả về kết quả phân tích theo cấu trúc JSON nguyên b
     }
   });
 
-  // AI Cycle Report Analyzer endpoint using Gemini 3.6 Flash
+  // Multimodal AI Remedial Worksheet Generator endpoint (Outputs Cambria Math $...$ and $$...$$ for Word .docx export)
+  app.post("/api/ai-remedial-worksheet", async (req, res) => {
+    try {
+      const {
+        studentNames,
+        className,
+        gradeLevel,
+        teacherName,
+        weakTopics,
+        teacherPrompt,
+        attachmentBase64,
+        attachmentMimeType,
+        userApiKey,
+      } = req.body;
+
+      const apiKey = userApiKey || process.env.GEMINI_API_KEY;
+      if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
+        return res.status(400).json({
+          error: "Chưa cấu hình GEMINI_API_KEY. Vui lòng nhập API Key trong phần Cài đặt."
+        });
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey: apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
+
+      const topicsListStr = Array.isArray(weakTopics) && weakTopics.length > 0
+        ? weakTopics.join(", ")
+        : "Chuyên đề Toán THCS Trọng tâm";
+
+      const prompt = `
+Bạn là Chuyên gia Biên soạn Học liệu & Đề thi Toán THCS (Lớp 6 - Lớp 9) hàng đầu tại Việt Nam.
+Hãy biên soạn 1 PHIẾU BÀI TẬP BÙ LỖ HỔNG CÁ NHÂN HÓA chuẩn sư phạm để xuất ra File Word (.DOCX) cho học sinh:
+- Học sinh / Nhóm học sinh: ${Array.isArray(studentNames) ? studentNames.join(", ") : studentNames || "Học sinh"}
+- Lớp: ${className || "Toán THCS"} (Khối ${gradeLevel || 9})
+- Giáo viên phụ trách: ${teacherName || "Thầy/Cô"}
+- Các chuyên đề đang hổng (< 7.0đ qua bài kiểm tra): ${topicsListStr}
+- Yêu cầu / Ghi chú lỗi sai từ Giáo viên (hoặc từ Ảnh/PDF đính kèm): ${teacherPrompt || "Biên soạn 5 bài tập tự luận phân bậc từ cơ bản lấy gốc đến vận dụng để học sinh khắc phục triệt để lỗ hổng chuyên đề trên."}
+
+QUY TẮC BẮT BUỘC VỀ CÔNG THỨC TOÁN HỌC ĐỂ TƯƠNG THÍCH MATHTYPE TRONG WORD:
+1. MỌI công thức, biểu thức, phương trình, hệ phương trình, phân số, căn thức, ký hiệu góc, tam giác... BẮT BUỘC phải viết bằng mã LaTeX chuẩn và đặt trong cặp dấu $...$ (công thức inline) hoặc $$...$$ (công thức block độc lập).
+   Ví dụ đúng: Cho biểu thức $P = \\frac{\\sqrt{x} + 1}{\\sqrt{x} - 2}$ với $x \\ge 0, x \\ne 4$.
+2. Tuyệt đối KHÔNG dùng ký tự Unicode rời rạc ngoài dấu $...$ cho công thức Toán để Giáo viên mở Word nhấn 'Alt + \\' là chuyển toàn bộ sang MathType chuẩn.
+
+Hãy trả về kết quả theo đúng cấu trúc JSON nguyên bản (JSON object ONLY, không chứa markdown \`\`\`json):
+{
+  "worksheetTitle": "PHIẾU BÀI TẬP BÙ LỖ HỔNG & BỨT PHÁ ĐIỂM KIỂM TRA",
+  "diagnosisSummary": "Tóm tắt ngắn gọn mục tiêu cần khắc phục trong phiếu này (1-2 câu)",
+  "theorySummary": [
+    "Công thức / Định lý trọng tâm 1 (có công thức bọc trong $...$)",
+    "Công thức / Phương pháp giải trọng tâm 2 (có công thức bọc trong $...$)",
+    "Lưu ý các lỗi sai thường gặp cần tránh (có công thức bọc trong $...$)"
+  ],
+  "exercises": [
+    {
+      "level": "Mức độ 1: Cơ bản - Lấy lại gốc",
+      "points": "2.0 điểm",
+      "question": "Nội dung đề bài số 1 rõ ràng, đầy đủ dữ kiện, công thức đặt trong $...$",
+      "hintOrSolution": "Hướng dẫn giải từng bước và đáp số chi tiết, công thức đặt trong $...$"
+    },
+    {
+      "level": "Mức độ 1: Cơ bản - Rèn kỹ năng biến đổi",
+      "points": "2.0 điểm",
+      "question": "Nội dung đề bài số 2, công thức đặt trong $...$",
+      "hintOrSolution": "Hướng dẫn giải từng bước và đáp số chi tiết, công thức đặt trong $...$"
+    },
+    {
+      "level": "Mức độ 2: Thông hiểu - Trình bày chặt chẽ",
+      "points": "2.0 điểm",
+      "question": "Nội dung đề bài số 3, công thức đặt trong $...$",
+      "hintOrSolution": "Hướng dẫn giải từng bước và đáp số chi tiết, công thức đặt trong $...$"
+    },
+    {
+      "level": "Mức độ 2: Vận dụng - Khắc phục lỗi sai thực chiến",
+      "points": "2.0 điểm",
+      "question": "Nội dung đề bài số 4, công thức đặt trong $...$",
+      "hintOrSolution": "Hướng dẫn giải từng bước và đáp số chi tiết, công thức đặt trong $...$"
+    },
+    {
+      "level": "Mức độ 3: Vận dụng cao - Chinh phục mốc 8.5+",
+      "points": "2.0 điểm",
+      "question": "Nội dung đề bài số 5, công thức đặt trong $...$",
+      "hintOrSolution": "Hướng dẫn giải từng bước và đáp số chi tiết, công thức đặt trong $...$"
+    }
+  ],
+  "parentNote": "Lời nhắn ấm áp gửi Phụ huynh kèm theo phiếu bài tập này để gia đình nhắc con hoàn thành đúng hạn."
+}
+`;
+
+      const contentsParts: any[] = [{ text: prompt }];
+      if (attachmentBase64 && attachmentMimeType) {
+        const cleanBase64 = String(attachmentBase64).includes(",")
+          ? String(attachmentBase64).split(",")[1]
+          : String(attachmentBase64);
+        contentsParts.push({
+          inlineData: {
+            data: cleanBase64,
+            mimeType: attachmentMimeType,
+          },
+        });
+      }
+
+      let worksheetData = null;
+      try {
+        if (!ai) throw new Error("No custom API key provided, using built-in Cambria Math worksheet engine");
+        const jsonText = await generateWithModelFallback(ai, contentsParts, 0.35);
+        worksheetData = JSON.parse(jsonText);
+      } catch (_err) {
+        console.warn("AI Remedial Worksheet fallback used:", _err);
+        worksheetData = null;
+      }
+
+      if (!worksheetData || !Array.isArray(worksheetData.exercises)) {
+        worksheetData = {
+          worksheetTitle: `PHIẾU BÀI TẬP BÙ LỖ HỔNG: ${topicsListStr.toUpperCase()}`,
+          diagnosisSummary: `Củng cố kiến thức nền tảng và rèn kỹ năng trình bày bài kiểm tra chuyên đề: ${topicsListStr}.`,
+          theorySummary: [
+            `Nắm vững điều kiện xác định và các phép biến đổi tương đương cơ bản: $\\sqrt{A^2} = |A|$, $\\frac{A}{B}$ xác định khi $B \\ne 0$.`,
+            `Với phương trình bậc hai $ax^2 + bx + c = 0$ ($a \\ne 0$), biệt thức $\\Delta = b^2 - 4ac \\ge 0$ thì theo định lý Vi-ét: $x_1 + x_2 = -\\frac{b}{a}$ và $x_1 x_2 = \\frac{c}{a}$.`,
+            `Kiểm tra kỹ điều kiện sau khi tìm nghiệm và trình bày đầy đủ các bước lập luận hình học.`,
+          ],
+          exercises: [
+            {
+              level: "Mức độ 1: Cơ bản - Lấy lại gốc",
+              points: "2.0 điểm",
+              question: "Tính giá trị và rút gọn biểu thức: $A = 3\\sqrt{12} - 2\\sqrt{27} + \\sqrt{(2 - \\sqrt{3})^2}$.",
+              hintOrSolution: "Ta có $A = 3 \\cdot 2\\sqrt{3} - 2 \\cdot 3\\sqrt{3} + |2 - \\sqrt{3}| = 6\\sqrt{3} - 6\\sqrt{3} + 2 - \\sqrt{3} = 2 - \\sqrt{3}$."
+            },
+            {
+              level: "Mức độ 1: Cơ bản - Rèn kỹ năng biến đổi",
+              points: "2.0 điểm",
+              question: "Cho biểu thức $P = \\left(\\frac{1}{\\sqrt{x} - 1} + \\frac{1}{\\sqrt{x} + 1}\\right) : \\frac{\\sqrt{x}}{x - 1}$ với $x > 0, x \\ne 1$. a) Rút gọn $P$. b) Tính giá trị của $P$ khi $x = 4$.",
+              hintOrSolution: "a) Quy đồng mẫu thức trong ngoặc: $P = \\frac{2\\sqrt{x}}{x - 1} \\cdot \\frac{x - 1}{\\sqrt{x}} = 2$. b) Khi $x = 4$ (thỏa mãn ĐKXĐ), $P = 2$."
+            },
+            {
+              level: "Mức độ 2: Thông hiểu - Trình bày chặt chẽ",
+              points: "2.0 điểm",
+              question: "Giải hệ phương trình sau bằng phương pháp cộng đại số: $$\\begin{cases} 2x + 3y = 8 \\\\ 3x - y = 1 \\end{cases}$$",
+              hintOrSolution: "Từ phương trình thứ hai suy ra $y = 3x - 1$. Thế vào phương trình đầu: $2x + 3(3x - 1) = 8 \\Leftrightarrow 11x = 11 \\Leftrightarrow x = 1$, suy ra $y = 2$. Vậy hệ có nghiệm duy nhất $(x; y) = (1; 2)$."
+            },
+            {
+              level: "Mức độ 2: Vận dụng - Khắc phục lỗi sai thực chiến",
+              points: "2.0 điểm",
+              question: "Cho phương trình $x^2 - 2(m + 1)x + m^2 + 2 = 0$ (với $m$ là tham số). Tìm $m$ để phương trình có hai nghiệm phân biệt $x_1, x_2$ thỏa mãn $x_1^2 + x_2^2 = 10$.",
+              hintOrSolution: "Tính $\\Delta' = (m + 1)^2 - (m^2 + 2) = 2m - 1 > 0 \\Leftrightarrow m > \\frac{1}{2}$. Áp dụng hệ thức Vi-ét: $(x_1 + x_2)^2 - 2x_1x_2 = 10 \\Leftrightarrow 4(m + 1)^2 - 2(m^2 + 2) = 10 \\Leftrightarrow 2m^2 + 8m - 10 = 0 \\Leftrightarrow m = 1$ (nhận) hoặc $m = -5$ (loại)."
+            },
+            {
+              level: "Mức độ 3: Vận dụng cao - Chinh phục mốc 8.5+",
+              points: "2.0 điểm",
+              question: "Cho tam giác $ABC$ vuông tại $A$ ($AB < AC$), đường cao $AH$. Biết $AB = 6\\text{ cm}$, $AC = 8\\text{ cm}$. Tính độ dài $BC, AH, BH$ và chứng minh $AB^2 = BH \\cdot BC$.",
+              hintOrSolution: "Áp dụng định lý Pythagore: $BC = \\sqrt{AB^2 + AC^2} = \\sqrt{6^2 + 8^2} = 10\\text{ cm}$. Hệ thức lượng trong tam giác vuông $ABC$: $AH = \\frac{AB \\cdot AC}{BC} = 4,8\\text{ cm}$ và $BH = \\frac{AB^2}{BC} = 3,6\\text{ cm}$."
+            }
+          ],
+          parentNote: "Gia đình nhắc con hoàn thành đầy đủ 5 bài tập tự luận vào vở trước buổi học tới để Thầy/Cô chấm chữa trực tiếp nhé!"
+        };
+      }
+
+      res.json({ success: true, worksheet: worksheetData });
+    } catch (error: any) {
+      console.error("AI Remedial Worksheet Error:", error);
+      res.status(500).json({
+        error: error.message || "Không thể khởi tạo Phiếu bài tập bù lỗ hổng AI."
+      });
+    }
+  });
+
+  // AI Cycle Report Analyzer endpoint using Gemini 3.8 Flash
   app.post("/api/ai-cycle-report", async (req, res) => {
     try {
       const { className, cycleName, sessionThemes, classMetrics, studentSummaryList, userApiKey } = req.body;
@@ -292,20 +504,12 @@ Nhiệm vụ: Hãy trả về kết quả phân tích chuẩn hóa định dạn
 }
 `;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          temperature: 0.4,
-        }
-      });
-
-      const jsonText = response.text || "{}";
       let reportData;
       try {
+        const jsonText = await generateWithModelFallback(ai, prompt, 0.4);
         reportData = JSON.parse(jsonText);
       } catch (err) {
+        console.warn("AI Cycle Report fallback used:", err);
         reportData = {
           knowledge_gap_summary: "Đa số các con nắm được lý thuyết nhưng còn chưa cẩn thận khi giải toán tính toán phân thức và trình bày hình học.",
           outstanding_students: "Tuyên dương các con có điểm số và tinh thần tự giác học tập cao nhất lớp.",

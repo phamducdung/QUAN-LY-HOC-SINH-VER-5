@@ -1,10 +1,37 @@
 import React, { useState, useMemo } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { ClassItem, GradeLevel, ClassStatus, ClassType, UserRole, Session, Warning, StudentSession } from '../types';
-import { db, pushBatchDocsToFirestore } from '../db/dexie';
+import {
+  ClassItem,
+  GradeLevel,
+  ClassStatus,
+  ClassType,
+  UserRole,
+  Session,
+  Warning,
+  StudentSession,
+  Student,
+  ClassStudent,
+  KnowledgeTag,
+  KnowledgeResult,
+  Settings,
+  CRMCustomerStatus,
+  CRMInteractionLog,
+} from '../types';
+import { db, deleteStudent } from '../db/dexie';
 import { logAudit } from '../utils/auditLogger';
 import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
+import {
+  authorizeCascadeDeleteIds,
+  flushSyncOutbox,
+} from '../services/syncService';
 import { compareVietnameseNames } from '../utils/sortUtils';
+import {
+  CRM_CLASSIFICATION_CRITERIA,
+  DEFAULT_CRM_MESSAGE_TEMPLATES,
+  compileAccurateStudentParentReport,
+  renderCRMTemplate,
+  compileClassGroupZaloAnnouncement,
+} from '../utils/crmEngine';
 import * as XLSX from 'xlsx';
 import {
   Plus,
@@ -21,10 +48,18 @@ import {
   Lock,
   Clock,
   Search,
-  Download,
-  Printer,
   AlertTriangle,
   FileSpreadsheet,
+  MessageSquareText,
+  Megaphone,
+  GitMerge,
+  Copy,
+  Check,
+  ExternalLink,
+  Phone,
+  CheckCircle2,
+  Flame,
+  Settings2,
 } from 'lucide-react';
 
 interface ClassManagementProps {
@@ -36,6 +71,17 @@ interface ClassManagementProps {
 }
 
 const EMPTY_ARRAY: any[] = [];
+
+function removeAccents(str?: string): string {
+  return (str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
 
 export const ClassManagement: React.FC<ClassManagementProps> = ({
   classes,
@@ -50,11 +96,23 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
 
   // Live queries for reactive size and sub-list details (stable fallback reference)
-  const classStudents = useLiveQuery(() => db.class_students.toArray()) ?? EMPTY_ARRAY;
-  const students = useLiveQuery(() => db.students.toArray()) ?? EMPTY_ARRAY;
-  const sessions = useLiveQuery(() => db.sessions.toArray()) ?? EMPTY_ARRAY;
-  const studentSessions = useLiveQuery(() => db.student_sessions.toArray()) ?? EMPTY_ARRAY;
-  const warnings = useLiveQuery(() => db.warnings.toArray()) ?? EMPTY_ARRAY;
+  const classStudents =
+    useLiveQuery(() => db.class_students.toArray()) ?? (EMPTY_ARRAY as ClassStudent[]);
+  const students =
+    useLiveQuery(() => db.students.toArray()) ?? (EMPTY_ARRAY as Student[]);
+  const sessions =
+    useLiveQuery(() => db.sessions.toArray()) ?? (EMPTY_ARRAY as Session[]);
+  const studentSessions =
+    useLiveQuery(() => db.student_sessions.toArray()) ?? (EMPTY_ARRAY as StudentSession[]);
+  const warnings =
+    useLiveQuery(() => db.warnings.toArray()) ?? (EMPTY_ARRAY as Warning[]);
+  const knowledgeTags =
+    useLiveQuery(() => db.knowledge_tags.toArray()) ?? (EMPTY_ARRAY as KnowledgeTag[]);
+  const knowledgeResults =
+    useLiveQuery(() => db.knowledge_results.toArray()) ?? (EMPTY_ARRAY as KnowledgeResult[]);
+  const settingsArr =
+    useLiveQuery(() => db.settings.toArray()) ?? (EMPTY_ARRAY as Settings[]);
+  const activeSettings = settingsArr[0];
 
   // Modal States
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -62,6 +120,25 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
   const [viewingClassDetails, setViewingClassDetails] = useState<ClassItem | null>(null);
   const [detailSubTab, setDetailSubTab] = useState<'roster' | 'sessions'>('roster');
   const [rosterFilterStatus, setRosterFilterStatus] = useState<'active' | 'all' | 'left'>('active');
+
+  // Kaizen CSKH Modals inside Class Details
+  const [isGroupZaloOpen, setIsGroupZaloOpen] = useState(false);
+  const [groupZaloMode, setGroupZaloMode] = useState<'single_session' | 'cycle_4'>('single_session');
+  const [groupZaloSessionId, setGroupZaloSessionId] = useState<string>('');
+  const [groupZaloCustomText, setGroupZaloCustomText] = useState<string>('');
+  const [isGroupZaloEdited, setIsGroupZaloEdited] = useState(false);
+  const [copiedGroupZalo, setCopiedGroupZalo] = useState(false);
+
+  // 1-Click Single Student Parent Report Modal inside Class Details
+  const [reportStudentId, setReportStudentId] = useState<string | null>(null);
+  const [reportCycleLimit, setReportCycleLimit] = useState<1 | 4 | 8 | 'all'>(4);
+  const [reportTemplateId, setReportTemplateId] = useState<string>(
+    DEFAULT_CRM_MESSAGE_TEMPLATES[0].id
+  );
+  const [reportCustomText, setReportCustomText] = useState<string>('');
+  const [isReportEdited, setIsReportEdited] = useState(false);
+  const [copiedSingleReport, setCopiedSingleReport] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Form States (Clean default placeholders)
   const [classNameInput, setClassNameInput] = useState('');
@@ -80,11 +157,16 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
   const [promotingClass, setPromotingClass] = useState<ClassItem | null>(null);
   const [promotedClassName, setPromotedClassName] = useState('');
 
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 4500);
+  };
+
   const generatePromotedClassName = (currentName: string, currentGrade: number, nextGrade: number) => {
     let name = currentName;
     const gradeStr = String(currentGrade);
     const nextGradeStr = String(nextGrade);
-    
+
     if (name.includes(`Khối ${gradeStr}`)) {
       name = name.replace(`Khối ${gradeStr}`, `Khối ${nextGradeStr}`);
     } else if (name.includes(`khối ${gradeStr}`)) {
@@ -227,6 +309,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
       updated_at: now,
     });
     await logAudit(currentRole as UserRole, 'Thay đổi trạng thái lớp', `${newStatus === 'archived' ? 'Lưu trữ' : 'Khôi phục'} lớp ${cls.class_name}`);
+    setIsModalOpen(false);
     onRefresh();
   };
 
@@ -399,7 +482,8 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
           'Ngày Sinh': st.birthday || '',
           'Họ Tên Phụ Huynh': st.parent_name || '',
           'SĐT Phụ Huynh': st.parent_phone || '',
-          'Địa Chỉ': st.address || '',
+          'Trạng Thái CSKH':
+            CRM_CLASSIFICATION_CRITERIA[st.crm_status || 'satisfied'].shortBadge,
           'Ngày Vào Lớp': link.join_date || '',
           'Ghi Chú': st.note || '',
         };
@@ -412,11 +496,11 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     XLSX.writeFile(workbook, `Danh_Sach_Lop_${cls.class_name}.xlsx`);
   };
 
-  // Helper for Class Health Indicators
+  // Helper for Class Health Indicators (Preserved 100% as requested)
   const getClassHealthData = (classId: string) => {
     const classSess = sessions.filter((s) => String(s.class_id) === String(classId));
     const classP1Count = warnings.filter((w) => String(w.class_id) === String(classId) && !w.resolved && w.priority === 'P1').length;
-    
+
     if (classSess.length === 0) {
       return { p1Count: classP1Count, latestTestAvg: null, attendanceRate: null };
     }
@@ -454,13 +538,334 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     return { p1Count: classP1Count, latestTestAvg, attendanceRate };
   };
 
+  // Detect Cross-Class Algebra (Đ) <-> Geometry (H) Duplicate Student Pairs for the currently viewed class
+  const crossClassDuplicatePairs = useMemo(() => {
+    if (!viewingClassDetails?.id) return [];
+    const curClassId = String(viewingClassDetails.id);
+    const curGrade = viewingClassDetails.grade_level;
+
+    // Active students in current class
+    const curClassStudentIds = new Set(
+      classStudents
+        .filter((cs) => String(cs.class_id) === curClassId && !cs.leave_date)
+        .map((cs) => String(cs.student_id))
+    );
+    const curStudents = students.filter(
+      (s) => s.id && curClassStudentIds.has(String(s.id)) && s.status !== 'stopped'
+    );
+
+    // Same-grade other classes (e.g. Algebra <-> Geometry sibling classes)
+    const siblingClassMap = new Map<string, ClassItem>();
+    classes.forEach((c) => {
+      if (
+        c.id &&
+        String(c.id) !== curClassId &&
+        c.grade_level === curGrade &&
+        c.status === 'active'
+      ) {
+        siblingClassMap.set(String(c.id), c);
+      }
+    });
+
+    const pairs: Array<{
+      thisStudent: Student;
+      otherStudent: Student;
+      otherClassName: string;
+    }> = [];
+
+    for (const sThis of curStudents) {
+      const nThis = removeAccents(sThis.full_name);
+      if (!nThis) continue;
+
+      for (const cs of classStudents) {
+        if (cs.leave_date) continue;
+        const otherCls = siblingClassMap.get(String(cs.class_id));
+        if (!otherCls) continue;
+        if (String(cs.student_id) === String(sThis.id)) continue; // Already shared ID!
+
+        const sOther = students.find(
+          (st) => String(st.id) === String(cs.student_id) && st.status !== 'stopped'
+        );
+        if (!sOther) continue;
+
+        const nOther = removeAccents(sOther.full_name);
+        if (nThis === nOther) {
+          pairs.push({
+            thisStudent: sThis,
+            otherStudent: sOther,
+            otherClassName: otherCls.class_name,
+          });
+        }
+      }
+    }
+
+    return pairs;
+  }, [viewingClassDetails, classes, classStudents, students]);
+
+  // Handler: 1-Click Merge Algebra <-> Geometry Duplicate Pair right inside Class Details
+  const handleMergeCrossClassDuplicate = async (pair: {
+    thisStudent: Student;
+    otherStudent: Student;
+    otherClassName: string;
+  }) => {
+    const primaryId = String(pair.thisStudent.id);
+    const secondaryId = String(pair.otherStudent.id);
+    if (!primaryId || !secondaryId) return;
+
+    const now = new Date().toISOString();
+
+    await createPreDeleteSnapshot(
+      'student',
+      secondaryId,
+      `Gộp hồ sơ Đại & Hình: ${pair.otherStudent.full_name} (${pair.otherClassName}) vào ${pair.thisStudent.full_name}`
+    );
+
+    // 1. Migrate class_students
+    const secCS = classStudents.filter((cs) => String(cs.student_id) === secondaryId);
+    const oldCsIds: string[] = [];
+    for (const cs of secCS) {
+      if (cs.id) oldCsIds.push(String(cs.id));
+      const cid = String(cs.class_id);
+      const newCsId = `cs_${cid}_${primaryId}`;
+      const existing = await db.class_students.get(newCsId);
+      if (!existing) {
+        await db.class_students.put({
+          ...cs,
+          id: newCsId,
+          class_id: cid,
+          student_id: primaryId,
+        });
+      }
+    }
+
+    // 2. Migrate student_sessions
+    const secSS = studentSessions.filter((ss) => String(ss.student_id) === secondaryId);
+    const oldSsIds: string[] = [];
+    for (const ss of secSS) {
+      if (ss.id) oldSsIds.push(String(ss.id));
+      const sessId = String(ss.session_id);
+      const newSsId = `ss_${sessId}_${primaryId}`;
+      const existing = await db.student_sessions.get(newSsId);
+      if (!existing) {
+        await db.student_sessions.put({
+          ...ss,
+          id: newSsId,
+          session_id: sessId,
+          student_id: primaryId,
+          updated_at: now,
+        });
+      }
+    }
+
+    // 3. Migrate knowledge_results
+    const secKR = knowledgeResults.filter((kr) => String(kr.student_id) === secondaryId);
+    const oldKrIds: string[] = [];
+    for (const kr of secKR) {
+      if (kr.id) oldKrIds.push(String(kr.id));
+      const tagId = String(kr.knowledge_tag_id);
+      const newKrId = `kr_${primaryId}_${tagId}`;
+      const existing = await db.knowledge_results.get(newKrId);
+      if (!existing) {
+        await db.knowledge_results.put({
+          ...kr,
+          id: newKrId,
+          student_id: primaryId,
+          knowledge_tag_id: tagId,
+          last_updated: now,
+        });
+      }
+    }
+
+    // 4. Migrate warnings
+    const secWarns = warnings.filter((w) => String(w.student_id) === secondaryId);
+    for (const w of secWarns) {
+      if (w.id) {
+        await db.warnings.update(w.id, {
+          student_id: primaryId,
+          updated_at: now,
+        });
+      }
+    }
+
+    authorizeCascadeDeleteIds('students', [secondaryId]);
+    authorizeCascadeDeleteIds('class_students', oldCsIds);
+    authorizeCascadeDeleteIds('student_sessions', oldSsIds);
+    authorizeCascadeDeleteIds('knowledge_results', oldKrIds);
+
+    await deleteStudent(secondaryId);
+    await flushSyncOutbox();
+
+    await logAudit(
+      currentRole as UserRole,
+      'Gộp học sinh học cả Đại & Hình',
+      `Đã gộp hồ sơ "${pair.otherStudent.full_name}" (Lớp ${pair.otherClassName}) vào "${pair.thisStudent.full_name}" (Lớp ${viewingClassDetails?.class_name})`
+    );
+
+    showToast(
+      `Đã gộp thành công hồ sơ "${pair.thisStudent.full_name}" học cả 2 lớp ${viewingClassDetails?.class_name} và ${pair.otherClassName}!`
+    );
+    onRefresh();
+  };
+
+  // Compiled Class Group Zalo Announcement
+  const compiledGroupZalo = useMemo(() => {
+    if (!viewingClassDetails?.id) return null;
+    const cid = String(viewingClassDetails.id);
+    const clsSessions = sessions.filter((s) => String(s.class_id) === cid);
+    const activeIds = new Set(
+      classStudents
+        .filter((cs) => String(cs.class_id) === cid && !cs.leave_date)
+        .map((cs) => String(cs.student_id))
+    );
+    const activeStuds = students.filter(
+      (s) => s.id && activeIds.has(String(s.id)) && s.status !== 'stopped'
+    );
+
+    return compileClassGroupZaloAnnouncement({
+      cls: viewingClassDetails,
+      mode: groupZaloMode,
+      targetSessionId: groupZaloSessionId || undefined,
+      classSessions: clsSessions,
+      activeClassStudents: activeStuds,
+      allStudentSessions: studentSessions,
+      pronounConfig: activeSettings?.pronoun_config,
+    });
+  }, [
+    viewingClassDetails,
+    groupZaloMode,
+    groupZaloSessionId,
+    sessions,
+    classStudents,
+    students,
+    studentSessions,
+    activeSettings,
+  ]);
+
+  // Compiled Single Student Parent Report inside Class Details
+  const activeSingleReport = useMemo(() => {
+    if (!reportStudentId || !viewingClassDetails?.id) return null;
+    const st = students.find((s) => String(s.id) === String(reportStudentId));
+    if (!st) return null;
+    const cid = String(viewingClassDetails.id);
+    return compileAccurateStudentParentReport({
+      student: st,
+      classes,
+      enrolledClassIds: [cid],
+      selectedClassId: cid,
+      cycleLimit: reportCycleLimit,
+      allSessions: sessions,
+      allStudentSessions: studentSessions,
+      allWarnings: warnings,
+      allKnowledgeTags: knowledgeTags,
+      allKnowledgeResults: knowledgeResults,
+    });
+  }, [
+    reportStudentId,
+    viewingClassDetails,
+    reportCycleLimit,
+    students,
+    classes,
+    sessions,
+    studentSessions,
+    warnings,
+    knowledgeTags,
+    knowledgeResults,
+  ]);
+
+  const templates = useMemo(() => {
+    if (
+      activeSettings?.crm_message_templates &&
+      activeSettings.crm_message_templates.length > 0
+    ) {
+      return activeSettings.crm_message_templates;
+    }
+    return DEFAULT_CRM_MESSAGE_TEMPLATES;
+  }, [activeSettings]);
+
+  const renderedSingleReportMessage = useMemo(() => {
+    if (!activeSingleReport) return '';
+    const tpl =
+      templates.find((t) => t.id === reportTemplateId) || templates[0];
+    return renderCRMTemplate(
+      tpl.body,
+      activeSingleReport,
+      activeSettings?.pronoun_config
+    );
+  }, [activeSingleReport, templates, reportTemplateId, activeSettings]);
+
+  const handleCopySingleReportAndLog = async (openZalo = false) => {
+    if (!activeSingleReport?.student.id || !viewingClassDetails) return;
+    const st = activeSingleReport.student;
+    const textToCopy = isReportEdited
+      ? reportCustomText
+      : renderedSingleReportMessage;
+
+    try {
+      await navigator.clipboard.writeText(textToCopy);
+      setCopiedSingleReport(true);
+    } catch (e) {}
+
+    const now = new Date().toISOString();
+    const d = new Date();
+    d.setDate(d.getDate() + 7);
+    const nextDate = d.toISOString().slice(0, 10);
+    const tpl =
+      templates.find((t) => t.id === reportTemplateId) || templates[0];
+
+    const newLog: CRMInteractionLog = {
+      id: `crm_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      created_at: now,
+      channel: 'zalo',
+      template_category: tpl.category,
+      summary: `[Lớp ${viewingClassDetails.class_name}] Đã gửi ${tpl.title}`,
+      message_sent: textToCopy,
+      parent_feedback: 'Đã gửi báo cáo từ Chi tiết Lớp học',
+      status_snapshot: st.crm_status || activeSingleReport.suggestedStatus,
+      next_followup_date: nextDate,
+      created_by: 'Giáo viên',
+    };
+
+    const existingLogs = Array.isArray(st.crm_interactions)
+      ? st.crm_interactions
+      : [];
+
+    await db.students.update(st.id!, {
+      crm_status: st.crm_status || activeSingleReport.suggestedStatus,
+      crm_last_contacted_at: now,
+      crm_next_followup_date: nextDate,
+      crm_interactions: [newLog, ...existingLogs],
+      updated_at: now,
+    });
+
+    await logAudit(
+      currentRole as UserRole,
+      'CRM_SEND_PARENT_REPORT',
+      `Gửi báo cáo 1-Click PH em ${st.full_name} tại lớp ${viewingClassDetails.class_name}`
+    );
+
+    showToast(
+      `Đã sao chép báo cáo của ${st.full_name} và tự động ghi nhận vào Nhật ký CSKH!`
+    );
+
+    if (openZalo && st.parent_phone) {
+      const clean = st.parent_phone.replace(/\D/g, '');
+      if (clean) {
+        const a = document.createElement('a');
+        a.href = `https://zalo.me/${clean}`;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.click();
+      }
+    }
+  };
+
   return (
     <div id="class-management-view" className="space-y-6">
       {/* Top Header Controls */}
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
         <div>
           <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-            <span>Quản Lý Lớp Học &amp; Chuyển Khối</span>
+            <span>Quản Lý Lớp Học &amp; Điều Phối CSKH</span>
             {!isAdmin && (
               <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300 flex items-center gap-1">
                 <Lock className="w-3 h-3" /> Quyền Trợ Giảng (Xem &amp; Nhập Điểm)
@@ -468,7 +873,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
             )}
           </h2>
           <p className="text-xs text-slate-500">
-            Phân loại Lớp học môn Toán THCS (Khối 6-9), phân công Trợ giảng &amp; Lên lớp đầu năm.
+            Quản lý các lớp Toán THCS (Khối 6-9), gửi báo cáo Nhóm Zalo Phụ huynh cả lớp và chăm sóc từng học sinh 1-Click.
           </p>
         </div>
 
@@ -482,7 +887,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
             handleOpenAddModal();
           }}
           disabled={!isAdmin}
-          className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-md shrink-0 ${
+          className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-md shrink-0 cursor-pointer ${
             isAdmin
               ? 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-600/20'
               : 'bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-500 cursor-not-allowed'
@@ -501,7 +906,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
           <button
             id="tab-status-active"
             onClick={() => setActiveTabStatus('active')}
-            className={`flex-1 md:flex-none px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${
+            className={`flex-1 md:flex-none px-4 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
               activeTabStatus === 'active'
                 ? 'bg-white text-slate-900 dark:bg-slate-900 dark:text-white shadow-sm'
                 : 'text-slate-600 dark:text-slate-400'
@@ -512,7 +917,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
           <button
             id="tab-status-archived"
             onClick={() => setActiveTabStatus('archived')}
-            className={`flex-1 md:flex-none px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${
+            className={`flex-1 md:flex-none px-4 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
               activeTabStatus === 'archived'
                 ? 'bg-white text-slate-900 dark:bg-slate-900 dark:text-white shadow-sm'
                 : 'text-slate-600 dark:text-slate-400'
@@ -526,7 +931,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
         <div className="flex items-center gap-1.5 bg-slate-50 dark:bg-slate-800/60 p-1 rounded-xl w-full md:w-auto overflow-x-auto">
           <button
             onClick={() => setSelectedGrade('all')}
-            className={`px-3 py-1 rounded-lg text-xs font-bold shrink-0 ${
+            className={`px-3 py-1 rounded-lg text-xs font-bold shrink-0 cursor-pointer ${
               selectedGrade === 'all'
                 ? 'bg-emerald-600 text-white'
                 : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-100'
@@ -538,7 +943,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
             <button
               key={g}
               onClick={() => setSelectedGrade(g)}
-              className={`px-3 py-1 rounded-lg text-xs font-bold shrink-0 ${
+              className={`px-3 py-1 rounded-lg text-xs font-bold shrink-0 cursor-pointer ${
                 selectedGrade === g
                   ? 'bg-emerald-600 text-white'
                   : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-100'
@@ -562,7 +967,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
         </div>
       </div>
 
-      {/* Class Cards Grid */}
+      {/* Class Cards Grid — Preserved Exterior Metrics & Decluttered Action Buttons */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
         {filteredClasses.length === 0 ? (
           <div className="col-span-full p-8 text-center text-xs text-slate-500 bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-300 dark:border-slate-800">
@@ -606,46 +1011,30 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                           setDetailSubTab('roster');
                         }}
                         className="block text-left text-base font-bold text-slate-900 dark:text-slate-100 mt-1.5 hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors cursor-pointer"
-                        title="Xem danh sách & lịch sử dạy học"
+                        title="Xem danh sách & công cụ CSKH Phụ huynh của lớp"
                       >
                         {cls.class_name}
                       </button>
                     </div>
 
+                    {/* Single clean Settings / Edit button on card header (Delete & Promote moved inside) */}
                     <div className="flex items-center gap-1 opacity-80 group-hover:opacity-100 transition-opacity">
                       <button
                         onClick={() => {
                           if (!isAdmin) {
-                            alert('Chỉ Admin (Giáo viên chính) mới có quyền sửa thông tin lớp học!');
+                            alert('Chỉ Admin (Giáo viên chính) mới có quyền sửa/cài đặt thông tin lớp học!');
                             return;
                           }
                           handleOpenEditModal(cls);
                         }}
-                        className={`p-1.5 rounded-lg ${
+                        className={`p-1.5 rounded-lg cursor-pointer ${
                           isAdmin
                             ? 'text-slate-400 hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-slate-100 dark:hover:bg-slate-800'
                             : 'text-slate-300 dark:text-slate-700 cursor-not-allowed'
                         }`}
-                        title={isAdmin ? 'Sửa thông tin lớp' : 'Khóa với quyền Trợ giảng'}
+                        title={isAdmin ? 'Cài đặt & Sửa thông tin lớp (Lên lớp / Lưu trữ / Xóa an toàn)' : 'Khóa với quyền Trợ giảng'}
                       >
-                        <Edit className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={() => {
-                          if (!isAdmin) {
-                            alert('Chỉ Admin (Giáo viên chính) mới có quyền xóa lớp học!');
-                            return;
-                          }
-                          setDeletingClass(cls);
-                        }}
-                        className={`p-1.5 rounded-lg ${
-                          isAdmin
-                            ? 'text-slate-400 hover:text-rose-600 hover:bg-slate-100 dark:hover:bg-slate-800'
-                            : 'text-slate-300 dark:text-slate-700 cursor-not-allowed'
-                        }`}
-                        title={isAdmin ? 'Xóa an toàn lớp học' : 'Khóa với quyền Trợ giảng'}
-                      >
-                        <Trash2 className="w-4 h-4" />
+                        <Settings2 className="w-4 h-4" />
                       </button>
                     </div>
                   </div>
@@ -655,7 +1044,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                     🎯 {cls.target_description}
                   </p>
 
-                  {/* Class Health Badges */}
+                  {/* Class Health Badges (Preserved as requested) */}
                   <div className="grid grid-cols-2 gap-2 mb-3">
                     <div className="p-2 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-100 dark:border-slate-800 text-[11px]">
                       <span className="text-slate-400 block text-[10px] font-semibold">ĐIỂM KT GẦN NHẤT</span>
@@ -687,7 +1076,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                           setViewingClassDetails(cls);
                           setDetailSubTab('roster');
                         }}
-                        className="flex items-center gap-1.5 p-1.5 bg-slate-50 hover:bg-emerald-50 dark:bg-slate-800/40 dark:hover:bg-slate-800 rounded-lg text-[11px] font-bold text-slate-600 dark:text-slate-300 transition-colors"
+                        className="flex items-center gap-1.5 p-1.5 bg-slate-50 hover:bg-emerald-50 dark:bg-slate-800/40 dark:hover:bg-slate-800 rounded-lg text-[11px] font-bold text-slate-600 dark:text-slate-300 transition-colors cursor-pointer"
                       >
                         <Users className="w-3.5 h-3.5 text-emerald-600" />
                         <span>Sĩ số: <strong>{activeStudentsCount} HS</strong></span>
@@ -697,7 +1086,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                           setViewingClassDetails(cls);
                           setDetailSubTab('sessions');
                         }}
-                        className="flex items-center gap-1.5 p-1.5 bg-slate-50 hover:bg-emerald-50 dark:bg-slate-800/40 dark:hover:bg-slate-800 rounded-lg text-[11px] font-bold text-slate-600 dark:text-slate-300 transition-colors"
+                        className="flex items-center gap-1.5 p-1.5 bg-slate-50 hover:bg-emerald-50 dark:bg-slate-800/40 dark:hover:bg-slate-800 rounded-lg text-[11px] font-bold text-slate-600 dark:text-slate-300 transition-colors cursor-pointer"
                       >
                         <Clock className="w-3.5 h-3.5 text-emerald-600" />
                         <span>Đã dạy: <strong>{sessionsCount} buổi</strong></span>
@@ -706,56 +1095,26 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                   </div>
                 </div>
 
-                {/* Actions Footer */}
+                {/* Actions Footer — Decluttered: Grade Entry + Class CSKH Details */}
                 <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
                   <button
                     onClick={() => onSelectClassForGradeEntry(cls.id!)}
-                    className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm"
+                    className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm cursor-pointer"
                   >
                     <Users className="w-3.5 h-3.5" />
                     <span>Nhập điểm Lớp</span>
                   </button>
 
-                  <div className="flex items-center gap-1">
-                    {cls.status === 'active' && (
-                      <button
-                        onClick={() => {
-                          if (!isAdmin) {
-                            alert('Chỉ Admin (Giáo viên chính) mới có quyền chuyển khối lên lớp!');
-                            return;
-                          }
-                          handleStartPromoting(cls);
-                        }}
-                        className={`px-2.5 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1 ${
-                          isAdmin
-                            ? 'bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 hover:bg-sky-100'
-                            : 'bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
-                        }`}
-                        title={isAdmin ? 'Chuyển khối / Lên lớp tự động' : 'Khóa với quyền Trợ giảng'}
-                      >
-                        <ArrowUpRight className="w-3.5 h-3.5" />
-                        <span>Lên Lớp</span>
-                      </button>
-                    )}
-
-                    <button
-                      onClick={() => {
-                        if (!isAdmin) {
-                          alert('Chỉ Admin (Giáo viên chính) mới có quyền thay đổi trạng thái lưu trữ lớp!');
-                          return;
-                        }
-                        handleArchiveClass(cls);
-                      }}
-                      className={`p-1.5 rounded-xl ${
-                        isAdmin
-                          ? 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
-                          : 'text-slate-300 dark:text-slate-700 cursor-not-allowed'
-                      }`}
-                      title={isAdmin ? (cls.status === 'active' ? 'Lưu trữ lớp này' : 'Khôi phục hoạt động') : 'Khóa với quyền Trợ giảng'}
-                    >
-                      <Archive className="w-4 h-4" />
-                    </button>
-                  </div>
+                  <button
+                    onClick={() => {
+                      setViewingClassDetails(cls);
+                      setDetailSubTab('roster');
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <MessageSquareText className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Chi tiết &amp; CSKH Lớp</span>
+                  </button>
                 </div>
               </div>
             );
@@ -763,17 +1122,17 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
         )}
       </div>
 
-      {/* Add / Edit Modal */}
+      {/* Add / Edit & Class Maintenance Modal (Houses Promote, Archive, and Safe Delete) */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
           <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-lg w-full p-6 border border-slate-200 dark:border-slate-800 shadow-xl space-y-4">
             <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
               <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                {editingClass ? 'Sửa Thông Tin Lớp Học' : 'Tạo Lớp Học Mới'}
+                {editingClass ? `Cài Đặt & Sửa Thông Tin Lớp: ${editingClass.class_name}` : 'Tạo Lớp Học Mới'}
               </h3>
               <button
                 onClick={() => setIsModalOpen(false)}
-                className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -798,13 +1157,13 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                     }`}
                   />
                   {isDuplicateClassName && (
-                    <div className="mt-1.5 p-2 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl flex items-center gap-1.5 text-xs text-rose-700 dark:text-rose-300 font-bold animate-fadeIn">
+                    <div className="mt-1.5 p-2 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl flex items-center gap-1.5 text-xs text-rose-700 dark:text-rose-300 font-bold">
                       <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />
                       <span>Đã tồn tại lớp học trùng tên này! Vui lòng đổi tên khác.</span>
                     </div>
                   )}
                 </div>
-                
+
                 <div className="col-span-2 md:col-span-1">
                   <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
                     Profile Lớp
@@ -893,6 +1252,55 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                 </div>
               </div>
 
+              {/* Cất gọn thao tác Quản trị Lớp (Lên lớp / Lưu trữ / Xóa an toàn) vào trong Cài đặt lớp */}
+              {editingClass && isAdmin && (
+                <div className="mt-4 pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2">
+                  <div className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                    Quản Trị &amp; Bảo Trì Lớp Học (Cất gọn chống bấm nhầm)
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {editingClass.status === 'active' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const target = editingClass;
+                          setIsModalOpen(false);
+                          handleStartPromoting(target);
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-sky-50 hover:bg-sky-100 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <ArrowUpRight className="w-3.5 h-3.5" />
+                        <span>Chuyển khối / Lên lớp</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => handleArchiveClass(editingClass)}
+                      className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Archive className="w-3.5 h-3.5" />
+                      <span>
+                        {editingClass.status === 'active' ? 'Đưa vào Lưu trữ' : 'Khôi phục Hoạt động'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const target = editingClass;
+                        setIsModalOpen(false);
+                        setDeletingClass(target);
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Xóa an toàn (Có lưu Bản chụp)</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-2">
                 <button
                   type="button"
@@ -904,7 +1312,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                 <button
                   type="submit"
                   disabled={isDuplicateClassName || !(classNameInput || '').trim()}
-                  className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                 >
                   Lưu Thông Tin
                 </button>
@@ -921,8 +1329,10 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
             <div className="flex items-center gap-3 text-rose-600 dark:text-rose-400">
               <ShieldAlert className="w-8 h-8 shrink-0" />
               <div>
-                <h3 className="text-base font-bold">Xác Nhận Xóa Vĩnh Viễn Lớp Học</h3>
-                <p className="text-xs text-slate-500">Thao tác này KHÔNG THỂ KHÔI PHỤC!</p>
+                <h3 className="text-base font-bold">Xác Nhận Xóa An Toàn Lớp Học</h3>
+                <p className="text-xs text-slate-500">
+                  Hệ thống sẽ tự động lưu 1 Bản chụp dự phòng trước khi xóa để có thể hoàn tác trong Cài đặt.
+                </p>
               </div>
             </div>
 
@@ -949,9 +1359,9 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
               <button
                 onClick={handleConfirmDelete}
                 disabled={(deleteConfirmText || '').trim() !== (deletingClass?.class_name || '').trim()}
-                className="px-4 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold hover:bg-rose-700 disabled:opacity-50"
+                className="px-4 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold hover:bg-rose-700 disabled:opacity-50 cursor-pointer"
               >
-                Xóa Vĩnh Viễn
+                Xóa Lớp (Lưu Bản Chụp)
               </button>
             </div>
           </div>
@@ -994,14 +1404,11 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                 }`}
               />
               {isDuplicatePromotedClassName && (
-                <div className="mt-1.5 p-2 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl flex items-center gap-1.5 text-xs text-rose-700 dark:text-rose-300 font-bold animate-fadeIn">
+                <div className="mt-1.5 p-2 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl flex items-center gap-1.5 text-xs text-rose-700 dark:text-rose-300 font-bold">
                   <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />
                   <span>Đã tồn tại lớp học trùng tên này trong hệ thống! Vui lòng đổi tên khác.</span>
                 </div>
               )}
-              <p className="text-[10px] text-slate-400">
-                *Hệ thống tự động đề xuất tăng tên lớp lên +1 đơn vị. Thầy cô có thể tự do chỉnh sửa lại.
-              </p>
             </div>
 
             <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-200 dark:border-slate-800">
@@ -1014,7 +1421,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
               <button
                 onClick={handleExecutePromote}
                 disabled={isDuplicatePromotedClassName || !(promotedClassName || '').trim()}
-                className="px-4 py-2 bg-sky-600 text-white rounded-xl text-xs font-bold hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="px-4 py-2 bg-sky-600 text-white rounded-xl text-xs font-bold hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
               >
                 Xác Nhận Lên Lớp
               </button>
@@ -1023,13 +1430,31 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
         </div>
       )}
 
-      {/* Viewing Class Details Modal */}
+      {/* ======================================================================= */}
+      {/* VIEWING CLASS DETAILS MODAL — KAIZEN FOR CUSTOMER CARE (CSKH)           */}
+      {/* ======================================================================= */}
       {viewingClassDetails && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-4xl w-full p-6 border border-slate-200 dark:border-slate-800 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
-            
+        <div className="fixed inset-0 z-40 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-6xl w-full p-6 border border-slate-200 dark:border-slate-800 shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto">
+            {/* Toast Notification inside Class Details */}
+            {toastMessage && (
+              <div className="p-3 rounded-xl bg-emerald-600 text-white text-xs font-bold flex items-center justify-between shadow-md">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  <span>{toastMessage}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setToastMessage(null)}
+                  className="p-1 hover:bg-emerald-700 rounded-lg cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
             {/* Modal Header */}
-            <div className="flex items-start justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-3">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300">
@@ -1040,36 +1465,85 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                   </span>
                 </div>
                 <h3 className="text-lg font-extrabold text-slate-900 dark:text-slate-100">
-                  Chi Tiết Lớp Học: {viewingClassDetails.class_name}
+                  Chi Tiết &amp; CSKH Lớp Học: {viewingClassDetails.class_name}
                 </h3>
                 <p className="text-[11px] text-slate-500">
                   Trợ giảng phụ trách: <strong>{viewingClassDetails.assistant_name}</strong> ({viewingClassDetails.assistant_phone || 'Chưa có SĐT'})
                 </p>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex items-center flex-wrap gap-2">
+                {/* KAIZEN 1 TRIGGER: 1-Click Class Zalo Group Report */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsGroupZaloOpen(true);
+                    setIsGroupZaloEdited(false);
+                    setCopiedGroupZalo(false);
+                  }}
+                  className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+                  title="Tạo bản tin tổng kết buổi học & bảng vinh danh để gửi Nhóm Zalo Phụ huynh cả lớp"
+                >
+                  <Megaphone className="w-4 h-4" />
+                  <span>Báo cáo Zalo Nhóm PH Cả Lớp 1-Click</span>
+                </button>
+
                 <button
                   onClick={() => handleExportRosterExcel(viewingClassDetails)}
-                  className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm"
-                  title="Xuất danh sách sĩ số ra Excel"
+                  className="px-3 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  title="Xuất danh sách sĩ số & trạng thái CSKH ra Excel"
                 >
-                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
                   <span>Xuất Excel</span>
                 </button>
+
                 <button
                   onClick={() => setViewingClassDetails(null)}
-                  className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                  className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
             </div>
 
+            {/* KAIZEN 3 BANNER: Automatic Detection of Algebra (Đ) <-> Geometry (H) Duplicate Profiles */}
+            {crossClassDuplicatePairs.length > 0 && (
+              <div className="p-3.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 space-y-2">
+                <div className="text-xs font-bold text-amber-900 dark:text-amber-200 flex items-center gap-2">
+                  <GitMerge className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span>
+                    Phát hiện {crossClassDuplicatePairs.length} học sinh học cả Đại số &amp; Hình học cùng Khối {viewingClassDetails.grade_level} đang bị tách 2 hồ sơ trùng tên:
+                  </span>
+                </div>
+                <div className="space-y-1.5">
+                  {crossClassDuplicatePairs.map((pair, idx) => (
+                    <div
+                      key={idx}
+                      className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white dark:bg-slate-900 px-3 py-2 rounded-lg border border-amber-200/70 dark:border-amber-900/60 text-xs"
+                    >
+                      <span className="text-slate-700 dark:text-slate-200">
+                        Học sinh <strong>{pair.thisStudent.full_name}</strong> (Lớp {viewingClassDetails.class_name}) trùng với hồ sơ{' '}
+                        <strong>{pair.otherStudent.full_name}</strong> đang ở lớp <strong>{pair.otherClassName}</strong>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleMergeCrossClassDuplicate(pair)}
+                        className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1.5 shrink-0 cursor-pointer"
+                      >
+                        <GitMerge className="w-3.5 h-3.5" />
+                        <span>Gộp 1-Click (Giữ cả 2 lớp &amp; điểm)</span>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Sub-tabs inside Detail Modal */}
             <div className="flex border-b border-slate-200 dark:border-slate-800">
               <button
                 onClick={() => setDetailSubTab('roster')}
-                className={`flex-1 pb-2.5 text-xs font-bold text-center border-b-2 transition-all flex items-center justify-center gap-1.5 ${
+                className={`flex-1 pb-2.5 text-xs font-bold text-center border-b-2 transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
                   detailSubTab === 'roster'
                     ? 'border-emerald-600 text-emerald-600 dark:text-emerald-400'
                     : 'border-transparent text-slate-500 hover:text-slate-700'
@@ -1077,7 +1551,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
               >
                 <Users className="w-4 h-4" />
                 <span>
-                  Danh Sách Sĩ Số ({
+                  Danh Sách Sĩ Số &amp; Điều Phối CSKH ({
                     classStudents.filter((cs) => {
                       if (String(cs.class_id) !== String(viewingClassDetails.id)) return false;
                       if (cs.leave_date) return false;
@@ -1089,7 +1563,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
               </button>
               <button
                 onClick={() => setDetailSubTab('sessions')}
-                className={`flex-1 pb-2.5 text-xs font-bold text-center border-b-2 transition-all flex items-center justify-center gap-1.5 ${
+                className={`flex-1 pb-2.5 text-xs font-bold text-center border-b-2 transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
                   detailSubTab === 'sessions'
                     ? 'border-emerald-600 text-emerald-600 dark:text-emerald-400'
                     : 'border-transparent text-slate-500 hover:text-slate-700'
@@ -1100,15 +1574,15 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
               </button>
             </div>
 
-            {/* Sub-tab 1 Content: Class Roster */}
+            {/* Sub-tab 1 Content: Class Roster & CSKH */}
             {detailSubTab === 'roster' && (
               <div className="space-y-3">
-                {/* Roster Filter Status & Quick Enroll */}
+                {/* Roster Filter Status & Smart Cross-Class Enrollment (No bulk orphan button!) */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
                   <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl shrink-0">
                     <button
                       onClick={() => setRosterFilterStatus('active')}
-                      className={`px-3 py-1 rounded-lg font-bold text-[11px] ${
+                      className={`px-3 py-1 rounded-lg font-bold text-[11px] cursor-pointer ${
                         rosterFilterStatus === 'active' ? 'bg-white dark:bg-slate-900 shadow-sm text-slate-900 dark:text-white' : 'text-slate-500'
                       }`}
                     >
@@ -1123,7 +1597,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                     </button>
                     <button
                       onClick={() => setRosterFilterStatus('left')}
-                      className={`px-3 py-1 rounded-lg font-bold text-[11px] ${
+                      className={`px-3 py-1 rounded-lg font-bold text-[11px] cursor-pointer ${
                         rosterFilterStatus === 'left' ? 'bg-white dark:bg-slate-900 shadow-sm text-slate-900 dark:text-white' : 'text-slate-500'
                       }`}
                     >
@@ -1137,7 +1611,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                     </button>
                     <button
                       onClick={() => setRosterFilterStatus('all')}
-                      className={`px-3 py-1 rounded-lg font-bold text-[11px] ${
+                      className={`px-3 py-1 rounded-lg font-bold text-[11px] cursor-pointer ${
                         rosterFilterStatus === 'all' ? 'bg-white dark:bg-slate-900 shadow-sm text-slate-900 dark:text-white' : 'text-slate-500'
                       }`}
                     >
@@ -1151,23 +1625,41 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                     </button>
                   </div>
 
+                  {/* KAIZEN 3: Smart Cross-Class Enrollment Dropdown (Prioritizes Sibling Algebra/Geometry Students of the Same Grade) */}
                   {isAdmin && (() => {
                     const activeClassIdStr = String(viewingClassDetails.id);
+                    const curGrade = viewingClassDetails.grade_level;
                     const enrolledInThisClass = new Set(
                       classStudents
                         .filter((cs) => String(cs.class_id) === activeClassIdStr && !cs.leave_date)
                         .map((cs) => String(cs.student_id))
                     );
-                    const enrolledAnywhere = new Set(
-                      classStudents
-                        .filter((cs) => !cs.leave_date)
-                        .map((cs) => String(cs.student_id))
-                    );
+
+                    // Map student_id -> active class names & grades
+                    const studentClassNamesMap = new Map<string, string[]>();
+                    const studentGradesMap = new Map<string, Set<number>>();
+                    for (const cs of classStudents) {
+                      if (cs.leave_date) continue;
+                      const cObj = classes.find((c) => String(c.id) === String(cs.class_id));
+                      if (!cObj) continue;
+                      const sid = String(cs.student_id);
+                      if (!studentClassNamesMap.has(sid)) studentClassNamesMap.set(sid, []);
+                      studentClassNamesMap.get(sid)!.push(cObj.class_name);
+                      if (!studentGradesMap.has(sid)) studentGradesMap.set(sid, new Set());
+                      studentGradesMap.get(sid)!.add(cObj.grade_level);
+                    }
+
                     const availableToEnroll = students
                       .filter((s) => s.status !== 'stopped' && !enrolledInThisClass.has(String(s.id)))
                       .sort((a, b) => compareVietnameseNames(a.full_name || '', b.full_name || ''));
-                    const unassignedStudents = availableToEnroll.filter(
-                      (s) => !enrolledAnywhere.has(String(s.id))
+
+                    // Priority Group 1: Students already in a same-grade sibling class (e.g. Algebra <-> Geometry)
+                    const sameGradeSiblingStudents = availableToEnroll.filter((s) =>
+                      studentGradesMap.get(String(s.id))?.has(curGrade)
+                    );
+                    // Group 2: Other available students
+                    const otherAvailableStudents = availableToEnroll.filter(
+                      (s) => !studentGradesMap.get(String(s.id))?.has(curGrade)
                     );
 
                     if (availableToEnroll.length === 0) return null;
@@ -1177,17 +1669,35 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                         <select
                           id="quick-enroll-student-select"
                           defaultValue=""
-                          className="text-[11px] bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 rounded-xl outline-none font-bold text-slate-700 dark:text-slate-200 max-w-[210px]"
+                          className="text-[11px] bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 rounded-xl outline-none font-bold text-slate-700 dark:text-slate-200 max-w-[320px]"
                         >
-                          <option value="">+ Chọn học sinh thêm vào lớp...</option>
-                          {availableToEnroll.map((s) => {
-                            const hasNoClass = !enrolledAnywhere.has(String(s.id));
-                            return (
-                              <option key={s.id} value={s.id}>
-                                {s.full_name} {hasNoClass ? '(Chưa xếp lớp)' : ''}
-                              </option>
-                            );
-                          })}
+                          <option value="">
+                            + Ghi danh học sinh vào lớp (Chống tạo trùng Đại/Hình)...
+                          </option>
+                          {sameGradeSiblingStudents.length > 0 && (
+                            <optgroup label={`★ Ưu tiên: Học sinh cùng Khối ${curGrade} đang học lớp Đại/Hình đối ứng`}>
+                              {sameGradeSiblingStudents.map((s) => {
+                                const cNames = studentClassNamesMap.get(String(s.id)) || [];
+                                return (
+                                  <option key={s.id} value={s.id}>
+                                    {s.full_name} (Đang học: {cNames.join(', ')})
+                                  </option>
+                                );
+                              })}
+                            </optgroup>
+                          )}
+                          {otherAvailableStudents.length > 0 && (
+                            <optgroup label="Học sinh khác / Chưa xếp lớp">
+                              {otherAvailableStudents.map((s) => {
+                                const cNames = studentClassNamesMap.get(String(s.id)) || [];
+                                return (
+                                  <option key={s.id} value={s.id}>
+                                    {s.full_name} {cNames.length > 0 ? `(${cNames.join(', ')})` : '(Chưa xếp lớp)'}
+                                  </option>
+                                );
+                              })}
+                            </optgroup>
+                          )}
                         </select>
                         <button
                           type="button"
@@ -1209,73 +1719,48 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                               await logAudit(
                                 currentRole as UserRole,
                                 'Xếp học sinh vào lớp',
-                                `Xếp học sinh ${stObj.full_name} học thêm lớp ${viewingClassDetails.class_name}`
+                                `Xếp học sinh ${stObj.full_name} học thêm lớp ${viewingClassDetails.class_name} (Dùng chung 1 hồ sơ)`
+                              );
+                              showToast(
+                                `Đã ghi danh "${stObj.full_name}" vào lớp ${viewingClassDetails.class_name} (Liên kết chung 1 hồ sơ)!`
                               );
                             }
                             sel.value = '';
                             onRefresh();
                           }}
-                          className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-[11px] transition-colors cursor-pointer shrink-0"
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-[11px] transition-colors cursor-pointer shrink-0"
                         >
-                          Thêm vào lớp
+                          Ghi danh vào lớp
                         </button>
-                        {unassignedStudents.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              if (
-                                confirm(
-                                  `Xác nhận xếp toàn bộ ${unassignedStudents.length} học sinh đang ở trạng thái "Chưa xếp lớp" vào lớp ${viewingClassDetails.class_name}?`
-                                )
-                              ) {
-                                const now = new Date().toISOString();
-                                const todayStr = now.split('T')[0];
-                                const records = unassignedStudents.map((s) => ({
-                                  id: `cs_${activeClassIdStr}_${String(s.id)}`,
-                                  class_id: activeClassIdStr,
-                                  student_id: String(s.id!),
-                                  join_date: todayStr,
-                                  leave_date: undefined,
-                                  created_at: now,
-                                }));
-                                await db.class_students.bulkPut(records);
-                                await pushBatchDocsToFirestore('class_students', records);
-                                await logAudit(
-                                  currentRole as UserRole,
-                                  'Xếp lớp hàng loạt',
-                                  `Xếp ${unassignedStudents.length} học sinh chưa phân lớp vào lớp ${viewingClassDetails.class_name}`
-                                );
-                                onRefresh();
-                              }
-                            }}
-                            className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-[11px] transition-colors cursor-pointer shrink-0"
-                            title="Tự động thêm tất cả học sinh chưa có lớp vào lớp học này"
-                          >
-                            + Xếp {unassignedStudents.length} HS chưa có lớp
-                          </button>
-                        )}
                       </div>
                     );
                   })()}
                 </div>
 
-                <div className="overflow-x-auto">
+                {/* KAIZEN 2: Customer-Care Roster Table with Academic Telemetry, Last Active Date, CRM Status & 1-Click Parent Report */}
+                <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-xl">
                   <table className="w-full text-left text-xs border-collapse">
                     <thead>
-                      <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-400 font-bold uppercase text-[10px]">
+                      <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/60 text-slate-500 font-bold uppercase text-[10px]">
                         <th className="py-2.5 px-3">STT</th>
-                        <th className="py-2.5 px-3">Học Sinh</th>
-                        <th className="py-2.5 px-3">Giới Tính</th>
-                        <th className="py-2.5 px-3">Phụ Huynh</th>
-                        <th className="py-2.5 px-3">SĐT Phụ Huynh</th>
-                        <th className="py-2.5 px-3">Trạng Thái</th>
-                        {isAdmin && <th className="py-2.5 px-3 text-right">Thao Tác</th>}
+                        <th className="py-2.5 px-3">Học Sinh &amp; Lớp Học Kèm</th>
+                        <th className="py-2.5 px-3">Phụ Huynh &amp; Liên Hệ</th>
+                        <th className="py-2.5 px-3">Kết Quả Tại Lớp &amp; Buổi Cuối</th>
+                        <th className="py-2.5 px-3">Nhãn CSKH</th>
+                        <th className="py-2.5 px-3 text-right">Báo Cáo PH 1-Click &amp; Quản Lý</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60 text-slate-700 dark:text-slate-300">
                       {(() => {
+                        const curClassIdStr = String(viewingClassDetails.id);
+                        const clsSessions = sessions
+                          .filter((s) => String(s.class_id) === curClassIdStr)
+                          .sort((a, b) => a.session_date.localeCompare(b.session_date));
+                        const clsSessionIdSet = new Set(clsSessions.map((s) => String(s.id)));
+                        const clsSessionMap = new Map(clsSessions.map((s) => [String(s.id), s]));
+
                         const classStudLinks = classStudents.filter((cs) => {
-                          if (String(cs.class_id) !== String(viewingClassDetails.id)) return false;
+                          if (String(cs.class_id) !== curClassIdStr) return false;
                           const st = students.find((s) => String(s.id) === String(cs.student_id));
                           if (!st) return false;
 
@@ -1294,7 +1779,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                         if (classStudLinks.length === 0) {
                           return (
                             <tr>
-                              <td colSpan={7} className="py-8 text-center text-slate-400 italic">
+                              <td colSpan={6} className="py-8 text-center text-slate-400 italic">
                                 Không có học sinh nào trong danh mục này.
                               </td>
                             </tr>
@@ -1304,84 +1789,287 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                         return classStudLinks.map((link, idx) => {
                           const st = students.find((s) => String(s.id) === String(link.student_id));
                           if (!st) return null;
-                          const isCurrentlyActive = !link.leave_date;
+                          const sid = String(st.id);
+                          const isCurrentlyActive = !link.leave_date && st.status !== 'stopped';
+
+                          // Other active classes this student is enrolled in (e.g. Đại <-> Hình)
+                          const otherClasses = classStudents
+                            .filter(
+                              (cs) =>
+                                String(cs.student_id) === sid &&
+                                String(cs.class_id) !== curClassIdStr &&
+                                !cs.leave_date
+                            )
+                            .map((cs) => classes.find((c) => String(c.id) === String(cs.class_id))?.class_name)
+                            .filter(Boolean);
+
+                          // Academic performance inside this class
+                          const stClsRecords = studentSessions.filter(
+                            (ss) =>
+                              String(ss.student_id) === sid &&
+                              clsSessionIdSet.has(String(ss.session_id))
+                          );
+                          const presentRecs = stClsRecords.filter(
+                            (r) => r.attendance === 'present' || r.attendance === 'late'
+                          );
+                          const hwScores = stClsRecords
+                            .filter((r) => typeof r.homework_score === 'number' && r.homework_score > 0)
+                            .map((r) => Number(r.homework_score));
+                          const testScores = stClsRecords
+                            .filter((r) => typeof r.test_score === 'number' && r.test_score > 0)
+                            .map((r) => Number(r.test_score));
+
+                          const avgHw =
+                            hwScores.length > 0
+                              ? (hwScores.reduce((a, b) => a + b, 0) / hwScores.length).toFixed(1)
+                              : '—';
+                          const avgTest =
+                            testScores.length > 0
+                              ? (testScores.reduce((a, b) => a + b, 0) / testScores.length).toFixed(1)
+                              : '—';
+
+                          const activeDates = presentRecs
+                            .map((r) => clsSessionMap.get(String(r.session_id))?.session_date)
+                            .filter(Boolean)
+                            .sort() as string[];
+                          const lastActiveDate =
+                            activeDates[activeDates.length - 1] || 'Chưa có buổi';
+
+                          const cleanPhone = (st.parent_phone || '').replace(/\D/g, '');
+                          const crmStatus: CRMCustomerStatus = st.crm_status || 'satisfied';
+
+                          const handleCycleCrmStatus = async () => {
+                            const order: CRMCustomerStatus[] = [
+                              'satisfied',
+                              'attention',
+                              'at_risk',
+                            ];
+                            const nextStatus =
+                              order[(order.indexOf(crmStatus) + 1) % order.length];
+                            const now = new Date().toISOString();
+                            await db.students.update(sid, {
+                              crm_status: nextStatus,
+                              crm_status_updated_at: now,
+                              updated_at: now,
+                            });
+                            showToast(
+                              `Đã đổi nhãn CSKH của ${st.full_name} sang "${CRM_CLASSIFICATION_CRITERIA[nextStatus].shortBadge}"`
+                            );
+                          };
 
                           return (
-                            <tr key={link.id ? `${link.id}-${idx}` : idx} className={`hover:bg-slate-50 dark:hover:bg-slate-800/30 ${!isCurrentlyActive ? 'opacity-60 bg-slate-50/40 dark:bg-slate-900/40' : ''}`}>
-                              <td className="py-3 px-3 font-mono text-slate-400">{idx + 1}</td>
-                              <td className="py-3 px-3 font-bold text-slate-900 dark:text-slate-100">
-                                {st.full_name}
-                                {!isCurrentlyActive && (
-                                  <span className="ml-1.5 text-[10px] text-rose-500 font-bold">(Đã rút)</span>
-                                )}
+                            <tr
+                              key={link.id ? `${link.id}-${idx}` : idx}
+                              className={`hover:bg-slate-50 dark:hover:bg-slate-800/30 ${
+                                !isCurrentlyActive ? 'opacity-60 bg-slate-50/40 dark:bg-slate-900/40' : ''
+                              }`}
+                            >
+                              <td className="py-3 px-3 font-mono text-slate-400 align-top">
+                                {idx + 1}
                               </td>
-                              <td className="py-3 px-3 text-slate-500">{st.gender}</td>
-                              <td className="py-3 px-3">{st.parent_name}</td>
-                              <td className="py-3 px-3 font-medium text-emerald-600 dark:text-emerald-400">{st.parent_phone}</td>
-                              <td className="py-3 px-3">
-                                {isCurrentlyActive ? (
-                                  <span className={`px-2 py-0.5 rounded text-[10px] font-extrabold ${
-                                    st.status === 'studying'
-                                      ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
-                                      : st.status === 'paused'
-                                      ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/40'
-                                      : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40'
-                                  }`}>
-                                    {st.status === 'studying' ? 'Đang Học' : st.status === 'paused' ? 'Tạm Nghỉ' : 'Nghỉ Hẳn'}
-                                  </span>
-                                ) : (
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400">
-                                    Rút ngày {link.leave_date}
-                                  </span>
-                                )}
-                              </td>
-                              {isAdmin && (
-                                <td className="py-3 px-3 text-right space-x-2.5">
-                                  {isCurrentlyActive ? (
-                                    <button
-                                      onClick={async () => {
-                                        if (confirm(`Bạn có chắc chắn muốn cho học sinh ${st.full_name} rút lui an toàn khỏi lớp ${viewingClassDetails.class_name}?\nDữ liệu lịch sử điểm số cũ vẫn được bảo lưu đầy đủ.`)) {
-                                          const todayStr = new Date().toISOString().split('T')[0];
-                                          await db.class_students.update(link.id!, { leave_date: todayStr });
-                                          await logAudit(currentRole as UserRole, 'Cho học sinh rút lui', `Cho học sinh ${st.full_name} rút lui an toàn khỏi lớp ${viewingClassDetails.class_name}`);
-                                          onRefresh();
-                                        }
-                                      }}
-                                      className="text-amber-500 hover:text-amber-700 font-bold hover:underline text-[11px]"
-                                    >
-                                      Rút lui
-                                    </button>
-                                  ) : (
-                                    <button
-                                      onClick={async () => {
-                                        if (confirm(`Khôi phục học sinh ${st.full_name} quay lại tham gia học lớp ${viewingClassDetails.class_name}?`)) {
-                                          await db.class_students.update(link.id!, {
-                                            leave_date: undefined,
-                                            join_date: new Date().toISOString().split('T')[0]
-                                          });
-                                          await logAudit(currentRole as UserRole, 'Khôi phục học sinh', `Khôi phục ${st.full_name} tham gia học lại lớp ${viewingClassDetails.class_name}`);
-                                          onRefresh();
-                                        }
-                                      }}
-                                      className="text-emerald-500 hover:text-emerald-700 font-bold hover:underline text-[11px]"
-                                    >
-                                      Học lại
-                                    </button>
+
+                              {/* Col 2: Student Name & Linked Sibling Class */}
+                              <td className="py-3 px-3 align-top">
+                                <div className="font-bold text-slate-900 dark:text-slate-100">
+                                  {st.full_name}
+                                  {!isCurrentlyActive && (
+                                    <span className="ml-1.5 text-[10px] text-rose-500 font-bold">
+                                      (Đã rút {link.leave_date})
+                                    </span>
                                   )}
+                                </div>
+                                {otherClasses.length > 0 && (
+                                  <div className="text-[11px] text-sky-700 dark:text-sky-400 font-medium mt-0.5">
+                                    Học kèm: {otherClasses.join(', ')}
+                                  </div>
+                                )}
+                              </td>
+
+                              {/* Col 3: Parent & Quick Call / Zalo */}
+                              <td className="py-3 px-3 align-top">
+                                <div className="font-medium text-slate-800 dark:text-slate-200">
+                                  {st.parent_name || 'Phụ huynh'}
+                                </div>
+                                <div className="text-[11px] font-mono text-slate-500 tabular-nums">
+                                  {st.parent_phone || 'Chưa có SĐT'}
+                                </div>
+                                {cleanPhone && (
+                                  <div className="flex items-center gap-2 mt-1">
+                                    <a
+                                      href={`tel:${cleanPhone}`}
+                                      className="text-[11px] font-semibold text-slate-600 dark:text-slate-300 hover:text-emerald-600 flex items-center gap-0.5"
+                                    >
+                                      <Phone className="w-3 h-3" />
+                                      <span>Gọi</span>
+                                    </a>
+                                    <span>·</span>
+                                    <a
+                                      href={`https://zalo.me/${cleanPhone}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-[11px] font-semibold text-sky-600 dark:text-sky-400 hover:underline flex items-center gap-0.5"
+                                    >
+                                      <ExternalLink className="w-3 h-3" />
+                                      <span>Zalo</span>
+                                    </a>
+                                  </div>
+                                )}
+                              </td>
+
+                              {/* Col 4: Class Academic Telemetry & Last Active Date */}
+                              <td className="py-3 px-3 align-top font-mono tabular-nums">
+                                <div className="text-[11px]">
+                                  Đi học:{' '}
+                                  <strong className="text-slate-900 dark:text-slate-100">
+                                    {presentRecs.length}/{stClsRecords.length} buổi
+                                  </strong>{' '}
+                                  · BTVN: <strong>{avgHw}</strong> · KT:{' '}
+                                  <strong className="text-emerald-700 dark:text-emerald-400">
+                                    {avgTest}
+                                  </strong>
+                                </div>
+                                <div
+                                  className={`text-[11px] mt-0.5 ${
+                                    lastActiveDate < '2026-10-20'
+                                      ? 'text-rose-600 dark:text-rose-400 font-bold'
+                                      : 'text-slate-500'
+                                  }`}
+                                >
+                                  Buổi cuối: {lastActiveDate}
+                                </div>
+                              </td>
+
+                              {/* Col 5: 1-Click CRM Status Toggle */}
+                              <td className="py-3 px-3 align-top">
+                                <button
+                                  type="button"
+                                  onClick={handleCycleCrmStatus}
+                                  title="Nhấn để chuyển nhanh nhãn CSKH (Hài lòng -> Cần chú ý -> Nguy cơ nghỉ học)"
+                                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold flex items-center gap-1 cursor-pointer ${
+                                    crmStatus === 'satisfied'
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800'
+                                      : crmStatus === 'attention'
+                                      ? 'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800'
+                                      : 'bg-rose-50 text-rose-800 border-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:border-rose-800'
+                                  }`}
+                                >
+                                  {crmStatus === 'satisfied' && (
+                                    <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                  )}
+                                  {crmStatus === 'attention' && (
+                                    <AlertTriangle className="w-3 h-3 text-amber-600" />
+                                  )}
+                                  {crmStatus === 'at_risk' && (
+                                    <Flame className="w-3 h-3 text-rose-600" />
+                                  )}
+                                  <span>
+                                    {CRM_CLASSIFICATION_CRITERIA[crmStatus].shortBadge}
+                                  </span>
+                                </button>
+                              </td>
+
+                              {/* Col 6: 1-Click Parent Report & Roster Actions */}
+                              <td className="py-3 px-3 align-top text-right">
+                                <div className="flex items-center justify-end gap-2">
                                   <button
-                                    onClick={async () => {
-                                      if (confirm(`Bạn có chắc chắn muốn xóa học sinh ${st.full_name} khỏi lớp ${viewingClassDetails.class_name}? Các dữ liệu điểm số vẫn được bảo lưu nhưng học sinh sẽ không còn thuộc sĩ số lớp này.`)) {
-                                        await db.class_students.delete(link.id!);
-                                        await logAudit(currentRole as UserRole, 'Xóa học sinh khỏi lớp', `Xóa ${st.full_name} khỏi lớp ${viewingClassDetails.class_name}`);
-                                        onRefresh();
+                                    type="button"
+                                    onClick={() => {
+                                      setReportStudentId(sid);
+                                      setIsReportEdited(false);
+                                      setCopiedSingleReport(false);
+                                      if (crmStatus === 'at_risk') {
+                                        setReportTemplateId('tpl_retention_care');
+                                      } else if (crmStatus === 'attention') {
+                                        setReportTemplateId('tpl_homework_attendance');
+                                      } else {
+                                        setReportTemplateId('tpl_periodic_report');
                                       }
                                     }}
-                                    className="text-rose-500 hover:text-rose-700 font-bold hover:underline"
+                                    className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1 cursor-pointer whitespace-nowrap"
                                   >
-                                    Xóa
+                                    <MessageSquareText className="w-3.5 h-3.5" />
+                                    <span>Báo cáo PH 1-Click</span>
                                   </button>
-                                </td>
-                              )}
+
+                                  {isAdmin && (
+                                    <>
+                                      {isCurrentlyActive ? (
+                                        <button
+                                          onClick={async () => {
+                                            if (
+                                              confirm(
+                                                `Bạn có chắc chắn muốn cho học sinh ${st.full_name} rút lui an toàn khỏi lớp ${viewingClassDetails.class_name}?\nDữ liệu lịch sử điểm số cũ vẫn được bảo lưu đầy đủ.`
+                                              )
+                                            ) {
+                                              const todayStr = new Date()
+                                                .toISOString()
+                                                .split('T')[0];
+                                              await db.class_students.update(link.id!, {
+                                                leave_date: todayStr,
+                                              });
+                                              await logAudit(
+                                                currentRole as UserRole,
+                                                'Cho học sinh rút lui',
+                                                `Cho học sinh ${st.full_name} rút lui an toàn khỏi lớp ${viewingClassDetails.class_name}`
+                                              );
+                                              onRefresh();
+                                            }
+                                          }}
+                                          className="text-amber-600 hover:text-amber-800 font-bold hover:underline text-[11px] cursor-pointer"
+                                        >
+                                          Rút lớp
+                                        </button>
+                                      ) : (
+                                        <button
+                                          onClick={async () => {
+                                            if (
+                                              confirm(
+                                                `Khôi phục học sinh ${st.full_name} quay lại tham gia học lớp ${viewingClassDetails.class_name}?`
+                                              )
+                                            ) {
+                                              await db.class_students.update(link.id!, {
+                                                leave_date: undefined,
+                                                join_date: new Date()
+                                                  .toISOString()
+                                                  .split('T')[0],
+                                              });
+                                              await logAudit(
+                                                currentRole as UserRole,
+                                                'Khôi phục học sinh',
+                                                `Khôi phục ${st.full_name} tham gia học lại lớp ${viewingClassDetails.class_name}`
+                                              );
+                                              onRefresh();
+                                            }
+                                          }}
+                                          className="text-emerald-600 hover:text-emerald-800 font-bold hover:underline text-[11px] cursor-pointer"
+                                        >
+                                          Học lại
+                                        </button>
+                                      )}
+                                      <button
+                                        onClick={async () => {
+                                          if (
+                                            confirm(
+                                              `Bạn có chắc chắn muốn xóa học sinh ${st.full_name} khỏi danh sách lớp ${viewingClassDetails.class_name}? Các dữ liệu điểm số vẫn được bảo lưu.`
+                                            )
+                                          ) {
+                                            await db.class_students.delete(link.id!);
+                                            await logAudit(
+                                              currentRole as UserRole,
+                                              'Xóa học sinh khỏi lớp',
+                                              `Xóa ${st.full_name} khỏi lớp ${viewingClassDetails.class_name}`
+                                            );
+                                            onRefresh();
+                                          }
+                                        }}
+                                        className="text-rose-500 hover:text-rose-700 font-bold hover:underline text-[11px] cursor-pointer"
+                                      >
+                                        Xóa
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
+                              </td>
                             </tr>
                           );
                         });
@@ -1417,8 +2105,8 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                   return (
                     <div className="space-y-3">
                       <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Lịch sử bài giảng đã dạy (Mới nhất lên đầu):</p>
-                      
-                      <div className="space-y-3 max-h-[40vh] overflow-y-auto pr-1">
+
+                      <div className="space-y-3 max-h-[50vh] overflow-y-auto pr-1">
                         {classSessions.map((sess, sIdx) => {
                           const rawSessScores = studentSessions.filter(
                             (ss) => String(ss.session_id) === String(sess.id) && (validClassStudentIds.size === 0 || validClassStudentIds.has(String(ss.student_id)))
@@ -1449,10 +2137,10 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
 
                           const presentCount = sessStudScores.filter((ss) => !ss.attendance || ss.attendance === 'present' || ss.attendance === 'late').length;
                           const totalCount = validClassStudentIds.size > 0 ? validClassStudentIds.size : sessStudScores.length;
-                          
+
                           const homeworks = sessStudScores.filter((ss) => !(ss.exempt || ss.exempt_homework) && typeof ss.homework_score === 'number' && ss.homework_score >= 0);
                           const avgHW = homeworks.length > 0 ? (homeworks.reduce((sum, h) => sum + (h.homework_score || 0), 0) / homeworks.length).toFixed(1) : 'N/A';
-                          
+
                           const tests = sessStudScores.filter((ss) => !(ss.exempt || ss.exempt_test) && (ss.attendance === 'present' || ss.attendance === 'late') && typeof ss.test_score === 'number' && ss.test_score >= 0);
                           const avgTest = tests.length > 0 ? (tests.reduce((sum, t) => sum + t.test_score, 0) / tests.length).toFixed(1) : 'N/A';
 
@@ -1483,22 +2171,38 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                                   <span className="text-slate-400 group-open:rotate-180 transition-transform">▼</span>
                                 </div>
                               </summary>
-                              
+
                               <div className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-3 space-y-2.5">
                                 <div className="flex justify-between items-center pb-2 border-b border-slate-100 dark:border-slate-800">
                                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Chi tiết điểm danh &amp; nhận xét học sinh:</span>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handleDeleteSession(sess);
-                                    }}
-                                    className="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-950/80 text-rose-600 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1 shadow-sm"
-                                    title="Xóa vĩnh viễn buổi học này và toàn bộ dữ liệu điểm liên quan"
-                                  >
-                                    <Trash2 className="w-3 h-3 text-rose-500" />
-                                    <span>Xóa buổi học này</span>
-                                  </button>
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setGroupZaloMode('single_session');
+                                        setGroupZaloSessionId(String(sess.id));
+                                        setIsGroupZaloEdited(false);
+                                        setIsGroupZaloOpen(true);
+                                      }}
+                                      className="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 rounded-lg text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <Megaphone className="w-3 h-3" />
+                                      <span>Tạo Bản tin Zalo Buổi này</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDeleteSession(sess);
+                                      }}
+                                      className="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-950/80 text-rose-600 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1 shadow-sm cursor-pointer"
+                                      title="Xóa vĩnh viễn buổi học này và toàn bộ dữ liệu điểm liên quan"
+                                    >
+                                      <Trash2 className="w-3 h-3 text-rose-500" />
+                                      <span>Xóa buổi học này</span>
+                                    </button>
+                                  </div>
                                 </div>
 
                                 {sess.homework_description && (
@@ -1506,7 +2210,7 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                                     📝 <strong>Bài tập giao về nhà:</strong> {sess.homework_description}
                                   </div>
                                 )}
-                                
+
                                 <div className="overflow-x-auto">
                                   <table className="w-full text-left text-[11px] border-collapse">
                                     <thead>
@@ -1591,10 +2295,318 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
             <div className="flex justify-end pt-3 border-t border-slate-100 dark:border-slate-800/60">
               <button
                 onClick={() => setViewingClassDetails(null)}
-                className="px-4 py-2 bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 rounded-xl text-xs font-bold shadow"
+                className="px-4 py-2 bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 rounded-xl text-xs font-bold shadow cursor-pointer"
               >
                 Đóng chi tiết
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================================= */}
+      {/* KAIZEN MODAL A: 1-CLICK CLASS ZALO GROUP ANNOUNCEMENT                   */}
+      {/* ======================================================================= */}
+      {isGroupZaloOpen && viewingClassDetails && compiledGroupZalo && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-emerald-600/10 text-emerald-600 flex items-center justify-center">
+                  <Megaphone className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
+                    Báo Cáo Nhóm Zalo Phụ Huynh Cả Lớp — {viewingClassDetails.class_name}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Tự động tổng hợp bài học, điểm TB lớp, BTVN và bảng vinh danh học sinh tiêu biểu
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsGroupZaloOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Mode & Session Selector */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 bg-slate-50 dark:bg-slate-800/60 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGroupZaloMode('single_session');
+                    setIsGroupZaloEdited(false);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer ${
+                    groupZaloMode === 'single_session'
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  Tổng kết 1 Buổi học
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGroupZaloMode('cycle_4');
+                    setIsGroupZaloEdited(false);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer ${
+                    groupZaloMode === 'cycle_4'
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  Tổng kết Chu kỳ 4 Buổi
+                </button>
+              </div>
+
+              {groupZaloMode === 'single_session' && (
+                <select
+                  value={groupZaloSessionId}
+                  onChange={(e) => {
+                    setGroupZaloSessionId(e.target.value);
+                    setIsGroupZaloEdited(false);
+                  }}
+                  className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-semibold"
+                >
+                  <option value="">Buổi học gần nhất</option>
+                  {sessions
+                    .filter((s) => String(s.class_id) === String(viewingClassDetails.id))
+                    .sort((a, b) => b.session_date.localeCompare(a.session_date))
+                    .map((s) => (
+                      <option key={s.id} value={String(s.id)}>
+                        {s.session_date} — {s.lesson_title}
+                      </option>
+                    ))}
+                </select>
+              )}
+            </div>
+
+            {/* Editable Announcement Textarea */}
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-200 mb-1.5">
+                Nội dung bản tin gửi Nhóm Zalo Phụ Huynh Lớp (Có thể chỉnh sửa thêm):
+              </label>
+              <textarea
+                rows={13}
+                value={
+                  isGroupZaloEdited
+                    ? groupZaloCustomText
+                    : compiledGroupZalo.announcementText
+                }
+                onChange={(e) => {
+                  setGroupZaloCustomText(e.target.value);
+                  setIsGroupZaloEdited(true);
+                }}
+                className="w-full p-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-800 dark:text-slate-100 leading-relaxed focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setIsGroupZaloOpen(false)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 cursor-pointer"
+              >
+                Đóng
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const text = isGroupZaloEdited
+                    ? groupZaloCustomText
+                    : compiledGroupZalo.announcementText;
+                  try {
+                    await navigator.clipboard.writeText(text);
+                    setCopiedGroupZalo(true);
+                    showToast(
+                      `Đã sao chép bản tin tổng kết lớp ${viewingClassDetails.class_name} để dán vào Nhóm Zalo Phụ huynh!`
+                    );
+                  } catch (e) {}
+                }}
+                className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-2 shadow-sm cursor-pointer"
+              >
+                {copiedGroupZalo ? (
+                  <>
+                    <Check className="w-4 h-4" />
+                    <span>Đã Sao Chép Bản Tin Nhóm Lớp!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-4 h-4" />
+                    <span>Sao Chép Bản Tin Gửi Nhóm Zalo Lớp</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================================= */}
+      {/* KAIZEN MODAL B: 1-CLICK SINGLE STUDENT PARENT REPORT INSIDE CLASS       */}
+      {/* ======================================================================= */}
+      {activeSingleReport && viewingClassDetails && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-3xl w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
+                  Báo Cáo Học Tập 1-Click — {activeSingleReport.student.full_name} (Lớp {viewingClassDetails.class_name})
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Phụ huynh: {activeSingleReport.student.parent_name || 'Gia đình'} ({activeSingleReport.student.parent_phone || 'Chưa có SĐT'}) ·{' '}
+                  {activeSingleReport.periodLabel} ({activeSingleReport.dateRangeText})
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReportStudentId(null)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Period & Template Selectors */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-300 mb-1">
+                  Chu kỳ tổng hợp điểm tại lớp {viewingClassDetails.class_name}:
+                </label>
+                <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+                  {(
+                    [
+                      { val: 1, label: '1 Buổi' },
+                      { val: 4, label: '4 Buổi' },
+                      { val: 8, label: '8 Buổi' },
+                      { val: 'all', label: 'Toàn khóa' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={String(opt.val)}
+                      type="button"
+                      onClick={() => {
+                        setReportCycleLimit(opt.val);
+                        setIsReportEdited(false);
+                      }}
+                      className={`flex-1 py-1.5 rounded-lg text-xs font-bold cursor-pointer ${
+                        reportCycleLimit === opt.val
+                          ? 'bg-white dark:bg-slate-900 text-emerald-700 dark:text-emerald-300 shadow-xs'
+                          : 'text-slate-600 dark:text-slate-400'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-300 mb-1">
+                  Chọn mẫu tin nhắn Zalo / SMS cá nhân hóa:
+                </label>
+                <select
+                  value={reportTemplateId}
+                  onChange={(e) => {
+                    setReportTemplateId(e.target.value);
+                    setIsReportEdited(false);
+                  }}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-semibold"
+                >
+                  {templates.map((tpl) => (
+                    <option key={tpl.id} value={tpl.id}>
+                      {tpl.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Summary Academic Strip */}
+            <div className="grid grid-cols-3 gap-2.5 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 text-xs font-mono tabular-nums">
+              <div>
+                <span className="text-slate-500 font-sans block text-[11px]">Chuyên cần</span>
+                <strong className="text-slate-900 dark:text-slate-100">
+                  {activeSingleReport.attendanceRate}% ({activeSingleReport.presentCount}/
+                  {activeSingleReport.totalSessionsInPeriod} buổi)
+                </strong>
+              </div>
+              <div>
+                <span className="text-slate-500 font-sans block text-[11px]">Điểm TB BTVN (Lớp)</span>
+                <strong className="text-slate-900 dark:text-slate-100">
+                  {activeSingleReport.studentHwAvg ?? '—'}/10 (Lớp: {activeSingleReport.classHwAvg ?? '—'})
+                </strong>
+              </div>
+              <div>
+                <span className="text-slate-500 font-sans block text-[11px]">Điểm TB Kiểm tra (Lớp)</span>
+                <strong className="text-emerald-700 dark:text-emerald-400">
+                  {activeSingleReport.studentTestAvg ?? '—'}/10 (Lớp: {activeSingleReport.classTestAvg ?? '—'})
+                </strong>
+              </div>
+            </div>
+
+            {/* Editable Message Textarea */}
+            <div>
+              <textarea
+                rows={12}
+                value={
+                  isReportEdited
+                    ? reportCustomText
+                    : renderedSingleReportMessage
+                }
+                onChange={(e) => {
+                  setReportCustomText(e.target.value);
+                  setIsReportEdited(true);
+                }}
+                className="w-full p-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-800 dark:text-slate-100 leading-relaxed focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setReportStudentId(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 cursor-pointer"
+              >
+                Đóng
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleCopySingleReportAndLog(false)}
+                className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+              >
+                {copiedSingleReport ? (
+                  <>
+                    <Check className="w-4 h-4" />
+                    <span>Đã Sao Chép &amp; Lưu Nhật Ký CSKH!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-4 h-4" />
+                    <span>Sao Chép &amp; Tự Động Lưu Nhật Ký CSKH</span>
+                  </>
+                )}
+              </button>
+
+              {activeSingleReport.student.parent_phone && (
+                <button
+                  type="button"
+                  onClick={() => handleCopySingleReportAndLog(true)}
+                  className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  <span>Sao Chép &amp; Mở Zalo Phụ Huynh</span>
+                </button>
+              )}
             </div>
           </div>
         </div>

@@ -1,15 +1,20 @@
 import React, { useState, useMemo } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { Student, StudentStatus, ClassItem, StudentSession, Session, Warning } from '../types';
+import { Student, StudentStatus, ClassItem, StudentSession, Session, Warning, CRMCustomerStatus, CRMInteractionLog } from '../types';
 import { db, deleteStudent } from '../db/dexie';
 import { createPreDeleteSnapshot } from '../utils/dbSafetyAndQA';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { StudentPerformanceTrend } from './student/StudentPerformanceTrend';
 import { StudentDuplicateAuditorModal } from './student/StudentDuplicateAuditorModal';
 import {
+  RawSessionHistoryPoint,
+  computePerformanceSummary,
+  computeSessionComposite,
+  generateZaloPerformanceSummary,
+  generatePerformanceReportCardBlob,
+} from '../utils/performanceReportCardGenerator';
+import {
   ResponsiveContainer,
-  LineChart,
-  Line,
   BarChart,
   Bar,
   Cell,
@@ -43,6 +48,10 @@ import {
   Copy,
   Filter,
   GraduationCap,
+  Download,
+  Image as ImageIcon,
+  MessageSquare,
+  CheckCircle2,
 } from 'lucide-react';
 import { UserRole } from '../types';
 
@@ -93,6 +102,11 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
   const [studentSessionsList, setStudentSessionsList] = useState<Session[]>([]);
   const [selectedProfileClassId, setSelectedProfileClassId] = useState<string | number | 'all'>('all');
 
+  // Report Card & Zalo Export Feedback States
+  const [reportToast, setReportToast] = useState<string | null>(null);
+  const [isExportingPng, setIsExportingPng] = useState(false);
+  const [quickCrmNote, setQuickCrmNote] = useState('');
+
   // Quick resolution states within student profile
   const [resolvingWarningId, setResolvingWarningId] = useState<string | null>(null);
   const [actionChoiceProfile, setActionChoiceProfile] = useState('Đã gọi điện cho Phụ huynh trao đổi tình hình');
@@ -103,8 +117,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
   const [transferFromClassId, setTransferFromClassId] = useState<string | number | ''>('');
   const [transferToClassId, setTransferToClassId] = useState<string | number | ''>('');
 
-  // Dynamically calculate performance history based on class filter
-  const studentPerformanceHistory = useMemo(() => {
+  // Dynamically calculate performance history based on class filter (aligned 100% with warningEngine 0-point rules)
+  const studentPerformanceHistory = useMemo<RawSessionHistoryPoint[]>(() => {
     if (!viewingStudent) return [];
 
     const filteredRaw = selectedProfileClassId === 'all'
@@ -119,82 +133,112 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
     return filteredRaw
       .map((ss) => {
         const sess = sortedSessList.find((s) => String(s.id) === String(ss.session_id));
+        const isExcused = ss.exempt || ss.attendance === 'absent_excused';
+
+        // Resolve topic name
+        let topicName = '';
+        if (sess?.knowledge_tag_id) {
+          const tag = knowledgeTags.find((t) => String(t.id) === String(sess.knowledge_tag_id));
+          if (tag) topicName = tag.tag_name;
+        }
+        if (!topicName && sess?.test_knowledge_tag && sess.test_knowledge_tag !== 'same') {
+          topicName = sess.test_knowledge_tag;
+        }
+        if (!topicName && sess?.lesson_title) {
+          topicName = sess.lesson_title;
+        }
+
+        // Accurate homework score: unsubmitted or unexcused absence = 0đ (unless exempt)
+        let computedHwScore: number | null = null;
+        if (!isExcused && !ss.exempt_homework) {
+          if (ss.homework_submitted === false || ss.attendance === 'absent_unexcused') {
+            computedHwScore = 0;
+          } else if (typeof ss.homework_score === 'number' && !isNaN(ss.homework_score)) {
+            computedHwScore = ss.homework_score;
+          }
+        }
+
+        // Accurate test score
+        let computedTestScore: number | null = null;
+        if (!isExcused && !ss.exempt_test) {
+          if (typeof ss.test_score === 'number' && !isNaN(ss.test_score)) {
+            computedTestScore = ss.test_score;
+          } else if (ss.attendance === 'absent_unexcused') {
+            computedTestScore = 0;
+          }
+        }
+
         return {
-          session_id: ss.session_id,
+          session_id: String(ss.session_id),
           class_id: sess ? sess.class_id : undefined,
           date: sess ? sess.session_date : '',
           title: sess ? sess.lesson_title : '',
-          hwScore: (ss.exempt || ss.exempt_homework || ss.homework_submitted === false || ss.late_submit) ? null : ss.homework_score,
-          testScore: (ss.exempt || ss.exempt_test) ? null : ss.test_score,
+          topicName,
+          hwScore: computedHwScore,
+          testScore: computedTestScore,
+          attendance: ss.attendance,
+          homework_submitted: ss.homework_submitted,
+          late_submit: ss.late_submit,
+          exempt: ss.exempt,
+          exempt_homework: ss.exempt_homework,
+          teacher_comment: ss.teacher_comment,
         };
       })
       .filter(item => item.date !== '')
       .sort((a, b) => a.date.localeCompare(b.date))
-      .map((item, idx) => ({
-        session: `Buổi ${idx + 1}`,
-        sessionFullName: item.title,
-        date: item.date,
-        hwScore: item.hwScore,
-        testScore: item.testScore,
-      }));
-  }, [viewingStudent, studentSessionsRaw, studentSessionsList, selectedProfileClassId]);
+      .map((item, idx) => {
+        const parts = item.date.split('-');
+        const shortDate = parts.length === 3 ? `${parts[2]}/${parts[1]}` : `Buổi ${idx + 1}`;
+        return {
+          sessionId: item.session_id,
+          session: shortDate,
+          sessionDate: item.date,
+          sessionFullName: item.title ? `${shortDate} - ${item.title}` : `Buổi ${idx + 1} (${shortDate})`,
+          topicName: item.topicName || item.title,
+          hwScore: item.hwScore,
+          testScore: item.testScore,
+          attendance: item.attendance,
+          homework_submitted: item.homework_submitted,
+          late_submit: item.late_submit,
+          exempt: item.exempt,
+          exempt_homework: item.exempt_homework,
+          teacher_comment: item.teacher_comment,
+        };
+      });
+  }, [viewingStudent, studentSessionsRaw, studentSessionsList, selectedProfileClassId, knowledgeTags]);
 
-  // Dynamically calculate topic averages based on class filter
+  // Dynamically calculate topic averages based on class filter using 70% Test + 30% HW composite
   const topicAverages = useMemo(() => {
     if (!viewingStudent) return [];
 
     const topicGroupMap: { [tagName: string]: { sum: number; count: number; category: string } } = {};
 
-    const filteredRaw = selectedProfileClassId === 'all'
-      ? studentSessionsRaw
-      : studentSessionsRaw.filter(ss => {
-          const sess = studentSessionsList.find(s => String(s.id) === String(ss.session_id));
-          return sess && String(sess.class_id) === String(selectedProfileClassId);
-        });
+    studentPerformanceHistory.forEach((pt) => {
+      if (pt.exempt) return;
+      const comp = computeSessionComposite(pt.testScore, pt.hwScore);
+      if (comp === null) return;
 
-    filteredRaw.forEach((ss) => {
-      if (ss.exempt) return;
-      const sess = studentSessionsList.find((s) => String(s.id) === String(ss.session_id));
-      if (!sess) return;
+      let topicName = pt.topicName || 'Đại số & Hình học';
+      if (topicName.includes(' - ')) {
+        topicName = topicName.split(' - ').slice(-1)[0];
+      }
 
-      let topicName = '';
       let category = 'Algebra';
-
-      if (sess.knowledge_tag_id) {
-        const tag = knowledgeTags.find(t => String(t.id) === String(sess.knowledge_tag_id));
-        if (tag) {
-          topicName = tag.tag_name;
-          category = tag.category;
-        }
-      }
-
-      if (!topicName) {
-        topicName = sess.test_knowledge_tag && sess.test_knowledge_tag !== 'same' ? sess.test_knowledge_tag : '';
-      }
-
-      if (!topicName) {
-        const title = sess?.lesson_title || '';
-        topicName = title.includes(' - ') ? title.split(' - ').slice(-1)[0] : 'Đại số & Hình học';
-      }
-
       const lowerTopic = topicName.toLowerCase();
-      if (lowerTopic.includes('hình') || lowerTopic.includes('tứ giác') || lowerTopic.includes('đường tròn') || lowerTopic.includes('hệ thức lượng')) {
+      if (
+        lowerTopic.includes('hình') ||
+        lowerTopic.includes('tứ giác') ||
+        lowerTopic.includes('đường tròn') ||
+        lowerTopic.includes('hệ thức lượng') ||
+        lowerTopic.includes('tam giác')
+      ) {
         category = 'Geometry';
       }
-
-      const hasValidTest = typeof ss.test_score === 'number' && ss.test_score >= 0;
-      const hasValidHw = !(ss.exempt || ss.exempt_homework) && typeof ss.homework_score === 'number' && ss.homework_score >= 0;
-
-      if (!hasValidTest && !hasValidHw) {
-        return;
-      }
-
-      const score = hasValidTest ? ss.test_score : ss.homework_score;
 
       if (!topicGroupMap[topicName]) {
         topicGroupMap[topicName] = { sum: 0, count: 0, category };
       }
-      topicGroupMap[topicName].sum += score;
+      topicGroupMap[topicName].sum += comp;
       topicGroupMap[topicName].count += 1;
     });
 
@@ -203,7 +247,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
       category: data.category === 'Algebra' ? 'Đại số' : 'Hình học',
       avgScore: data.count > 0 && !Number.isNaN(data.sum / data.count) ? parseFloat((data.sum / data.count).toFixed(1)) : 0,
     }));
-  }, [viewingStudent, studentSessionsRaw, studentSessionsList, selectedProfileClassId, knowledgeTags]);
+  }, [viewingStudent, studentPerformanceHistory]);
 
   // AI Diagnostics State
   const [aiDiagnosis, setAiDiagnosis] = useState<any | null>(null);
@@ -1077,18 +1121,41 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
       {/* Student Profile Drawer / Modal */}
       {viewingStudent && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-2xl w-full p-6 border border-slate-200 dark:border-slate-800 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-3xl w-full p-6 border border-slate-200 dark:border-slate-800 shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-2xl bg-emerald-600 text-white flex items-center justify-center font-bold text-sm shadow-md shadow-emerald-600/10">
                   {(viewingStudent.full_name || '?').slice(-1)}
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                    Hồ Sơ Phong Độ: {viewingStudent.full_name || ''}
-                  </h3>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
+                      Hồ Sơ Phong Độ: {viewingStudent.full_name || ''}
+                    </h3>
+                    {(() => {
+                      const crmSt: CRMCustomerStatus = viewingStudent.crm_status || 'satisfied';
+                      return (
+                        <span
+                          className={`px-2 py-0.5 rounded-lg text-[10px] font-extrabold border ${
+                            crmSt === 'at_risk'
+                              ? 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300'
+                              : crmSt === 'attention'
+                              ? 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300'
+                              : 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300'
+                          }`}
+                        >
+                          {crmSt === 'at_risk'
+                            ? '🔴 CSKH: Nguy cơ nghỉ học'
+                            : crmSt === 'attention'
+                            ? '🟠 CSKH: Cần chú ý'
+                            : '🟢 CSKH: Hài lòng'}
+                        </span>
+                      );
+                    })()}
+                  </div>
                   <p className="text-xs text-slate-500">
-                    Phụ huynh: {viewingStudent.parent_name || 'N/A'}{viewingStudent.parent_phone ? ` (${viewingStudent.parent_phone})` : ''}
+                    Phụ huynh: {viewingStudent.parent_name || 'N/A'}
+                    {viewingStudent.parent_phone ? ` (${viewingStudent.parent_phone})` : ''}
                   </p>
                 </div>
               </div>
@@ -1096,7 +1163,11 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
               <div className="flex items-center gap-2">
                 <button
                   onClick={async () => {
-                    if (confirm(`Xác nhận xóa học sinh ${viewingStudent.full_name}?\n\nHệ thống sẽ tự động tạo bản sao lưu dự phòng đầy đủ trước khi xóa để Thầy/Cô có thể hoàn tác trong mục Cài đặt nếu cần.`)) {
+                    if (
+                      confirm(
+                        `Xác nhận xóa học sinh ${viewingStudent.full_name}?\n\nHệ thống sẽ tự động tạo bản sao lưu dự phòng đầy đủ trước khi xóa để Thầy/Cô có thể hoàn tác trong mục Cài đặt nếu cần.`
+                      )
+                    ) {
                       await createPreDeleteSnapshot(
                         'student',
                         viewingStudent.id!,
@@ -1112,39 +1183,230 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                 >
                   <Trash2 className="w-4 h-4" />
                 </button>
-                <button onClick={() => setViewingStudent(null)} className="p-1 text-slate-400 hover:text-slate-600 transition-colors">
+                <button
+                  onClick={() => setViewingStudent(null)}
+                  className="p-1 text-slate-400 hover:text-slate-600 transition-colors"
+                >
                   <X className="w-5 h-5" />
                 </button>
               </div>
             </div>
 
-            {/* Class Filter if they have multiple classes */}
+            {/* Trạm Xuất Báo Cáo Phong Độ Gửi Phụ Huynh 1-Click & Bộ Lọc Lớp */}
             {(() => {
               const enrolledClassIds = classStudents
+                .filter((cs) => String(cs.student_id) === String(viewingStudent.id) && !cs.leave_date)
+                .map((cs) => String(cs.class_id));
+              const allEnrolledIds = classStudents
                 .filter((cs) => String(cs.student_id) === String(viewingStudent.id))
                 .map((cs) => String(cs.class_id));
-              const enrolledClasses = classes.filter((c) => enrolledClassIds.includes(String(c.id!)));
-              
-              if (enrolledClasses.length <= 1) return null;
-              
+              const enrolledClasses = classes.filter((c) => allEnrolledIds.includes(String(c.id!)));
+
+              let activeClassName = 'Lớp Toán';
+              let targetDesc = 'Thi vào Lớp 10 Công lập 8.0+';
+
+              if (selectedProfileClassId !== 'all') {
+                const specificClass = classes.find((c) => String(c.id) === String(selectedProfileClassId));
+                if (specificClass) {
+                  activeClassName = specificClass.class_name;
+                  if (specificClass.target_description) targetDesc = specificClass.target_description;
+                }
+              } else {
+                const activeClasses = classes.filter((c) => enrolledClassIds.includes(String(c.id!)));
+                if (activeClasses.length > 0) {
+                  activeClassName = activeClasses.map((c) => c.class_name).join(' + ');
+                  if (activeClasses[0].target_description) targetDesc = activeClasses[0].target_description;
+                } else if (enrolledClasses.length > 0) {
+                  activeClassName = enrolledClasses[0].class_name;
+                  if (enrolledClasses[0].target_description) targetDesc = enrolledClasses[0].target_description;
+                }
+              }
+
+              const perfSummary = computePerformanceSummary(studentPerformanceHistory, targetDesc);
+
+              const logCrmExportAction = async (summaryNote: string) => {
+                if (!viewingStudent.id) return;
+                const nowIso = new Date().toISOString();
+                const todayStr = nowIso.split('T')[0];
+                const newInteraction: CRMInteractionLog = {
+                  id: `crm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                  created_at: nowIso,
+                  channel: 'zalo',
+                  summary: summaryNote,
+                  created_by: currentRole === 'TA' ? 'TA' : 'Teacher',
+                };
+                const existingHistory = Array.isArray(viewingStudent.crm_interactions)
+                  ? viewingStudent.crm_interactions
+                  : [];
+                const updatedInteractions = [newInteraction, ...existingHistory];
+                await db.students.update(String(viewingStudent.id), {
+                  crm_interactions: updatedInteractions,
+                  crm_last_contacted_at: todayStr,
+                  updated_at: nowIso,
+                });
+                setViewingStudent((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        crm_interactions: updatedInteractions,
+                        crm_last_contacted_at: todayStr,
+                      }
+                    : null
+                );
+              };
+
+              const handleCopyZaloReport = async () => {
+                const zaloText = generateZaloPerformanceSummary({
+                  student: viewingStudent,
+                  className: activeClassName,
+                  targetDescription: targetDesc,
+                  summary: perfSummary,
+                  topicAverages,
+                });
+                await navigator.clipboard.writeText(zaloText);
+                await logCrmExportAction(
+                  `[Hồ Sơ Phong Độ] Đã sao chép & gửi Báo cáo Phong độ Zalo (Tổng hợp 70/30: ${perfSummary.compositeScore ?? '--'}đ | 2 buổi gần nhất: ${perfSummary.twoSessionBadgeText})`
+                );
+                setReportToast('Đã sao chép Bản tin Zalo Phong Độ & ghi nhận vào Nhật ký CSKH!');
+                setTimeout(() => setReportToast(null), 4000);
+              };
+
+              const handleCopyPngReportCard = async () => {
+                if (isExportingPng) return;
+                setIsExportingPng(true);
+                try {
+                  const blob = await generatePerformanceReportCardBlob({
+                    student: viewingStudent,
+                    className: activeClassName,
+                    targetDescription: targetDesc,
+                    summary: perfSummary,
+                    rawHistory: studentPerformanceHistory,
+                    topicAverages,
+                  });
+
+                  if (navigator.clipboard && 'write' in navigator.clipboard && typeof ClipboardItem !== 'undefined') {
+                    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+                    await logCrmExportAction(
+                      `[Hồ Sơ Phong Độ] Đã xuất & sao chép Ảnh Phiếu Phong Độ PNG gửi Phụ huynh (${activeClassName})`
+                    );
+                    setReportToast('Đã Copy Ảnh Phiếu Phong Độ vào bộ nhớ tạm! Hãy nhấn Ctrl+V vào khung chat Zalo Phụ huynh.');
+                  } else {
+                    // Fallback download if ClipboardItem not available
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `Phieu_Phong_Do_${(viewingStudent.full_name || 'HocSinh').replace(/\s+/g, '_')}.png`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    setReportToast('Trình duyệt không hỗ trợ copy ảnh trực tiếp — Đã tự động tải Ảnh Phiếu Phong Độ (.PNG) về máy!');
+                  }
+                } catch (err) {
+                  console.error(err);
+                  setReportToast('Không thể copy ảnh trực tiếp, vui lòng dùng nút Tải Ảnh PNG bên cạnh.');
+                } finally {
+                  setIsExportingPng(false);
+                  setTimeout(() => setReportToast(null), 4500);
+                }
+              };
+
+              const handleDownloadPngReportCard = async () => {
+                if (isExportingPng) return;
+                setIsExportingPng(true);
+                try {
+                  const blob = await generatePerformanceReportCardBlob({
+                    student: viewingStudent,
+                    className: activeClassName,
+                    targetDescription: targetDesc,
+                    summary: perfSummary,
+                    rawHistory: studentPerformanceHistory,
+                    topicAverages,
+                  });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `Phieu_Phong_Do_${(viewingStudent.full_name || 'HocSinh').replace(/\s+/g, '_')}.png`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  await logCrmExportAction(
+                    `[Hồ Sơ Phong Độ] Đã tải Ảnh Phiếu Phong Độ PNG gửi Phụ huynh (${activeClassName})`
+                  );
+                  setReportToast('Đã tải xuống Ảnh Phiếu Phong Độ (.PNG) sắc nét!');
+                } catch (err) {
+                  console.error(err);
+                  setReportToast('Đã xảy ra lỗi khi xuất ảnh PNG.');
+                } finally {
+                  setIsExportingPng(false);
+                  setTimeout(() => setReportToast(null), 4000);
+                }
+              };
+
               return (
-                <div className="flex items-center gap-2 bg-slate-50 dark:bg-slate-800/40 p-2.5 rounded-xl border border-slate-100 dark:border-slate-800/60">
-                  <span className="text-[11px] font-extrabold text-slate-500 uppercase tracking-wider shrink-0">Chọn Lớp Phân Tích:</span>
-                  <select
-                    value={selectedProfileClassId}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setSelectedProfileClassId(val === 'all' ? 'all' : val);
-                    }}
-                    className="text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 rounded-lg outline-none font-bold text-slate-800 dark:text-slate-100 shadow-sm"
-                  >
-                    <option value="all">Tất cả lớp đang học ({enrolledClasses.length})</option>
-                    {enrolledClasses.map((c, idx) => (
-                      <option key={c.id ? `${c.id}-${idx}` : idx} value={c.id}>
-                        {c.class_name}
-                      </option>
-                    ))}
-                  </select>
+                <div className="bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl border border-slate-200/80 dark:border-slate-800 space-y-2.5">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[11px] font-extrabold text-emerald-700 dark:text-emerald-400 uppercase tracking-wider">
+                        Trạm Báo Cáo Phụ Huynh 1-Click:
+                      </span>
+                      {enrolledClasses.length > 1 && (
+                        <select
+                          value={selectedProfileClassId}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setSelectedProfileClassId(val === 'all' ? 'all' : val);
+                          }}
+                          className="text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 px-2.5 py-1 rounded-lg outline-none font-bold text-slate-800 dark:text-slate-100 shadow-sm"
+                        >
+                          <option value="all">Tất cả lớp ({enrolledClasses.length})</option>
+                          {enrolledClasses.map((c, idx) => (
+                            <option key={c.id ? `${c.id}-${idx}` : idx} value={c.id}>
+                              {c.class_name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleCopyZaloReport}
+                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-sm flex items-center gap-1.5 transition-all cursor-pointer"
+                        title="Sao chép bản tin tổng kết phong độ 70/30 & 2 buổi gần nhất gửi Zalo Phụ huynh"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copy Zalo Phong Độ 1-Click</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleCopyPngReportCard}
+                        disabled={isExportingPng}
+                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold shadow-sm flex items-center gap-1.5 transition-all cursor-pointer"
+                        title="Copy trực tiếp Ảnh Phiếu Phong Độ vào Clipboard để nhấn Ctrl+V dán vào Zalo"
+                      >
+                        <ImageIcon className="w-3.5 h-3.5" />
+                        <span>Copy Ảnh Phiếu (Dán Zalo)</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleDownloadPngReportCard}
+                        disabled={isExportingPng}
+                        className="px-2.5 py-1.5 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-bold shadow-sm flex items-center gap-1.5 transition-all cursor-pointer"
+                        title="Tải file Ảnh Phiếu Phong Độ (.PNG) về thiết bị"
+                      >
+                        <Download className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>Tải Ảnh .PNG</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {reportToast && (
+                    <div className="px-3 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-sm">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>{reportToast}</span>
+                    </div>
+                  )}
                 </div>
               );
             })()}
@@ -1171,7 +1433,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                 }`}
               >
                 <Brain className="w-4 h-4" />
-                <span>Lỗ Hổng & Khắc Phục (V2)</span>
+                <span>Chuyên Đề & Lỗ Hổng</span>
               </button>
               <button
                 onClick={() => setActiveTab('classes')}
@@ -1182,7 +1444,10 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                 }`}
               >
                 <Users className="w-4 h-4" />
-                <span>Xếp Lớp & Chuyển Lớp ({classStudents.filter(cs => String(cs.student_id) === String(viewingStudent.id)).length})</span>
+                <span>
+                  Xếp Lớp & Chuyển Lớp (
+                  {classStudents.filter((cs) => String(cs.student_id) === String(viewingStudent.id)).length})
+                </span>
               </button>
               <button
                 onClick={() => setActiveTab('warnings')}
@@ -1193,7 +1458,10 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                 }`}
               >
                 <AlertTriangle className="w-4 h-4" />
-                <span>Cảnh Báo & Xử Lý ({studentWarnings.filter(w => !w.resolved).length})</span>
+                <span>
+                  Cảnh Báo & CSKH (
+                  {studentWarnings.filter((w) => !w.resolved && w.priority !== 'P3').length})
+                </span>
               </button>
             </div>
 
@@ -1201,66 +1469,42 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
             {activeTab === 'performance' && (
               <div className="space-y-4">
                 {(() => {
-                  // Determine target description based on selected profile class or student active class
                   let targetDesc = 'Thi vào Lớp 10 Công lập 8.0+';
                   if (selectedProfileClassId !== 'all') {
-                    const specificClass = classes.find(c => String(c.id) === String(selectedProfileClassId));
+                    const specificClass = classes.find((c) => String(c.id) === String(selectedProfileClassId));
                     if (specificClass?.target_description) {
                       targetDesc = specificClass.target_description;
                     }
                   } else {
-                    const activeRel = classStudents.find(cs => String(cs.student_id) === String(viewingStudent.id) && !cs.leave_date);
-                    const activeClassObj = activeRel ? classes.find(c => String(c.id) === String(activeRel.class_id)) : null;
+                    const activeRel = classStudents.find(
+                      (cs) => String(cs.student_id) === String(viewingStudent.id) && !cs.leave_date
+                    );
+                    const activeClassObj = activeRel
+                      ? classes.find((c) => String(c.id) === String(activeRel.class_id))
+                      : null;
                     if (activeClassObj?.target_description) {
                       targetDesc = activeClassObj.target_description;
                     }
                   }
 
                   return (
-                    <>
-                      {/* Module 12: Student Performance Trend & Moving Average Engine */}
-                      <StudentPerformanceTrend
-                        rawHistory={studentPerformanceHistory}
-                        targetDescription={targetDesc}
-                      />
-
-                      {/* Attendance Quick Stats */}
-                      <div className="bg-slate-50 dark:bg-slate-800/40 p-3 rounded-2xl border border-slate-100 dark:border-slate-800/60 flex items-center justify-between text-xs">
-                        <div className="flex items-center gap-2">
-                          <Clock className="w-4 h-4 text-indigo-500" />
-                          <span className="font-bold text-slate-700 dark:text-slate-300">Tỷ Lệ Chuyên Cần & Có Mặt:</span>
-                        </div>
-                        <div className="flex items-center gap-3 font-bold">
-                          {(() => {
-                            const present = studentSessionsRaw.filter(s => s.attendance === 'present').length;
-                            const late = studentSessionsRaw.filter(s => s.attendance === 'late').length;
-                            const absent = studentSessionsRaw.filter(s => s.attendance === 'absent_unexcused' || s.attendance === 'absent_excused').length;
-                            const total = studentSessionsRaw.length;
-                            const rate = total > 0 ? Math.round((present / total) * 100) : 0;
-                            return (
-                              <>
-                                <span className="text-emerald-600 dark:text-emerald-400">Có mặt: {present}/{total} ({rate}%)</span>
-                                {late > 0 && <span className="text-amber-600 dark:text-amber-400">Đi muộn: {late}</span>}
-                                {absent > 0 && <span className="text-rose-600 dark:text-rose-400">Vắng: {absent}</span>}
-                              </>
-                            );
-                          })()}
-                        </div>
-                      </div>
-                    </>
+                    <StudentPerformanceTrend
+                      rawHistory={studentPerformanceHistory}
+                      targetDescription={targetDesc}
+                    />
                   );
                 })()}
               </div>
             )}
 
-            {/* Tab 2 Content: Gaps & Actionable Resolutions */}
+            {/* Tab 2 Content: Chuyên Đề & Lỗ Hổng Kiến Thức */}
             {activeTab === 'gaps' && (
               <div className="space-y-4">
                 {/* Biểu đồ Đánh giá Chuyên đề */}
                 <div className="bg-slate-50 dark:bg-slate-800/60 p-4 rounded-2xl border border-slate-200 dark:border-slate-700/60">
                   <h4 className="text-xs font-bold text-slate-800 dark:text-slate-200 mb-3 flex items-center gap-1.5">
                     <Award className="w-4 h-4 text-emerald-600" />
-                    <span>Mức Độ Làm Chủ Kiến Thức Theo Chuyên Đề (Điểm trung bình tích lũy)</span>
+                    <span>Mức Độ Làm Chủ Kiến Thức Theo Chuyên Đề (Tính theo Điểm Tổng Hợp 70% KT - 30% BTVN)</span>
                   </h4>
                   {topicAverages.length === 0 ? (
                     <p className="text-xs text-slate-500 text-center py-4">Chưa có dữ liệu chuyên đề để thống kê.</p>
@@ -1279,7 +1523,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                               fontSize: '11px',
                             }}
                           />
-                          <Bar dataKey="avgScore" name="Điểm làm chủ" radius={[4, 4, 0, 0]}>
+                          <Bar dataKey="avgScore" name="Điểm làm chủ (70/30)" radius={[4, 4, 0, 0]}>
                             {topicAverages.map((entry, index) => {
                               const score = entry.avgScore;
                               let fill = '#10b981'; // Xanh lá nếu >= 8
@@ -1294,29 +1538,37 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                   )}
                 </div>
 
-                {/* Lỗ hổng cụ thể & Biện pháp khắc phục */}
+                {/* Đối chiếu Điểm Mạnh (Chuyên đề đã làm chủ) vs Lỗ Hổng (Các buổi học bị đuối) */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* Lỗ hổng cụ thể */}
+                  {/* Các buổi học bị đuối */}
                   <div className="bg-slate-50 dark:bg-slate-800/40 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
                     <h5 className="text-xs font-bold text-slate-800 dark:text-slate-200 mb-2.5 flex items-center gap-1.5">
                       <AlertCircle className="w-4 h-4 text-rose-500" />
-                      <span>Các buổi học bị đuối (Điểm kiểm tra/BTVN &lt; 6)</span>
+                      <span>Các buổi học cần bù lỗ hổng (Điểm KT / BTVN &lt; 6.0đ)</span>
                     </h5>
-                    
+
                     {(() => {
-                      const gaps = studentPerformanceHistory.filter(h => (h.hwScore !== null && h.hwScore < 6) || (h.testScore !== null && h.testScore < 6));
+                      const gaps = studentPerformanceHistory.filter(
+                        (h) => (h.hwScore !== null && h.hwScore < 6) || (h.testScore !== null && h.testScore < 6)
+                      );
                       if (gaps.length === 0) {
                         return (
                           <div className="text-xs text-slate-500 py-3 text-center bg-white dark:bg-slate-900 rounded-lg border border-slate-100 dark:border-slate-800">
-                            🌟 Không phát hiện lỗ hổng học lực nào dưới trung bình!
+                            Không phát hiện buổi học nào có điểm dưới 6.0!
                           </div>
                         );
                       }
                       return (
                         <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
                           {gaps.map((g, idx) => (
-                            <div key={idx} className="p-2 bg-rose-50/50 dark:bg-rose-950/20 border border-rose-100 dark:border-rose-900/40 rounded-lg text-xs flex justify-between items-center gap-2">
-                              <span className="font-medium text-rose-950 dark:text-rose-300 truncate max-w-[200px]" title={g.sessionFullName}>
+                            <div
+                              key={idx}
+                              className="p-2 bg-rose-50/50 dark:bg-rose-950/20 border border-rose-100 dark:border-rose-900/40 rounded-lg text-xs flex justify-between items-center gap-2"
+                            >
+                              <span
+                                className="font-medium text-rose-950 dark:text-rose-300 truncate max-w-[190px]"
+                                title={g.sessionFullName}
+                              >
                                 {g.sessionFullName || g.session}
                               </span>
                               <div className="flex gap-1.5 text-[10px] font-bold shrink-0">
@@ -1327,7 +1579,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                                 )}
                                 {g.hwScore !== null && g.hwScore < 6 && (
                                   <span className="px-1.5 py-0.5 bg-orange-100 dark:bg-orange-900/60 text-orange-700 dark:text-orange-300 rounded">
-                                    BTVN: {g.hwScore}đ
+                                    {g.homework_submitted === false ? 'Chưa nộp BTVN (0đ)' : `BTVN: ${g.hwScore}đ`}
                                   </span>
                                 )}
                               </div>
@@ -1338,41 +1590,37 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                     })()}
                   </div>
 
-                  {/* Hành động khắc phục đã thực hiện */}
+                  {/* Chuyên đề con đã nắm vững (>= 8.0đ) để khen ngợi với Phụ huynh */}
                   <div className="bg-slate-50 dark:bg-slate-800/40 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
                     <h5 className="text-xs font-bold text-slate-800 dark:text-slate-200 mb-2.5 flex items-center gap-1.5">
-                      <UserCheck className="w-4 h-4 text-emerald-600" />
-                      <span>Nhật ký hành động khắc phục (Trợ giảng ghi nhận)</span>
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                      <span>Điểm sáng: Chuyên đề đã làm chủ vững (≥ 8.0đ)</span>
                     </h5>
-                    
+
                     {(() => {
-                      const resolvedActions = studentWarnings
-                        .filter(w => w.resolved && w.resolved_action)
-                        .map(w => ({
-                          type: w.warning_type,
-                          date: w.updated_at ? w.updated_at.split('T')[0] : '',
-                          action: w.resolved_action
-                        }));
-                      
-                      if (resolvedActions.length === 0) {
+                      const strongTopics = topicAverages.filter((t) => t.avgScore >= 8.0);
+                      if (strongTopics.length === 0) {
                         return (
                           <div className="text-xs text-slate-500 py-3 text-center bg-white dark:bg-slate-900 rounded-lg border border-slate-100 dark:border-slate-800">
-                            Chưa có nhật ký hành động khắc phục cho học sinh này.
+                            Đang tích lũy thêm các chuyên đề đạt mốc ≥ 8.0 điểm.
                           </div>
                         );
                       }
-                      
+
                       return (
                         <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-                          {resolvedActions.map((ra, idx) => (
-                            <div key={idx} className="p-2 bg-emerald-50/50 dark:bg-emerald-950/20 border border-emerald-100 dark:border-emerald-900/40 rounded-lg text-xs">
-                              <div className="flex justify-between text-[9px] text-slate-400 font-bold mb-0.5">
-                                <span className="truncate max-w-[120px]">{ra.type}</span>
-                                <span>{ra.date}</span>
+                          {strongTopics.map((st, idx) => (
+                            <div
+                              key={idx}
+                              className="p-2 bg-emerald-50/60 dark:bg-emerald-950/20 border border-emerald-100 dark:border-emerald-900/40 rounded-lg text-xs flex items-center justify-between gap-2"
+                            >
+                              <div className="truncate">
+                                <span className="font-bold text-emerald-950 dark:text-emerald-200">{st.topic}</span>
+                                <span className="ml-1.5 text-[10px] text-slate-500">({st.category})</span>
                               </div>
-                              <p className="text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed font-medium">
-                                {ra.action}
-                              </p>
+                              <span className="px-2 py-0.5 bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-300 rounded font-extrabold text-[10px] shrink-0">
+                                TB: {st.avgScore}đ
+                              </span>
                             </div>
                           ))}
                         </div>
@@ -1386,7 +1634,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                   <div className="absolute top-0 right-0 p-3 pointer-events-none opacity-20">
                     <Sparkles className="w-16 h-16 text-indigo-500" />
                   </div>
-                  
+
                   <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
                       <div className="p-1.5 bg-indigo-100 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400 rounded-lg">
@@ -1460,7 +1708,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                           <button
                             onClick={() => {
                               navigator.clipboard.writeText(aiDiagnosis.parent_summary);
-                              alert('Đã sao chép tin nhắn Zalo gửi Phụ huynh!');
+                              setReportToast('Đã sao chép đoạn nhận xét AI gửi Phụ huynh!');
+                              setTimeout(() => setReportToast(null), 3500);
                             }}
                             className="absolute top-2 right-2 p-1.5 bg-white dark:bg-slate-800 border border-slate-100 dark:border-slate-700 text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 rounded-lg shadow-sm"
                             title="Sao chép"
@@ -1797,214 +2046,448 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
 
             {activeTab === 'warnings' && (
               <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl border border-slate-200/70 dark:border-slate-800">
+                  <div className="flex items-center gap-2">
                     <AlertTriangle className="w-4 h-4 text-amber-500" />
-                    <span>Lịch Sử & Trạng Thái Cảnh Báo Học Tập</span>
-                  </h4>
-                  <span className="px-2 py-0.5 bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-100/50 rounded text-[10px] font-bold">
-                    Chưa xử lý: {studentWarnings.filter(w => !w.resolved).length}
-                  </span>
-                </div>
-
-                {/* Unresolved warnings */}
-                <div className="space-y-2.5">
-                  <h5 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Cảnh báo hiện tại đang kích hoạt</h5>
-                  
-                  {studentWarnings.filter(w => !w.resolved).length === 0 ? (
-                    <div className="p-4 bg-emerald-50/50 dark:bg-emerald-950/10 text-emerald-700 dark:text-emerald-400 text-xs rounded-xl font-medium border border-emerald-100/50 text-center">
-                      🎉 Tuyệt vời! Học sinh hiện tại không có cảnh báo học tập nào chưa xử lý.
+                    <div>
+                      <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200">
+                        Cảnh Báo Học Tập (Cửa Sổ 2 Buổi Gần Nhất) & Nhật Ký CSKH
+                      </h4>
+                      <p className="text-[10px] text-slate-500">
+                        Đồng bộ tự động 2 chiều với Trung tâm Cảnh báo và CRM Phụ huynh
+                      </p>
                     </div>
-                  ) : (
-                    studentWarnings.filter(w => !w.resolved).map((w, idx) => {
-                      const isP1 = w.priority === 'P1';
-                      const isPraise = w.priority === 'Praise';
-                      const warningClass = classes.find(c => c.id === w.class_id);
+                  </div>
 
+                  {/* Quick 3-Tier CRM Status Switcher */}
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-slate-500">Nhãn CSKH:</span>
+                    {(['satisfied', 'attention', 'at_risk'] as CRMCustomerStatus[]).map((st) => {
+                      const currentSt: CRMCustomerStatus = viewingStudent.crm_status || 'satisfied';
+                      const isActive = currentSt === st;
+                      const label =
+                        st === 'satisfied' ? '🟢 Hài lòng' : st === 'attention' ? '🟠 Cần chú ý' : '🔴 Nguy cơ nghỉ';
                       return (
-                        <div
-                          key={w.id ? `${w.id}-${idx}` : idx}
-                          className={`p-4 border rounded-2xl space-y-3 shadow-sm ${
-                            isPraise
-                              ? 'bg-emerald-50/50 border-emerald-200/50 dark:bg-emerald-950/20 dark:border-emerald-900/40'
-                              : isP1
-                              ? 'bg-rose-50/40 border-rose-200/50 dark:bg-rose-950/20 dark:border-rose-900/40'
-                              : 'bg-amber-50/40 border-amber-200/50 dark:bg-amber-950/20 dark:border-amber-900/40'
+                        <button
+                          key={st}
+                          type="button"
+                          onClick={async () => {
+                            if (!viewingStudent.id) return;
+                            const nowIso = new Date().toISOString();
+                            await db.students.update(String(viewingStudent.id), {
+                              crm_status: st,
+                              updated_at: nowIso,
+                            });
+                            setViewingStudent((prev) => (prev ? { ...prev, crm_status: st } : null));
+                            onRefresh();
+                          }}
+                          className={`px-2 py-1 rounded-lg text-[10px] font-extrabold border transition-all cursor-pointer ${
+                            isActive
+                              ? st === 'at_risk'
+                                ? 'bg-rose-600 text-white border-rose-600'
+                                : st === 'attention'
+                                ? 'bg-amber-500 text-white border-amber-500'
+                                : 'bg-emerald-600 text-white border-emerald-600'
+                              : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700 hover:bg-slate-100'
                           }`}
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="space-y-1">
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                <span
-                                  className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${
-                                    isPraise
-                                      ? 'bg-emerald-100 text-emerald-800'
-                                      : isP1
-                                      ? 'bg-rose-100 text-rose-800'
-                                      : 'bg-amber-100 text-amber-800'
-                                  }`}
-                                >
-                                  {isPraise ? '🟢 Tuyên dương' : isP1 ? 'P1 - Khẩn cấp' : 'P2 - Nội bộ'}
-                                </span>
-                                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
-                                  {w.warning_type}
-                                </span>
-                                {warningClass && (
-                                  <span className="text-[10px] text-slate-500 font-medium">
-                                    ({warningClass.class_name})
-                                  </span>
-                                )}
-                              </div>
-                              <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed font-medium">
-                                Lý do: {w.reason}
-                              </p>
-                              <span className="text-[9px] text-slate-400 block font-medium">
-                                Phát hiện ngày: {w.created_at ? w.created_at.split('T')[0] : ''}
-                              </span>
-                            </div>
-                          </div>
-
-                          {/* Quick Resolve Button or Form */}
-                          {resolvingWarningId === w.id ? (
-                            <div className="bg-white dark:bg-slate-900 p-3 rounded-xl border border-slate-200 dark:border-slate-800 space-y-3 text-xs">
-                              <div className="space-y-1.5">
-                                <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Chọn hành động khắc phục nhanh:</label>
-                                <select
-                                  value={actionChoiceProfile}
-                                  onChange={(e) => setActionChoiceProfile(e.target.value)}
-                                  className="text-xs w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 rounded-xl outline-none font-bold text-slate-800 dark:text-slate-100"
-                                >
-                                  <option value="Đã gọi điện cho Phụ huynh trao đổi tình hình">📞 Đã gọi điện trao đổi với Phụ huynh</option>
-                                  <option value="Đã kèm cặp / phụ đạo bù chuyên đề hổng kiến thức">✏️ Đã kèm cặp / phụ đạo bù kiến thức hổng</option>
-                                  <option value="Đã yêu cầu hoàn thành bài tập về nhà và nộp bù">📚 Đã yêu cầu hoàn thành & nộp bù BTVN</option>
-                                  <option value="Đã cho làm lại bài kiểm tra để gỡ điểm">💯 Đã cho làm lại bài kiểm tra gỡ điểm</option>
-                                  <option value="Đã nhắc nhở học sinh tập trung hơn trong giờ học">⚠️ Đã trực tiếp nhắc nhở & chấn chỉnh học sinh</option>
-                                </select>
-                              </div>
-
-                              <div className="space-y-1.5">
-                                <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Ghi chú bổ sung (nếu có):</label>
-                                <input
-                                  type="text"
-                                  placeholder="Nhập thêm chi tiết biện pháp đã thực hiện..."
-                                  value={actionNotesProfile}
-                                  onChange={(e) => setActionNotesProfile(e.target.value)}
-                                  className="text-xs w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 rounded-xl outline-none text-slate-800 dark:text-slate-100"
-                                />
-                              </div>
-
-                              <div className="flex justify-end gap-2">
-                                <button
-                                  onClick={() => setResolvingWarningId(null)}
-                                  className="px-2.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 font-bold rounded-lg text-[11px] transition-colors"
-                                >
-                                  Hủy
-                                </button>
-                                <button
-                                  onClick={async () => {
-                                    if (isResolvingProfile) return;
-                                    setIsResolvingProfile(true);
-
-                                    try {
-                                      const now = new Date().toISOString();
-                                      let fullActionDesc = actionChoiceProfile;
-                                      if (actionNotesProfile) {
-                                        fullActionDesc += ` - Chi tiết: ${actionNotesProfile}`;
-                                      }
-
-                                      // Update in Dexie
-                                      await db.warnings.update(w.id!, {
-                                        resolved: true,
-                                        resolved_action: fullActionDesc,
-                                        updated_at: now
-                                      });
-
-                                      // Log Audit
-                                      await db.audit_logs.add({
-                                        user_role: currentRole as any,
-                                        action_type: 'Edit',
-                                        description: `Giải quyết cảnh báo [${w.warning_type}] cho học sinh ${viewingStudent.full_name}: ${fullActionDesc}`,
-                                        timestamp: now
-                                      });
-
-                                      // Reload student warnings
-                                      const updatedWarns = await db.warnings.where('student_id').equals(viewingStudent.id!).toArray();
-                                      setStudentWarnings(updatedWarns);
-
-                                      // Reset states
-                                      setResolvingWarningId(null);
-                                      setActionNotesProfile('');
-                                      onRefresh();
-                                    } catch (err) {
-                                      console.error(err);
-                                      alert('Đã xảy ra lỗi khi giải quyết cảnh báo.');
-                                    } finally {
-                                      setIsResolvingProfile(false);
-                                    }
-                                  }}
-                                  disabled={isResolvingProfile}
-                                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white font-bold rounded-lg text-[11px] shadow-sm transition-colors"
-                                >
-                                  {isResolvingProfile ? 'Đang lưu...' : 'Hoàn thành giải quyết'}
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="flex justify-end pt-1">
-                              <button
-                                onClick={() => {
-                                  setResolvingWarningId(w.id!);
-                                  setActionNotesProfile('');
-                                }}
-                                className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 font-extrabold rounded-xl text-[10px] shadow-sm flex items-center gap-1.5 transition-all"
-                              >
-                                <span>🔧</span>
-                                <span>Thực hiện xử lý khắc phục</span>
-                              </button>
-                            </div>
-                          )}
-                        </div>
+                          {label}
+                        </button>
                       );
-                    })
+                    })}
+                  </div>
+                </div>
+
+                {/* Unresolved warnings (2-session window, no P3) */}
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <h5 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                      Thẻ Cảnh báo / Tuyên dương đang kích hoạt (2 buổi gần nhất)
+                    </h5>
+                    <span className="px-2 py-0.5 bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-100/50 rounded text-[10px] font-bold">
+                      Chưa xử lý: {studentWarnings.filter((w) => !w.resolved && w.priority !== 'P3').length}
+                    </span>
+                  </div>
+
+                  {studentWarnings.filter((w) => !w.resolved && w.priority !== 'P3').length === 0 ? (
+                    <div className="p-4 bg-emerald-50/50 dark:bg-emerald-950/10 text-emerald-700 dark:text-emerald-400 text-xs rounded-xl font-medium border border-emerald-100/50 text-center">
+                      Học sinh hiện tại không có cảnh báo học tập nào chưa xử lý trong 2 buổi gần nhất.
+                    </div>
+                  ) : (
+                    studentWarnings
+                      .filter((w) => !w.resolved && w.priority !== 'P3')
+                      .map((w, idx) => {
+                        const isP1 = w.priority === 'P1';
+                        const isPraise = w.priority === 'Praise';
+                        const warningClass = classes.find((c) => String(c.id) === String(w.class_id));
+
+                        return (
+                          <div
+                            key={w.id ? `${w.id}-${idx}` : idx}
+                            className={`p-4 border rounded-2xl space-y-3 shadow-sm ${
+                              isPraise
+                                ? 'bg-emerald-50/50 border-emerald-200/50 dark:bg-emerald-950/20 dark:border-emerald-900/40'
+                                : isP1
+                                ? 'bg-rose-50/40 border-rose-200/50 dark:bg-rose-950/20 dark:border-rose-900/40'
+                                : 'bg-amber-50/40 border-amber-200/50 dark:bg-amber-950/20 dark:border-amber-900/40'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="space-y-1.5">
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${
+                                      isPraise
+                                        ? 'bg-emerald-100 text-emerald-800'
+                                        : isP1
+                                        ? 'bg-rose-100 text-rose-800'
+                                        : 'bg-amber-100 text-amber-800'
+                                    }`}
+                                  >
+                                    {isPraise ? '🟢 Tuyên dương' : isP1 ? '🔴 P1 - Khẩn cấp' : '🟠 P2 - Cần chú ý'}
+                                  </span>
+                                  <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                                    {w.warning_type}
+                                  </span>
+                                  {warningClass && (
+                                    <span className="text-[10px] text-slate-500 font-bold">
+                                      ({warningClass.class_name})
+                                    </span>
+                                  )}
+                                </div>
+
+                                {Array.isArray(w.issue_tags) && w.issue_tags.length > 0 && (
+                                  <div className="flex flex-wrap gap-1">
+                                    {w.issue_tags.map((tag, tIdx) => (
+                                      <span
+                                        key={tIdx}
+                                        className="px-2 py-0.5 rounded-md bg-white/80 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-700 text-[10px] font-bold text-slate-700 dark:text-slate-300"
+                                      >
+                                        {tag}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+
+                                <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed font-medium">
+                                  Chi tiết (2 buổi gần nhất): {w.reason}
+                                </p>
+                              </div>
+                            </div>
+
+                            {/* Quick Resolve Button or Form */}
+                            {resolvingWarningId === w.id ? (
+                              <div className="bg-white dark:bg-slate-900 p-3 rounded-xl border border-slate-200 dark:border-slate-800 space-y-3 text-xs">
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">
+                                    Chọn hành động khắc phục & CSKH:
+                                  </label>
+                                  <select
+                                    value={actionChoiceProfile}
+                                    onChange={(e) => setActionChoiceProfile(e.target.value)}
+                                    className="text-xs w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 rounded-xl outline-none font-bold text-slate-800 dark:text-slate-100"
+                                  >
+                                    <option value="Đã gọi điện cho Phụ huynh trao đổi tình hình">
+                                      📞 Đã gọi điện trao đổi với Phụ huynh
+                                    </option>
+                                    <option value="Đã gửi Báo cáo Phong độ Zalo và thống nhất hướng kèm cặp">
+                                      💬 Đã gửi Báo cáo Phong độ Zalo cho Phụ huynh
+                                    </option>
+                                    <option value="Đã kèm cặp / phụ đạo bù chuyên đề hổng kiến thức">
+                                      ✏️ Đã kèm cặp / phụ đạo bù kiến thức hổng
+                                    </option>
+                                    <option value="Đã yêu cầu hoàn thành bài tập về nhà và nộp bù">
+                                      📚 Đã yêu cầu hoàn thành & nộp bù BTVN
+                                    </option>
+                                    <option value="Đã cho làm lại bài kiểm tra để gỡ điểm">
+                                      💯 Đã cho làm lại bài kiểm tra gỡ điểm
+                                    </option>
+                                  </select>
+                                </div>
+
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">
+                                    Ghi chú phản hồi của Phụ huynh / Học sinh:
+                                  </label>
+                                  <input
+                                    type="text"
+                                    placeholder="Nhập thêm chi tiết phản hồi của Phụ huynh..."
+                                    value={actionNotesProfile}
+                                    onChange={(e) => setActionNotesProfile(e.target.value)}
+                                    className="text-xs w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 rounded-xl outline-none text-slate-800 dark:text-slate-100"
+                                  />
+                                </div>
+
+                                <div className="flex justify-end gap-2">
+                                  <button
+                                    onClick={() => setResolvingWarningId(null)}
+                                    className="px-2.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 font-bold rounded-lg text-[11px] transition-colors"
+                                  >
+                                    Hủy
+                                  </button>
+                                  <button
+                                    onClick={async () => {
+                                      if (isResolvingProfile) return;
+                                      setIsResolvingProfile(true);
+
+                                      try {
+                                        const now = new Date().toISOString();
+                                        const todayStr = now.split('T')[0];
+                                        let fullActionDesc = actionChoiceProfile;
+                                        if (actionNotesProfile.trim()) {
+                                          fullActionDesc += ` - Chi tiết: ${actionNotesProfile.trim()}`;
+                                        }
+
+                                        // Compute session anchor so resolved warning will NOT resurrect from past sessions
+                                        const allSessions = await db.sessions.toArray();
+                                        const classSessions = allSessions
+                                          .filter((s) => String(s.class_id) === String(w.class_id))
+                                          .sort((a, b) => (a.session_date || '').localeCompare(b.session_date || ''));
+                                        const latestSessionDate =
+                                          classSessions.length > 0
+                                            ? classSessions[classSessions.length - 1].session_date
+                                            : todayStr;
+                                        const resolvedSessionIds = classSessions
+                                          .map((s) => String(s.id || ''))
+                                          .filter(Boolean);
+
+                                        // Update unified card in Dexie with session anchor lock
+                                        await db.warnings.update(String(w.id!), {
+                                          resolved: true,
+                                          resolved_action: fullActionDesc,
+                                          resolved_at: now,
+                                          resolved_after_session_date: latestSessionDate,
+                                          resolved_session_ids: resolvedSessionIds,
+                                          updated_at: now,
+                                        });
+
+                                        // Auto-log to student.crm_interactions & update crm_status
+                                        if (viewingStudent.id) {
+                                          const newInteraction: CRMInteractionLog = {
+                                            id: `crm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                                            created_at: now,
+                                            channel: fullActionDesc.includes('gọi điện') ? 'call' : 'zalo',
+                                            summary: `[Giải quyết Cảnh báo ${w.priority}] ${w.warning_type}: ${fullActionDesc}`,
+                                            created_by: currentRole === 'TA' ? 'TA' : 'Teacher',
+                                          };
+                                          const existingHistory = Array.isArray(viewingStudent.crm_interactions)
+                                            ? viewingStudent.crm_interactions
+                                            : [];
+                                          const updatedInteractions = [newInteraction, ...existingHistory];
+
+                                          // Upgrade CRM status if resolving P1/P2
+                                          let nextCrmStatus: CRMCustomerStatus = viewingStudent.crm_status || 'satisfied';
+                                          if (w.priority === 'Praise') {
+                                            nextCrmStatus = 'satisfied';
+                                          } else if (nextCrmStatus === 'at_risk') {
+                                            nextCrmStatus = 'attention';
+                                          }
+
+                                          await db.students.update(String(viewingStudent.id), {
+                                            crm_interactions: updatedInteractions,
+                                            crm_status: nextCrmStatus,
+                                            crm_last_contacted_at: todayStr,
+                                            updated_at: now,
+                                          });
+                                          setViewingStudent((prev) =>
+                                            prev
+                                              ? {
+                                                  ...prev,
+                                                  crm_interactions: updatedInteractions,
+                                                  crm_status: nextCrmStatus,
+                                                  crm_last_contacted_at: todayStr,
+                                                }
+                                              : null
+                                          );
+                                        }
+
+                                        // Log Audit
+                                        await db.audit_logs.add({
+                                          user_role: currentRole as any,
+                                          action_type: 'Edit',
+                                          description: `Giải quyết cảnh báo [${w.warning_type}] (khóa mốc buổi ${latestSessionDate}) cho học sinh ${viewingStudent.full_name}: ${fullActionDesc}`,
+                                          timestamp: now,
+                                        });
+
+                                        // Reload student warnings
+                                        const allWarns = await db.warnings.toArray();
+                                        setStudentWarnings(
+                                          allWarns.filter((item) => String(item.student_id) === String(viewingStudent.id))
+                                        );
+
+                                        // Reset states
+                                        setResolvingWarningId(null);
+                                        setActionNotesProfile('');
+                                        setReportToast(
+                                          'Đã giải quyết cảnh báo (khóa mốc 2 buổi) & tự động ghi nhận vào Nhật ký CSKH!'
+                                        );
+                                        setTimeout(() => setReportToast(null), 4000);
+                                        onRefresh();
+                                      } catch (err) {
+                                        console.error(err);
+                                      } finally {
+                                        setIsResolvingProfile(false);
+                                      }
+                                    }}
+                                    disabled={isResolvingProfile}
+                                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white font-bold rounded-lg text-[11px] shadow-sm transition-colors"
+                                  >
+                                    {isResolvingProfile ? 'Đang lưu...' : 'Hoàn thành & Lưu CRM'}
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="flex justify-end pt-1">
+                                <button
+                                  onClick={() => {
+                                    setResolvingWarningId(w.id!);
+                                    setActionNotesProfile('');
+                                  }}
+                                  className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 font-extrabold rounded-xl text-[10px] shadow-sm flex items-center gap-1.5 transition-all cursor-pointer"
+                                >
+                                  <span>🔧</span>
+                                  <span>Xử lý & Ghi Nhật ký CSKH</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })
+                  )}
+                </div>
+
+                {/* Inline CRM Parent Interaction Logger & History */}
+                <div className="space-y-2.5 pt-3 border-t border-slate-200 dark:border-slate-800">
+                  <div className="flex items-center justify-between">
+                    <h5 className="text-[11px] font-bold text-emerald-700 dark:text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
+                      <MessageSquare className="w-3.5 h-3.5" />
+                      <span>Nhật Ký Tương Tác & Phản Hồi Phụ Huynh (CRM)</span>
+                    </h5>
+                    {viewingStudent.crm_last_contacted_at && (
+                      <span className="text-[10px] text-slate-400 font-semibold">
+                        Liên hệ gần nhất: {viewingStudent.crm_last_contacted_at}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Quick Add CRM Note Input */}
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={quickCrmNote}
+                      onChange={(e) => setQuickCrmNote(e.target.value)}
+                      placeholder="Ghi nhanh phản hồi của Phụ huynh (VD: Mẹ bé hứa nhắc con làm đủ BTVN tuần này)..."
+                      className="flex-1 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 rounded-xl outline-none text-slate-800 dark:text-slate-100"
+                    />
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!quickCrmNote.trim() || !viewingStudent.id) return;
+                        const nowIso = new Date().toISOString();
+                        const todayStr = nowIso.split('T')[0];
+                        const newInteraction: CRMInteractionLog = {
+                          id: `crm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                          created_at: nowIso,
+                          channel: 'zalo',
+                          summary: quickCrmNote.trim(),
+                          created_by: currentRole === 'TA' ? 'TA' : 'Teacher',
+                        };
+                        const existingHistory = Array.isArray(viewingStudent.crm_interactions)
+                          ? viewingStudent.crm_interactions
+                          : [];
+                        const updatedInteractions = [newInteraction, ...existingHistory];
+                        await db.students.update(String(viewingStudent.id), {
+                          crm_interactions: updatedInteractions,
+                          crm_last_contacted_at: todayStr,
+                          updated_at: nowIso,
+                        });
+                        setViewingStudent((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                crm_interactions: updatedInteractions,
+                                crm_last_contacted_at: todayStr,
+                              }
+                            : null
+                        );
+                        setQuickCrmNote('');
+                        onRefresh();
+                      }}
+                      className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-sm transition-colors cursor-pointer shrink-0"
+                    >
+                      Lưu Nhật Ký
+                    </button>
+                  </div>
+
+                  {(!viewingStudent.crm_interactions || viewingStudent.crm_interactions.length === 0) ? (
+                    <p className="text-center py-3 text-[11px] text-slate-400 italic">
+                      Chưa có nhật ký tương tác Phụ huynh. Khi Thầy/Cô bấm Copy Zalo Phong độ hoặc Giải quyết cảnh báo, lịch sử sẽ tự động lưu tại đây.
+                    </p>
+                  ) : (
+                    <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+                      {viewingStudent.crm_interactions.map((item) => (
+                        <div
+                          key={item.id}
+                          className="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200/70 dark:border-slate-800 rounded-xl text-xs flex flex-col gap-1"
+                        >
+                          <div className="flex items-center justify-between text-[10px] text-slate-400 font-bold">
+                            <span className="text-emerald-600 dark:text-emerald-400">
+                              [{item.channel.toUpperCase()}] • {item.created_by === 'TA' ? 'Trợ giảng' : 'Giáo viên'}
+                            </span>
+                            <span>{item.created_at ? item.created_at.split('T')[0] : ''}</span>
+                          </div>
+                          <p className="text-slate-700 dark:text-slate-200 text-[11px] font-medium leading-relaxed">
+                            {item.summary}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
 
                 {/* Resolved warnings history list */}
                 <div className="space-y-2.5 pt-2 border-t border-slate-100 dark:border-slate-800/60">
-                  <h5 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Lịch sử cảnh báo đã giải quyết</h5>
-                  
-                  {studentWarnings.filter(w => w.resolved).length === 0 ? (
-                    <p className="text-center py-4 text-[11px] text-slate-400 italic">
+                  <h5 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                    Lịch sử cảnh báo đã giải quyết
+                  </h5>
+
+                  {studentWarnings.filter((w) => w.resolved && w.priority !== 'P3').length === 0 ? (
+                    <p className="text-center py-3 text-[11px] text-slate-400 italic">
                       Chưa có cảnh báo nào được giải quyết trước đây.
                     </p>
                   ) : (
-                    <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                      {studentWarnings.filter(w => w.resolved).map((w, idx) => {
-                        const warningClass = classes.find(c => c.id === w.class_id);
-                        return (
-                          <div
-                            key={w.id ? `${w.id}-${idx}` : idx}
-                            className="p-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800/60 rounded-xl text-xs space-y-1"
-                          >
-                            <div className="flex items-center justify-between text-[10px] text-slate-400">
-                              <span className="font-extrabold text-emerald-600 uppercase flex items-center gap-1">
-                                <span>✓</span>
-                                <span>Đã giải quyết</span>
-                              </span>
-                              <span>Ngày xử lý: {w.updated_at ? w.updated_at.split('T')[0] : ''}</span>
+                    <div className="space-y-2 max-h-44 overflow-y-auto pr-1">
+                      {studentWarnings
+                        .filter((w) => w.resolved && w.priority !== 'P3')
+                        .map((w, idx) => {
+                          const warningClass = classes.find((c) => String(c.id) === String(w.class_id));
+                          return (
+                            <div
+                              key={w.id ? `${w.id}-${idx}` : idx}
+                              className="p-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800/60 rounded-xl text-xs space-y-1"
+                            >
+                              <div className="flex items-center justify-between text-[10px] text-slate-400">
+                                <span className="font-extrabold text-emerald-600 uppercase flex items-center gap-1">
+                                  <span>✓</span>
+                                  <span>
+                                    Đã giải quyết
+                                    {w.resolved_after_session_date
+                                      ? ` (Khóa mốc đến ${w.resolved_after_session_date})`
+                                      : ''}
+                                  </span>
+                                </span>
+                                <span>Ngày xử lý: {w.updated_at ? w.updated_at.split('T')[0] : ''}</span>
+                              </div>
+                              <div className="font-bold text-slate-800 dark:text-slate-200">
+                                {w.warning_type} {warningClass && `(${warningClass.class_name})`}
+                              </div>
+                              <p className="text-slate-500 text-[11px]">Lý do: {w.reason}</p>
+                              <div className="p-2 bg-white dark:bg-slate-900/60 border border-slate-100 dark:border-slate-800/60 rounded-lg text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed font-medium">
+                                Biện pháp: <span className="font-semibold">{w.resolved_action}</span>
+                              </div>
                             </div>
-                            <div className="font-bold text-slate-800 dark:text-slate-200">
-                              {w.warning_type} {warningClass && `(${warningClass.class_name})`}
-                            </div>
-                            <p className="text-slate-500 text-[11px]">
-                              Lý do: {w.reason}
-                            </p>
-                            <div className="p-2 bg-white dark:bg-slate-900/60 border border-slate-100 dark:border-slate-800/60 rounded-lg text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed font-medium">
-                              Biện pháp: <span className="font-semibold">{w.resolved_action}</span>
-                            </div>
-                          </div>
-                        );
-                      })}
+                          );
+                        })}
                     </div>
                   )}
                 </div>

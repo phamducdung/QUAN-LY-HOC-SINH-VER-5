@@ -922,3 +922,539 @@ export function renderCRMTemplate(
   }
   return output;
 }
+
+/**
+ * Compiles a 1-Click Class Zalo Group Announcement (either for a specific session
+ * or for the latest 4-session cycle of the class).
+ */
+export function compileClassGroupZaloAnnouncement(params: {
+  cls: ClassItem;
+  mode: 'single_session' | 'cycle_4';
+  targetSessionId?: string;
+  classSessions: Session[];
+  activeClassStudents: Student[];
+  allStudentSessions: StudentSession[];
+  pronounConfig?: PronounConfig;
+}): {
+  title: string;
+  announcementText: string;
+  presentCount: number;
+  totalCount: number;
+  avgHw: string;
+  avgTest: string;
+  topTestStudents: Array<{ name: string; score: number }>;
+  topHwStudents: Array<{ name: string; score: number }>;
+} {
+  const {
+    cls,
+    mode,
+    targetSessionId,
+    classSessions,
+    activeClassStudents,
+    allStudentSessions,
+    pronounConfig,
+  } = params;
+
+  const teacherTitle = pronounConfig?.teacher_title || 'Thầy';
+  const teacherName = pronounConfig?.teacher_name || 'Giáo viên Toán';
+  const studentPronoun = (pronounConfig?.student_pronoun || 'các con').toLowerCase();
+
+  const sortedSessions = [...classSessions].sort((a, b) =>
+    b.session_date.localeCompare(a.session_date)
+  );
+
+  const studentMap = new Map<string, Student>();
+  activeClassStudents.forEach((s) => {
+    if (s.id) studentMap.set(String(s.id), s);
+  });
+
+  if (sortedSessions.length === 0) {
+    return {
+      title: `Thông báo Nhóm Zalo Lớp ${cls.class_name}`,
+      announcementText: `Kính gửi Quý Phụ huynh lớp ${cls.class_name},\n${teacherTitle} ${teacherName} xin thông báo lịch học cố định của lớp: ${cls.schedule}.\nMong Quý Phụ huynh nhắc nhở ${studentPronoun} đi học đúng giờ và chuẩn bị đầy đủ sách vở ạ!`,
+      presentCount: activeClassStudents.length,
+      totalCount: activeClassStudents.length,
+      avgHw: 'Chưa chấm',
+      avgTest: 'Chưa KT',
+      topTestStudents: [],
+      topHwStudents: [],
+    };
+  }
+
+  if (mode === 'single_session') {
+    const sess =
+      (targetSessionId
+        ? sortedSessions.find((s) => String(s.id) === String(targetSessionId))
+        : undefined) || sortedSessions[0];
+
+    const sessId = String(sess.id);
+    const rawRecs = allStudentSessions.filter(
+      (ss) =>
+        String(ss.session_id) === sessId &&
+        (studentMap.size === 0 || studentMap.has(String(ss.student_id)))
+    );
+
+    const recByStudent = new Map<string, StudentSession>();
+    rawRecs.forEach((r) => recByStudent.set(String(r.student_id), r));
+    const recs = Array.from(recByStudent.values());
+
+    const presentCount = recs.filter(
+      (r) => !r.attendance || r.attendance === 'present' || r.attendance === 'late'
+    ).length;
+    const totalCount =
+      studentMap.size > 0 ? studentMap.size : Math.max(presentCount, recs.length);
+
+    const validHw = recs.filter(
+      (r) =>
+        !r.exempt &&
+        !r.exempt_homework &&
+        typeof r.homework_score === 'number' &&
+        r.homework_score > 0
+    );
+    const avgHw =
+      validHw.length > 0
+        ? (
+            validHw.reduce((sum, r) => sum + Number(r.homework_score || 0), 0) /
+            validHw.length
+          ).toFixed(1)
+        : 'Chưa chấm';
+
+    const validTests = recs.filter(
+      (r) =>
+        !r.exempt &&
+        !r.exempt_test &&
+        typeof r.test_score === 'number' &&
+        r.test_score > 0
+    );
+    const avgTest =
+      validTests.length > 0
+        ? (
+            validTests.reduce((sum, r) => sum + Number(r.test_score || 0), 0) /
+            validTests.length
+          ).toFixed(1)
+        : 'Không có KT';
+
+    const topTestStudents = validTests
+      .map((r) => ({
+        name: studentMap.get(String(r.student_id))?.full_name || 'Học sinh',
+        score: Number(r.test_score),
+      }))
+      .filter((item) => item.score >= 8.0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+
+    const topHwStudents = validHw
+      .map((r) => ({
+        name: studentMap.get(String(r.student_id))?.full_name || 'Học sinh',
+        score: Number(r.homework_score),
+      }))
+      .filter((item) => item.score >= 8.5)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+
+    const praiseTestLine =
+      topTestStudents.length > 0
+        ? `- Tuyên dương điểm Kiểm tra xuất sắc (≥ 8.0đ): ${topTestStudents
+            .map((s) => `${s.name} (${s.score}đ)`)
+            .join(', ')}.`
+        : '- Các con đã hoàn thành bài luyện tập trên lớp và được chữa chi tiết từng dạng toán.';
+
+    const praiseHwLine =
+      topHwStudents.length > 0
+        ? `- Tuyên dương hoàn thành BTVN rất tốt (≥ 8.5đ): ${topHwStudents
+            .map((s) => `${s.name} (${s.score}đ)`)
+            .join(', ')}.`
+        : '- Đa số các con có ý thức chuẩn bị BTVN trước khi đến lớp.';
+
+    const hwDesc =
+      sess.homework_description?.trim() ||
+      `Hoàn thành phiếu bài tập tự luyện phần "${sess.lesson_title}" và xem lại các ví dụ mẫu đã chữa trong vở.`;
+
+    const announcementText = `THÔNG BÁO TỔNG KẾT BUỔI HỌC LỚP ${cls.class_name.toUpperCase()} (${sess.session_date})
+
+Kính gửi Quý Phụ huynh lớp ${cls.class_name},
+${teacherTitle} ${teacherName} và Trợ giảng (${cls.assistant_name || 'Trợ giảng lớp'}) xin gửi tới Gia đình tổng kết tình hình buổi học ngày ${sess.session_date}:
+
+1. Nội dung bài giảng & Chuyên đề:
+- Bài học: ${sess.lesson_title}
+- Chuyên đề: ${sess.chapter || 'Toán THCS trọng tâm'}
+
+2. Tình hình lớp học & Kết quả chung:
+- Sĩ số tham gia: ${presentCount}/${totalCount} học sinh (${
+      totalCount > 0 ? Math.round((presentCount / totalCount) * 100) : 100
+    }%).
+- Điểm trung bình BTVN của lớp: ${avgHw}${avgHw !== 'Chưa chấm' ? '/10' : ''}
+- Điểm trung bình Kiểm tra của lớp: ${avgTest}${avgTest !== 'Không có KT' ? '/10' : ''}
+
+3. Bảng Vinh Danh & Ghi Nhận Tích Cực:
+${praiseTestLine}
+${praiseHwLine}
+
+4. Bài tập về nhà & Dặn dò buổi tới:
+- Nhiệm vụ BTVN: ${hwDesc}
+- Lịch học của lớp: ${cls.schedule}
+
+Nhờ Quý Phụ huynh nhắc nhở các con hoàn thành đầy đủ BTVN trước buổi học tới. Với những con cần lưu ý riêng hoặc cần kèm bổ trợ, ${teacherTitle} sẽ nhắn tin trao đổi trực tiếp tới Zalo cá nhân của Phụ huynh ạ. Trân trọng cảm ơn Quý Phụ huynh!`;
+
+    return {
+      title: `Tổng kết buổi học ${sess.session_date} - ${sess.lesson_title}`,
+      announcementText,
+      presentCount,
+      totalCount,
+      avgHw,
+      avgTest,
+      topTestStudents,
+      topHwStudents,
+    };
+  }
+
+  // Mode: 'cycle_4' (Latest 4 sessions summary)
+  const cycleSessions = sortedSessions.slice(0, 4).reverse();
+  const cycleSessionIds = new Set(cycleSessions.map((s) => String(s.id)));
+  const dateRange =
+    cycleSessions.length > 0
+      ? `${cycleSessions[0].session_date} đến ${
+          cycleSessions[cycleSessions.length - 1].session_date
+        }`
+      : '';
+
+  const topicsList = Array.from(
+    new Set(cycleSessions.map((s) => s.lesson_title).filter(Boolean))
+  );
+
+  const cycleRecs = allStudentSessions.filter(
+    (ss) =>
+      cycleSessionIds.has(String(ss.session_id)) &&
+      (studentMap.size === 0 || studentMap.has(String(ss.student_id)))
+  );
+
+  const presentRecs = cycleRecs.filter(
+    (r) => !r.attendance || r.attendance === 'present' || r.attendance === 'late'
+  );
+  const attendancePct =
+    cycleRecs.length > 0
+      ? Math.round((presentRecs.length / cycleRecs.length) * 100)
+      : 100;
+
+  const validHw = cycleRecs.filter(
+    (r) =>
+      !r.exempt &&
+      !r.exempt_homework &&
+      typeof r.homework_score === 'number' &&
+      r.homework_score > 0
+  );
+  const avgHw =
+    validHw.length > 0
+      ? (
+          validHw.reduce((sum, r) => sum + Number(r.homework_score || 0), 0) /
+          validHw.length
+        ).toFixed(1)
+      : 'Chưa chấm';
+
+  const validTests = cycleRecs.filter(
+    (r) =>
+      !r.exempt &&
+      !r.exempt_test &&
+      typeof r.test_score === 'number' &&
+      r.test_score > 0
+  );
+  const avgTest =
+    validTests.length > 0
+      ? (
+          validTests.reduce((sum, r) => sum + Number(r.test_score || 0), 0) /
+          validTests.length
+        ).toFixed(1)
+      : 'Chưa KT';
+
+  // Compute per-student averages across the 4 sessions
+  const studentTestScoresMap = new Map<string, number[]>();
+  const studentHwScoresMap = new Map<string, number[]>();
+  for (const r of cycleRecs) {
+    const sid = String(r.student_id);
+    if (typeof r.test_score === 'number' && r.test_score > 0) {
+      if (!studentTestScoresMap.has(sid)) studentTestScoresMap.set(sid, []);
+      studentTestScoresMap.get(sid)!.push(Number(r.test_score));
+    }
+    if (typeof r.homework_score === 'number' && r.homework_score > 0) {
+      if (!studentHwScoresMap.has(sid)) studentHwScoresMap.set(sid, []);
+      studentHwScoresMap.get(sid)!.push(Number(r.homework_score));
+    }
+  }
+
+  const topTestStudents: Array<{ name: string; score: number }> = [];
+  for (const [sid, scores] of studentTestScoresMap.entries()) {
+    const avg = Number(
+      (scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1)
+    );
+    if (avg >= 7.8) {
+      topTestStudents.push({
+        name: studentMap.get(sid)?.full_name || 'Học sinh',
+        score: avg,
+      });
+    }
+  }
+  topTestStudents.sort((a, b) => b.score - a.score);
+
+  const topHwStudents: Array<{ name: string; score: number }> = [];
+  for (const [sid, scores] of studentHwScoresMap.entries()) {
+    const avg = Number(
+      (scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1)
+    );
+    if (avg >= 8.2) {
+      topHwStudents.push({
+        name: studentMap.get(sid)?.full_name || 'Học sinh',
+        score: avg,
+      });
+    }
+  }
+  topHwStudents.sort((a, b) => b.score - a.score);
+
+  const announcementText = `BÁO CÁO TỔNG KẾT CHU KỲ ${cycleSessions.length} BUỔI HỌC - LỚP ${cls.class_name.toUpperCase()} (${dateRange})
+
+Kính gửi Quý Phụ huynh lớp ${cls.class_name},
+${teacherTitle} ${teacherName} xin gửi tới Quý Phụ huynh báo cáo tổng hợp tình hình học tập của cả lớp trong chu kỳ ${cycleSessions.length} buổi vừa qua (${dateRange}):
+
+1. Các bài học & Chuyên đề đã hoàn thành:
+${topicsList.map((t, i) => `- Buổi ${i + 1}: ${t}`).join('\n')}
+
+2. Chỉ số chất lượng toàn lớp:
+- Tỷ lệ chuyên cần chung của lớp: ${attendancePct}%
+- Điểm TB BTVN toàn lớp: ${avgHw}${avgHw !== 'Chưa chấm' ? '/10' : ''}
+- Điểm TB Kiểm tra toàn lớp: ${avgTest}${avgTest !== 'Chưa KT' ? '/10' : ''}
+
+3. Vinh danh Học sinh Phong độ Xuất sắc & Chuyên cần:
+- Top điểm Kiểm tra TB cao nhất lớp: ${
+    topTestStudents.slice(0, 8).map((s) => `${s.name} (${s.score}đ)`).join(', ') ||
+    'Các con đang duy trì điểm số đồng đều'
+  }.
+- Top hoàn thành BTVN xuất sắc: ${
+    topHwStudents.slice(0, 8).map((s) => `${s.name} (${s.score}đ)`).join(', ') ||
+    'Đa số các con nộp bài đầy đủ'
+  }.
+
+${teacherTitle} đã tổng hợp phiếu báo cáo chi tiết riêng của từng con để gửi tới Zalo cá nhân của Quý Phụ huynh. Trân trọng cảm ơn sự đồng hành của Gia đình!`;
+
+  return {
+    title: `Tổng kết chu kỳ ${cycleSessions.length} buổi (${dateRange})`,
+    announcementText,
+    presentCount: activeClassStudents.length,
+    totalCount: activeClassStudents.length,
+    avgHw,
+    avgTest,
+    topTestStudents: topTestStudents.slice(0, 8),
+    topHwStudents: topHwStudents.slice(0, 8),
+  };
+}
+
+/**
+ * Generates an accurate, personalized Zalo message for an individual student
+ * right after grading a specific session (for either Reminder/Coordination or Praise).
+ */
+export function compileSingleSessionStudentZaloMessage(params: {
+  student: Student;
+  cls: ClassItem;
+  session: Session;
+  rec: Partial<StudentSession>;
+  prevSession?: Session | null;
+  prevRec?: Partial<StudentSession> | null;
+  classAvgHw?: number;
+  classAvgTest?: number;
+  mode: 'reminder' | 'praise';
+  pronounConfig?: PronounConfig;
+}): {
+  issueBadges: string[];
+  messageText: string;
+  suggestedCrmStatus: CRMCustomerStatus;
+} {
+  const {
+    student,
+    cls,
+    session,
+    rec,
+    prevSession,
+    prevRec,
+    classAvgHw,
+    classAvgTest,
+    mode,
+    pronounConfig,
+  } = params;
+
+  const teacherTitle = pronounConfig?.teacher_title || 'Thầy';
+  const teacherName = pronounConfig?.teacher_name || 'Giáo viên Toán';
+  const studentPronoun = (pronounConfig?.student_pronoun || 'con').toLowerCase();
+
+  const issueBadges: string[] = [];
+  const att = rec.attendance || 'present';
+  const isHwExempt = !!(rec.exempt || rec.exempt_homework);
+  const isTestExempt = !!(rec.exempt || rec.exempt_test);
+
+  if (att === 'absent_unexcused') issueBadges.push('Vắng không phép');
+  else if (att === 'absent_excused') issueBadges.push('Nghỉ có phép');
+  else if (att === 'late') issueBadges.push('Đi muộn');
+
+  if (session.has_homework !== false && !isHwExempt && !att.startsWith('absent')) {
+    if (rec.homework_submitted === false) issueBadges.push('Chưa làm BTVN');
+    else if (rec.late_submit) issueBadges.push('Nộp muộn BTVN');
+    else if (typeof rec.homework_score === 'number' && rec.homework_score < 5) {
+      issueBadges.push(`BTVN thấp (${rec.homework_score}đ)`);
+    }
+  }
+
+  if (session.has_test !== false && !isTestExempt && !att.startsWith('absent')) {
+    if (typeof rec.test_score === 'number' && rec.test_score < 5) {
+      issueBadges.push(`Điểm KT thấp (${rec.test_score}đ)`);
+    }
+  }
+
+  if (
+    prevSession &&
+    prevRec &&
+    !prevRec.exempt &&
+    !prevRec.exempt_test &&
+    typeof prevRec.test_score === 'number' &&
+    prevRec.test_score < 5
+  ) {
+    issueBadges.push(`Trả bài KT buổi trước (${prevRec.test_score}đ)`);
+  }
+
+  if (mode === 'praise') {
+    if (typeof rec.test_score === 'number' && rec.test_score >= 8.0) {
+      issueBadges.push(`KT Xuất sắc (${rec.test_score}đ)`);
+    }
+    if (typeof rec.homework_score === 'number' && rec.homework_score >= 8.5) {
+      issueBadges.push(`BTVN Xuất sắc (${rec.homework_score}đ)`);
+    }
+    if (
+      typeof rec.test_score === 'number' &&
+      typeof prevRec?.test_score === 'number' &&
+      rec.test_score - prevRec.test_score >= 1.0
+    ) {
+      issueBadges.push(
+        `Tiến bộ +${(rec.test_score - prevRec.test_score).toFixed(1)}đ so với buổi trước`
+      );
+    }
+  }
+
+  // Attendance text
+  const attLine =
+    att === 'absent_unexcused'
+      ? 'Vắng học KHÔNG PHÉP'
+      : att === 'absent_excused'
+      ? 'Nghỉ học có phép'
+      : att === 'late'
+      ? 'Có mặt (Đi học muộn)'
+      : 'Có mặt đúng giờ, học tập nghiêm túc';
+
+  // Homework text
+  let hwLine = 'Không giao BTVN';
+  if (session.has_homework !== false) {
+    if (att.startsWith('absent')) {
+      hwLine = 'Chưa nộp do vắng mặt buổi học hôm nay';
+    } else if (isHwExempt) {
+      hwLine = 'Được miễn BTVN buổi này';
+    } else if (rec.homework_submitted === false) {
+      hwLine = 'Chưa hoàn thành BTVN trước khi đến lớp';
+    } else if (rec.late_submit) {
+      hwLine =
+        typeof rec.homework_score === 'number'
+          ? `Nộp muộn BTVN (Điểm: ${rec.homework_score}/10)`
+          : 'Nộp muộn BTVN';
+    } else if (typeof rec.homework_score === 'number') {
+      hwLine = `Đạt ${rec.homework_score}/10 điểm${
+        classAvgHw && classAvgHw > 0 ? ` (TB lớp: ${classAvgHw}/10)` : ''
+      }`;
+    } else {
+      hwLine = 'Đã kiểm tra vở BTVN';
+    }
+  }
+
+  // Test score text
+  let testLine = '';
+  if (session.has_test !== false && !isTestExempt) {
+    if (att.startsWith('absent')) {
+      testLine = `- Bài kiểm tra trên lớp: Cần sắp xếp làm bài kiểm tra bù.`;
+    } else if (typeof rec.test_score === 'number') {
+      const deltaStr =
+        typeof prevRec?.test_score === 'number'
+          ? rec.test_score > prevRec.test_score
+            ? ` - Tăng +${(rec.test_score - prevRec.test_score).toFixed(1)}đ so với buổi trước (${prevRec.test_score}đ)`
+            : rec.test_score < prevRec.test_score
+            ? ` - Giảm ${(prevRec.test_score - rec.test_score).toFixed(1)}đ so với buổi trước (${prevRec.test_score}đ)`
+            : ''
+          : '';
+      testLine = `- Điểm Kiểm tra buổi hôm nay: Đạt ${rec.test_score}/10 điểm${
+        classAvgTest && classAvgTest > 0 ? ` (TB lớp: ${classAvgTest}/10)` : ''
+      }${deltaStr}.`;
+    } else if (typeof prevRec?.test_score === 'number' && prevSession) {
+      testLine = `- Trả điểm Bài kiểm tra buổi trước (${prevSession.session_date}): Đạt ${prevRec.test_score}/10 điểm (Bài KT hôm nay đang chờ chấm).`;
+    }
+  }
+
+  const rawComment = (
+    rec.custom_comment ||
+    (Array.isArray(rec.quick_preset_comments)
+      ? rec.quick_preset_comments.join('; ')
+      : '')
+  ).trim();
+
+  const commentLine =
+    rawComment ||
+    (mode === 'praise'
+      ? `Trên lớp ${studentPronoun} nắm vững kiến thức trọng tâm, trình bày bài cẩn thận và có ý thức học tập rất tốt.`
+      : `Cần ôn kỹ lại các ví dụ mẫu đã chữa trên lớp và hoàn thành đầy đủ bài tập tự luyện.`);
+
+  const hwNextDesc =
+    session.homework_description?.trim() ||
+    `Hoàn thành phiếu bài tập chuyên đề "${session.lesson_title}".`;
+
+  if (mode === 'praise') {
+    const messageText = `Dạ ${teacherTitle} ${teacherName} xin gửi lời khen ngợi và chúc mừng kết quả buổi học hôm nay (${session.session_date}) của ${studentPronoun} ${student.full_name} (Lớp ${cls.class_name}) tới Gia đình ạ!
+
+1. Nội dung buổi học: ${session.lesson_title}
+2. Kết quả học tập xuất sắc trong buổi học:
+- Chuyên cần: ${attLine}.
+- Bài tập về nhà: ${hwLine}.
+${testLine ? `${testLine}\n` : ''}- Nhận xét của ${teacherTitle}: ${commentLine}
+
+3. Nhiệm vụ BTVN cho buổi tới:
+- ${hwNextDesc}
+
+Nhờ Gia đình gửi lời khen để khích lệ tinh thần giúp ${studentPronoun} tiếp tục phát huy phong độ rất tốt này trong các buổi học tiếp theo nhé ạ!`;
+
+    return {
+      issueBadges: issueBadges.length > 0 ? issueBadges : ['Hoàn thành tốt'],
+      messageText,
+      suggestedCrmStatus: 'satisfied',
+    };
+  }
+
+  // Mode: 'reminder'
+  const isAtRisk =
+    att === 'absent_unexcused' ||
+    (typeof rec.test_score === 'number' && rec.test_score < 4.5);
+
+  const actionGuidance = att.startsWith('absent')
+    ? `Do hôm nay ${studentPronoun} vắng mặt ở chuyên đề "${session.lesson_title}", ${teacherTitle} đã lưu lại phiếu bài tập và đề kiểm tra. Nhờ Gia đình nhắc ${studentPronoun} chép bài đầy đủ và báo lại ${teacherTitle} khung giờ để xếp lịch học bù/kèm lại kiến thức trước buổi học tới ạ.`
+    : `Nhờ Gia đình phối hợp nhắc nhở ${studentPronoun} xem lại các lỗi sai ${teacherTitle} đã chữa kỹ trong vở và dành khoảng 30-45 phút hoàn thành đầy đủ nhiệm vụ BTVN (${hwNextDesc}) trước khi đến lớp buổi sau nhé ạ!`;
+
+  const messageText = `Dạ ${teacherTitle} ${teacherName} xin phép thông tin nhanh tới Gia đình tình hình buổi học môn Toán hôm nay (${session.session_date}) của ${studentPronoun} ${student.full_name} (Lớp ${cls.class_name}):
+
+1. Chuyên đề bài học: ${session.lesson_title}
+2. Ghi nhận tình hình của ${studentPronoun} trong buổi học:
+- Điểm danh: ${attLine}.
+- Bài tập về nhà: ${hwLine}.
+${testLine ? `${testLine}\n` : ''}- Nhận xét chi tiết của ${teacherTitle}: ${commentLine}
+
+3. Phương án phối hợp & BTVN buổi tới:
+- ${actionGuidance}
+
+Gia đình xem qua nếu cần trao đổi thêm hoặc hẹn lịch kèm bổ trợ cho ${studentPronoun}, Phụ huynh nhắn lại giúp ${teacherTitle} nhé ạ!`;
+
+  return {
+    issueBadges: issueBadges.length > 0 ? issueBadges : ['Cần lưu ý'],
+    messageText,
+    suggestedCrmStatus: isAtRisk ? 'at_risk' : 'attention',
+  };
+}
+
+

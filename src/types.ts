@@ -173,11 +173,15 @@ export interface Warning {
   id?: string;
   student_id: string;
   class_id: string;
-  priority: PriorityLevel; // P1 (Khẩn cấp), P2 (Nội bộ)
-  warning_type: string; // e.g., "Vắng không phép 2 buổi", "Điểm kiểm tra < 5", "Lệch BTVN & Bài thi"
+  priority: PriorityLevel; // P1 (Nguy cơ cao), P2 (Cần chú ý), Praise (Tuyên dương)
+  warning_type: string; // Tiêu đề cảnh báo hợp nhất
   reason: string;
+  issue_tags?: string[]; // e.g., ["Chuyên cần", "BTVN", "Điểm KT"]
   resolved: boolean;
   resolved_action?: string; // e.g., "Đã gọi Phụ huynh", "Đã phụ đạo bù", "Đã cho làm lại bài"
+  resolved_at?: string;
+  resolved_after_session_date?: string; // YYYY-MM-DD mốc buổi học cuối cùng đã khép lại khi giải quyết
+  resolved_session_ids?: string[]; // Danh sách session_id đã khép lại
   is_demo?: boolean;
   created_at: string;
   updated_at: string;
@@ -264,14 +268,17 @@ export interface StudentStats {
   scoreTrend: 'Improving' | 'Stable' | 'Declining';
   latestTestScore?: number;
   latestHwScore?: number;
+  prevTestScore?: number;
+  prevHwScore?: number;
 }
 
 export interface DetectedWarning {
-  type: 'test_score' | 'homework' | 'attendance' | 'performance_gap' | 'praise_score' | 'praise_progress' | 'praise_diligence';
+  type: 'unified' | 'test_score' | 'homework' | 'attendance' | 'performance_gap' | 'praise_score' | 'praise_progress' | 'praise_diligence';
   priority: PriorityLevel; // 'P1' | 'P2' | 'Praise'
   badgeColor: 'red' | 'amber' | 'yellow' | 'emerald';
   title: string;
   reason: string;
+  issue_tags?: string[];
 }
 
 export interface WarningThresholds {

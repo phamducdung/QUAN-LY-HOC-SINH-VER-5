@@ -1,7 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import * as XLSX from 'xlsx';
-import { Warning, Student, ClassItem, WarningRuleConfig, Session } from '../types';
-import { db, seedDemoData } from '../db/dexie';
+import {
+  Warning,
+  Student,
+  ClassItem,
+  WarningRuleConfig,
+  Session,
+  CRMCustomerStatus,
+  CRMTemplateCategory,
+  CRMInteractionLog,
+  PronounConfig,
+} from '../types';
+import { db, pushBatchDocsToFirestore } from '../db/dexie';
 import { logAudit } from '../utils/auditLogger';
 import { exportCycleReportPDF } from '../utils/pdfGenerator';
 import { PrintableCycleReport } from './PrintableCycleReport';
@@ -15,8 +25,6 @@ import {
   AlertTriangle,
   CheckCircle2,
   Filter,
-  PhoneCall,
-  UserCheck,
   RefreshCw,
   X,
   MessageSquare,
@@ -51,7 +59,7 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
   onRefresh,
 }) => {
   const [statusFilter, setStatusFilter] = useState<'unresolved' | 'resolved' | 'all'>('unresolved');
-  const [priorityFilter, setPriorityFilter] = useState<'P1' | 'P2' | 'P3' | 'Praise' | 'all'>('all');
+  const [priorityFilter, setPriorityFilter] = useState<'P1' | 'P2' | 'Praise' | 'all'>('all');
   const [selectedClassId, setSelectedClassId] = useState<string | number | 'all'>('all');
 
   // Sub Tab Navigation
@@ -96,6 +104,8 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
   const [isZaloSingleOpen, setIsZaloSingleOpen] = useState(false);
   const [copiedSingleSuccess, setCopiedSingleSuccess] = useState(false);
   const [singleStudentPhone, setSingleStudentPhone] = useState<string>('');
+  const [singleStudentId, setSingleStudentId] = useState<string>('');
+  const [singleStudentWarningStatus, setSingleStudentWarningStatus] = useState<'normal' | 'P1' | 'P2' | 'Praise'>('normal');
 
   // State for detailed student modal & smart knowledge gap mapping
   const [selectedDetailStudent, setSelectedDetailStudent] = useState<any | null>(null);
@@ -418,35 +428,49 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
 
   // Single Zalo summary trigger
   const handleOpenZaloSingle = (student: any) => {
-    const cls = classes.find(c => c.id === reportClassId);
-    const currentCycle = cycles.find(c => c.index === selectedCycleIndex);
-    const parentName = student.parent_name ? `anh/chị ${student.parent_name}` : 'Phụ huynh';
+    const cls = classes.find((c) => String(c.id) === String(reportClassId));
+    const currentCycle = cycles.find((c) => c.index === selectedCycleIndex);
+    const parentName = student.parent_name ? `anh/chị ${student.parent_name}` : 'Quý Phụ huynh';
+    const teacherTitle = pronounConfig.teacher_title || 'Thầy/Cô';
+    const teacherName =
+      pronounConfig.teacher_name && pronounConfig.teacher_name !== 'Giáo viên'
+        ? `${teacherTitle} ${pronounConfig.teacher_name}`
+        : teacherTitle;
+    const studentPronoun = (pronounConfig.student_pronoun || 'con').toLowerCase();
 
-    let evaluationStr = 'Con có ý thức học tập rất tốt trong chu kỳ này!';
+    const weightedCycleAvg =
+      student.hwAvg > 0 && student.testAvg > 0
+        ? parseFloat((student.hwAvg * 0.3 + student.testAvg * 0.7).toFixed(1))
+        : student.testAvg || student.hwAvg || 0;
+
+    let evaluationStr = `Nhìn chung ${studentPronoun} có ý thức học tập ổn định trong chu kỳ này!`;
     if (student.warningStatus === 'P1') {
-      evaluationStr = `⚠️ Cảnh báo chu kỳ: ${student.warningReason}. Nhờ phụ huynh sát sao đôn đốc con học tập và làm bài đầy đủ.`;
+      evaluationStr = `⚠️ Cảnh báo cần phối hợp gấp: ${student.warningReason}. Rất mong Gia đình sát sao đôn đốc ${studentPronoun} đi học và hoàn thành bài tập đầy đủ.`;
     } else if (student.warningStatus === 'P2') {
-      evaluationStr = `⚠️ Lưu ý chu kỳ: ${student.warningReason}. Con cần tập trung hơn trong giờ kiểm tra.`;
+      evaluationStr = `⚠️ Lưu ý học tập: ${student.warningReason}. ${teacherTitle} sẽ kèm sát hơn để hỗ trợ ${studentPronoun} cải thiện điểm số.`;
     } else if (student.warningStatus === 'Praise') {
-      evaluationStr = `🌟 Tuyên dương: ${student.warningReason}. Thành tích xuất sắc, tinh thần học tập gương mẫu!`;
+      evaluationStr = `🌟 Tuyên dương: ${student.warningReason}. Thành tích rất xuất sắc, tinh thần học tập gương mẫu!`;
     }
 
-    const text = `Kính gửi ${parentName} em ${student.full_name},
+    const text = `Kính gửi ${parentName} (PH ${studentPronoun} ${student.full_name} - Lớp ${cls?.class_name || 'Toán'}),
 
-Trung tâm Toán TCT trân trọng gửi báo cáo kết quả học tập của con trong ${currentCycle?.name} (${currentCycle?.dateRange || 'vừa qua'}):
+${teacherName} xin gửi báo cáo kết quả học tập của ${studentPronoun} trong ${currentCycle?.name} (${currentCycle?.dateRange || 'vừa qua'}):
 
 📊 CHỈ SỐ HỌC TẬP CHU KỲ:
-- Chuyên cần: ${student.attendancePercent}% (Số buổi học: ${student.attendanceMap.filter((a: any) => a !== null).length}/4)
-- Trung bình Bài tập về nhà (BTVN): ${student.hwAvg > 0 ? student.hwAvg + 'đ' : 'Chưa nhập'}
-- Trung bình Bài kiểm tra (KT): ${student.testAvg > 0 ? student.testAvg + 'đ' : 'Chưa nhập'}
+• Chuyên cần: ${student.attendancePercent}% (${student.attendanceMap.filter((a: any) => a !== null && (a.attendance === 'present' || a.attendance === 'late')).length}/${student.attendanceMap.length} buổi)
+• Điểm TB Kiểm tra (Trọng số 70%): ${student.testAvg > 0 ? student.testAvg + 'đ' : 'Chưa nhập'}
+• Điểm TB Bài tập về nhà (Trọng số 30%): ${student.hwAvg > 0 ? student.hwAvg + 'đ' : 'Chưa nhập'}
+🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): ${weightedCycleAvg > 0 ? weightedCycleAvg + 'đ' : 'Đang cập nhật'}
 
 📝 ĐÁNH GIÁ TỪ GIÁO VIÊN:
-- ${evaluationStr}
+• ${evaluationStr}
 
-Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua để giúp con tiến bộ hơn mỗi ngày!`;
+Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle} để giúp ${studentPronoun} tiến bộ mỗi ngày!`;
 
     setZaloSingleText(text);
     setSingleStudentPhone(student.parent_phone ? student.parent_phone.replace(/\s+/g, '') : '');
+    setSingleStudentId(String(student.id || ''));
+    setSingleStudentWarningStatus(student.warningStatus || 'normal');
     setIsZaloSingleOpen(true);
     setCopiedSingleSuccess(false);
   };
@@ -583,21 +607,62 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
     setIsDetailModalOpen(true);
   };
 
-  // Modal State for Warning Rule Configuration
+  // Modal State for Warning Rule Configuration & Pronoun Settings
   const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
   const [ruleConfig, setRuleConfig] = useState<WarningRuleConfig>(DEFAULT_WARNING_RULE_CONFIG);
+  const [pronounConfig, setPronounConfig] = useState<PronounConfig>({
+    teacher_title: 'Thầy/Cô',
+    teacher_name: 'Giáo viên',
+    student_pronoun: 'Con',
+  });
+  const hasAutoCleanedRef = useRef(false);
 
-  // Load Rule Config from DB Settings
+  // Load Rule Config & Pronoun Config from DB Settings
   useEffect(() => {
     async function loadConfig() {
       const settingsList = await db.settings.toArray();
-      if (settingsList.length > 0 && settingsList[0].warning_rule_config) {
-        setRuleConfig(settingsList[0].warning_rule_config);
+      if (settingsList.length > 0) {
+        if (settingsList[0].warning_rule_config) {
+          setRuleConfig(settingsList[0].warning_rule_config);
+        }
+        if (settingsList[0].pronoun_config) {
+          setPronounConfig(settingsList[0].pronoun_config);
+        }
       }
     }
     loadConfig();
   }, []);
+
+  // Auto-clean legacy multi-cards or P3 warnings once on mount so the list is immediately unified
+  useEffect(() => {
+    if (hasAutoCleanedRef.current || classes.length === 0) return;
+    const hasLegacyP3OrMultiCards = (() => {
+      const seenActive = new Set<string>();
+      for (const w of warnings) {
+        if (w.priority === 'P3') return true;
+        if (!w.resolved) {
+          const key = `${w.class_id}__${w.student_id}`;
+          if (seenActive.has(key)) return true;
+          seenActive.add(key);
+        }
+      }
+      return false;
+    })();
+
+    if (hasLegacyP3OrMultiCards) {
+      hasAutoCleanedRef.current = true;
+      (async () => {
+        const activeClasses = classes.filter((c) => c.status === 'active');
+        for (const c of activeClasses) {
+          if (c.id) {
+            await runWarningScanForClass(String(c.id));
+          }
+        }
+        onRefresh();
+      })();
+    }
+  }, [warnings, classes]);
 
   // Modal State for Resolve Warning
   const [resolvingWarning, setResolvingWarning] = useState<Warning | null>(null);
@@ -605,6 +670,7 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
   const [actionNotes, setActionNotes] = useState<string>('');
   const [checkedTasks, setCheckedTasks] = useState<string[]>([]);
   const [makeupScore, setMakeupScore] = useState<string>('8');
+  const [resolveCrmStatus, setResolveCrmStatus] = useState<CRMCustomerStatus>('attention');
 
   // Modal State for Zalo Message
   const [zaloModalWarning, setZaloModalWarning] = useState<Warning | null>(null);
@@ -636,13 +702,118 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
   const [isScanning, setIsScanning] = useState(false);
   const [scanMessage, setScanMessage] = useState<string | null>(null);
 
-  const filteredWarnings = warnings.filter((w) => {
-    if (statusFilter === 'unresolved' && w.resolved) return false;
-    if (statusFilter === 'resolved' && !w.resolved) return false;
-    if (priorityFilter !== 'all' && w.priority !== priorityFilter) return false;
-    if (selectedClassId !== 'all' && w.class_id !== selectedClassId) return false;
-    return true;
-  });
+  /**
+   * Liên thông 1-Click với Hồ sơ CRM Học sinh (Ghi Nhật ký CSKH + Đồng bộ Nhãn 3 mức)
+   */
+  const recordWarningCRMInteraction = async (
+    studentId: string,
+    params: {
+      channel: 'zalo' | 'call' | 'meeting';
+      templateCategory: CRMTemplateCategory;
+      summary: string;
+      messageSent?: string;
+      newCrmStatus: CRMCustomerStatus;
+      statusReason: string;
+    }
+  ) => {
+    const targetStudent = await db.students.get(String(studentId));
+    if (!targetStudent) return;
+
+    const nowIso = new Date().toISOString();
+    const newLog: CRMInteractionLog = {
+      id: `crm_warn_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      created_at: nowIso,
+      channel: params.channel,
+      template_category: params.templateCategory,
+      summary: params.summary,
+      message_sent: params.messageSent,
+      status_snapshot: params.newCrmStatus,
+      created_by: pronounConfig.teacher_name || 'Giáo viên',
+    };
+
+    const existingLogs = Array.isArray(targetStudent.crm_interactions)
+      ? targetStudent.crm_interactions
+      : [];
+
+    const updatedStudent: Student = {
+      ...targetStudent,
+      crm_status: params.newCrmStatus,
+      crm_status_reason: params.statusReason,
+      crm_status_updated_at: nowIso,
+      crm_last_contacted_at: nowIso,
+      crm_interactions: [newLog, ...existingLogs],
+      updated_at: nowIso,
+    };
+
+    await db.students.put(updatedStudent);
+    await pushBatchDocsToFirestore('students', [updatedStudent]);
+  };
+
+  // Lọc danh sách cảnh báo: Loại bỏ hoàn toàn P3 và đảm bảo mỗi Học sinh / Lớp chỉ hiển thị 1 thẻ hợp nhất ưu tiên cao nhất
+  const filteredWarnings = (() => {
+    const baseList = warnings.filter((w) => {
+      if (w.priority === 'P3') return false;
+      if (statusFilter === 'unresolved' && w.resolved) return false;
+      if (statusFilter === 'resolved' && !w.resolved) return false;
+      if (priorityFilter !== 'all' && w.priority !== priorityFilter) return false;
+      if (selectedClassId !== 'all' && String(w.class_id) !== String(selectedClassId)) return false;
+      return true;
+    });
+
+    const rankPriority = (p: string) => (p === 'P1' ? 3 : p === 'P2' ? 2 : 1);
+    const dedupMap = new Map<string, Warning>();
+
+    for (const w of baseList) {
+      const key = w.resolved
+        ? `resolved__${w.class_id}__${w.student_id}`
+        : `active__${w.class_id}__${w.student_id}`;
+      const existing = dedupMap.get(key);
+      if (!existing) {
+        dedupMap.set(key, w);
+      } else {
+        // Ưu tiên bản ghi canonical warn_${classId}_${studentId} hoặc mức độ ưu tiên cao hơn
+        const canonicalId = `warn_${w.class_id}_${w.student_id}`;
+        if (
+          w.id === canonicalId ||
+          rankPriority(w.priority) > rankPriority(existing.priority) ||
+          (rankPriority(w.priority) === rankPriority(existing.priority) &&
+            (w.updated_at || '') > (existing.updated_at || ''))
+        ) {
+          dedupMap.set(key, w);
+        }
+      }
+    }
+
+    return Array.from(dedupMap.values()).sort((a, b) => {
+      if (a.resolved !== b.resolved) return a.resolved ? 1 : -1;
+      const rDiff = rankPriority(b.priority) - rankPriority(a.priority);
+      if (rDiff !== 0) return rDiff;
+      return (b.updated_at || '').localeCompare(a.updated_at || '');
+    });
+  })();
+
+  // Đếm số lượng thẻ hợp nhất chưa xử lý theo từng nhóm
+  const activeUnifiedCounts = (() => {
+    const map = new Map<string, Warning>();
+    const rankPriority = (p: string) => (p === 'P1' ? 3 : p === 'P2' ? 2 : 1);
+    warnings.forEach((w) => {
+      if (w.resolved || w.priority === 'P3') return;
+      const key = `${w.class_id}__${w.student_id}`;
+      const ex = map.get(key);
+      if (!ex || w.id === `warn_${w.class_id}_${w.student_id}` || rankPriority(w.priority) > rankPriority(ex.priority)) {
+        map.set(key, w);
+      }
+    });
+    let p1 = 0;
+    let p2 = 0;
+    let praise = 0;
+    map.forEach((w) => {
+      if (w.priority === 'P1') p1++;
+      else if (w.priority === 'P2') p2++;
+      else if (w.priority === 'Praise') praise++;
+    });
+    return { p1, p2, praise };
+  })();
 
   // Save Warning Rule Config
   const handleSaveRuleConfig = async () => {
@@ -655,14 +826,14 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
     } else {
       await db.settings.add({
         warning_rule_config: ruleConfig,
-        pronoun_config: { teacher_title: 'Thầy/Cô', teacher_name: 'Giáo viên', student_pronoun: 'Con' },
+        pronoun_config: pronounConfig,
         theme: 'light',
         updated_at: new Date().toISOString(),
       });
     }
 
     setIsRuleModalOpen(false);
-    setScanMessage('Đã lưu cấu hình quy tắc cảnh báo! Đang tiến hành quét lại...');
+    setScanMessage('Đã lưu cấu hình quy tắc cảnh báo (Cửa sổ 2 buổi)! Đang tiến hành quét lại...');
     await handleRunManualScan();
   };
 
@@ -675,41 +846,17 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
 
     for (const c of activeClasses) {
       if (c.id) {
-        const count = await runWarningScanForClass(c.id, ruleConfig);
+        const count = await runWarningScanForClass(String(c.id), ruleConfig);
         totalNew += count;
       }
     }
 
     setIsScanning(false);
-    setScanMessage(`Quét hoàn tất! Phát hiện ${totalNew} cảnh báo mới.`);
+    setScanMessage(
+      `Đã quét Cửa sổ 2 Buổi Gần Nhất (sau mốc Giải quyết) và hợp nhất thẻ cảnh báo! Phát hiện ${totalNew} hồ sơ mới.`
+    );
     onRefresh();
-    setTimeout(() => setScanMessage(null), 4000);
-  };
-
-  // Seed Comprehensive Test Scenarios for Warning Center Verification
-  const handleSeedScenarios = async () => {
-    setIsScanning(true);
-    setScanMessage('Đang nạp dữ liệu điểm & các kịch bản thử nghiệm cảnh báo...');
-    try {
-      await seedDemoData();
-      let totalNew = 0;
-      const activeClasses = (await db.classes.where('status').equals('active').toArray());
-      for (const c of activeClasses) {
-        if (c.id) {
-          const count = await runWarningScanForClass(c.id, ruleConfig);
-          totalNew += count;
-        }
-      }
-      setIsScanning(false);
-      setScanMessage(`Đã khởi tạo bộ kịch bản thử nghiệm! Hệ thống quét ra ${totalNew} cảnh báo mới.`);
-      onRefresh();
-      setTimeout(() => setScanMessage(null), 5000);
-    } catch (err) {
-      console.error("Lỗi nạp kịch bản thử nghiệm:", err);
-      setIsScanning(false);
-      setScanMessage("Có lỗi xảy ra khi nạp dữ liệu kịch bản thử nghiệm.");
-      setTimeout(() => setScanMessage(null), 4000);
-    }
+    setTimeout(() => setScanMessage(null), 4500);
   };
 
   // Open Resolve Modal
@@ -719,28 +866,30 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
     setActionNotes('');
     setCheckedTasks([]);
     setMakeupScore('8');
+    // Mặc định gợi ý nhãn CSKH sau khi giải quyết: P1 -> Cần chú ý (theo dõi sát), P2/Praise -> Hài lòng
+    setResolveCrmStatus(w.priority === 'P1' ? 'attention' : 'satisfied');
   };
 
   const parseWarningDetails = (reason: string) => {
-    const lessonMatch = reason.match(/• \*\*(.*?)\*\*/);
+    const lessonMatch = reason.match(/• Bài: (.*?)(?:\(|\[|\n|$)/) || reason.match(/• \*\*(.*?)\*\*/);
     const tagMatch = reason.match(/↳ Chuyên đề: (.*?)(?:\n|$)/);
-    
+
     return {
-      lessonName: lessonMatch ? lessonMatch[1] : '',
-      tagName: tagMatch ? tagMatch[1].trim() : ''
+      lessonName: lessonMatch ? lessonMatch[1].trim() : '',
+      tagName: tagMatch ? tagMatch[1].trim() : '',
     };
   };
 
-  // Execute Resolve
+  // Execute Resolve & Anchor Resolution Milestone + Sync to CRM
   const handleExecuteResolve = async () => {
     if (!resolvingWarning) return;
 
-    const student = students.find((s) => s.id === resolvingWarning.student_id);
+    const student = students.find((s) => String(s.id) === String(resolvingWarning.student_id));
     const studentName = student?.full_name || 'Học sinh';
 
     const details = parseWarningDetails(resolvingWarning.reason || '');
-    const task1 = `Đã gọi điện/nhắn tin trao đổi riêng với phụ huynh về lỗ hổng ${details.lessonName || '[Tên bài học]'}`;
-    const task2 = `Đã trợ giảng kèm bù kiến thức chuyên đề ${details.tagName || '[Chuyên đề]'}`;
+    const task1 = `Đã gọi điện/nhắn tin trao đổi riêng với phụ huynh về bài học ${details.lessonName || 'gần nhất'}`;
+    const task2 = `Đã trợ giảng kèm bù kiến thức chuyên đề ${details.tagName || 'trọng tâm'}`;
     const task3 = `Đã cho làm lại bài tập đạt điểm ${makeupScore}/10`;
 
     const selectedActions: string[] = [];
@@ -753,24 +902,69 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
       fullActionDesc += ` (${selectedActions.join('; ')})`;
     }
     if (actionNotes) {
-      fullActionDesc += ` - Chi tiết ghi chú: ${actionNotes}`;
+      fullActionDesc += ` - Ghi chú: ${actionNotes}`;
     }
 
     const now = new Date().toISOString();
-    await db.warnings.update(resolvingWarning.id!, {
+
+    // Lấy toàn bộ buổi học hiện có của lớp để neo mốc Giải quyết (không bao giờ quét lại lỗi cũ trước mốc này)
+    const allClassSessions = await db.sessions
+      .where('class_id')
+      .equals(resolvingWarning.class_id)
+      .toArray();
+    const sortedClassSessions = [...allClassSessions].sort((a, b) =>
+      (a.session_date || '').localeCompare(b.session_date || '')
+    );
+    const latestSessionDate =
+      sortedClassSessions.length > 0
+        ? sortedClassSessions[sortedClassSessions.length - 1].session_date
+        : now.slice(0, 10);
+    const resolvedSessionIds = sortedClassSessions
+      .map((s) => String(s.id))
+      .filter(Boolean);
+
+    // Đóng cả thẻ hiện tại lẫn các thẻ lẻ trùng lặp nếu còn của học sinh này trong lớp
+    const allStudClassWarnings = await db.warnings
+      .where('class_id')
+      .equals(resolvingWarning.class_id)
+      .toArray();
+    const targetWarnings = allStudClassWarnings.filter(
+      (w) => String(w.student_id) === String(resolvingWarning.student_id) && !w.resolved
+    );
+
+    const updatedWarnings: Warning[] = (
+      targetWarnings.length > 0 ? targetWarnings : [resolvingWarning]
+    ).map((w) => ({
+      ...w,
       resolved: true,
       resolved_action: fullActionDesc,
+      resolved_at: now,
+      resolved_after_session_date: latestSessionDate,
+      resolved_session_ids: resolvedSessionIds,
       updated_at: now,
+    }));
+
+    await db.warnings.bulkPut(updatedWarnings);
+    await pushBatchDocsToFirestore('warnings', updatedWarnings);
+
+    // Liên thông tự động vào Nhật ký CRM & cập nhật Nhãn CSKH 3 mức
+    await recordWarningCRMInteraction(String(resolvingWarning.student_id), {
+      channel: actionChoice.includes('gọi') ? 'call' : 'meeting',
+      templateCategory:
+        resolvingWarning.priority === 'Praise'
+          ? 'praise_progress'
+          : 'knowledge_remedial',
+      summary: `[Giải quyết Cảnh báo] ${fullActionDesc}`,
+      newCrmStatus: resolveCrmStatus,
+      statusReason: `Đã xử lý cảnh báo (${actionChoice}) - Khép mốc đến ${latestSessionDate}`,
     });
 
-    // Record in Audit Log
     await logAudit(
       'Teacher',
-      'Giải quyết cảnh báo',
+      'Giải quyết cảnh báo & Ghi CRM',
       `Giải quyết cảnh báo [${resolvingWarning.warning_type}] cho học sinh ${studentName}: ${fullActionDesc}`
     );
 
-    // Refresh active warnings list for student detail modal if it's open
     if (selectedDetailStudent && reportClassId) {
       const activeWarns = await db.warnings
         .where({ student_id: selectedDetailStudent.id, class_id: reportClassId, resolved: 0 })
@@ -783,7 +977,7 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
     onRefresh();
   };
 
-  // Generate cycle text dynamically for a specific student, class & session range
+  // Generate text dynamically for a specific student, class & session range (Mặc định Cửa sổ 2 buổi gần nhất)
   const generateCycleTextForRange = async (
     studentId: string,
     classId: string,
@@ -791,16 +985,24 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
     endIdx: number,
     w: Warning
   ) => {
-    const student = students.find((s) => s.id === studentId);
-    const cls = classes.find((c) => c.id === classId);
-    const studentName = student?.full_name || 'em';
-    const parentName = student?.parent_name ? `anh/chị ${student.parent_name}` : 'Phụ huynh';
+    const student = students.find((s) => String(s.id) === String(studentId));
+    const cls = classes.find((c) => String(c.id) === String(classId));
+    const studentName = student?.full_name || 'con';
+    const parentName = student?.parent_name ? `anh/chị ${student.parent_name}` : 'Quý Phụ huynh';
+    const teacherTitle = pronounConfig.teacher_title || 'Thầy/Cô';
+    const teacherName =
+      pronounConfig.teacher_name && pronounConfig.teacher_name !== 'Giáo viên'
+        ? `${teacherTitle} ${pronounConfig.teacher_name}`
+        : teacherTitle;
+    const studentPronoun = (pronounConfig.student_pronoun || 'con').toLowerCase();
 
     const classSessions = await db.sessions.where('class_id').equals(classId).toArray();
-    const sortedClassSessions = [...classSessions].sort((a, b) => a.session_date.localeCompare(b.session_date));
+    const sortedClassSessions = [...classSessions].sort((a, b) =>
+      (a.session_date || '').localeCompare(b.session_date || '')
+    );
 
     if (sortedClassSessions.length === 0) {
-      return `Kính gửi ${parentName} em ${studentName},\nTrung tâm Toán TCT thông báo: Hiện chưa có dữ liệu buổi học cho lớp ${cls?.class_name || ''}.`;
+      return `Kính gửi ${parentName} (PH ${studentPronoun} ${studentName}),\n${teacherName} xin thông báo: Hiện lớp ${cls?.class_name || ''} chưa có dữ liệu buổi học.`;
     }
 
     const validStart = Math.max(0, Math.min(startIdx, sortedClassSessions.length - 1));
@@ -853,16 +1055,18 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
     const firstSess = slicedClassSessions[0];
     const lastSess = slicedClassSessions[slicedClassSessions.length - 1];
     const countInSlice = slicedClassSessions.length;
+    const attendedInSlice = stats.presentCount + stats.lateCount;
 
-    const cycleRangeStr = firstSess && lastSess
-      ? `Buổi ${validStart + 1} (${firstSess.session_date}) -> Buổi ${validEnd + 1} (${lastSess.session_date})`
-      : `Tích lũy ${stats.totalSessions} buổi`;
+    const cycleRangeStr =
+      firstSess && lastSess
+        ? `Buổi ${validStart + 1} (${firstSess.session_date}) -> Buổi ${validEnd + 1} (${lastSess.session_date})`
+        : `${stats.totalSessions} buổi gần nhất`;
 
-    const statsSummary = `📊 KẾT QUẢ TỔNG HỢP CHU KỲ (${countInSlice} BUỔI):
-- Tỷ lệ chuyên cần: ${stats.presentCount}/${countInSlice} buổi (${Math.round((stats.presentCount / (countInSlice || 1)) * 100)}%)
-- Điểm TB Bài kiểm tra (Trọng số 60%): ${stats.testAverage}đ
-- Điểm TB Bài tập về nhà (Trọng số 40%): ${stats.hwAverage}đ
-🎯 Điểm TB Tổng hợp Chu kỳ: ${stats.weightedAverage}đ`;
+    const statsSummary = `📊 TỔNG HỢP KẾT QUẢ ${countInSlice} BUỔI HỌC GẦN NHẤT:
+• Chuyên cần: ${attendedInSlice}/${countInSlice} buổi (${Math.round((attendedInSlice / (countInSlice || 1)) * 100)}%${stats.lateCount > 0 ? ` - Đi muộn ${stats.lateCount}b` : ''}${stats.unexcusedCount > 0 ? ` - Vắng không phép ${stats.unexcusedCount}b` : ''})
+• Điểm TB Bài kiểm tra (Trọng số 70%): ${stats.testAverage}đ
+• Điểm TB Bài tập về nhà (Trọng số 30%): ${stats.hwAverage}đ
+🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): ${stats.weightedAverage}đ`;
 
     const sortedStudentSessions = [...slicedStudentSessions].sort((a, b) => {
       const sa = slicedClassSessions.find((s) => s.id === a.session_id);
@@ -886,8 +1090,17 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
       if (!sess) return;
 
       const isAbsent = ss.attendance === 'absent_unexcused' || ss.attendance === 'absent_excused';
-      const isHwWeak = sess.has_homework !== false && !ss.exempt && !ss.exempt_homework && (!ss.homework_submitted || (ss.homework_score !== undefined && ss.homework_score < 5));
-      const isTestWeak = sess.has_test !== false && !ss.exempt && !ss.exempt_test && (ss.test_score !== undefined && ss.test_score < 5);
+      const isHwWeak =
+        sess.has_homework !== false &&
+        !ss.exempt &&
+        !ss.exempt_homework &&
+        (!ss.homework_submitted || (ss.homework_score !== undefined && ss.homework_score < ruleConfig.minHomeworkScore));
+      const isTestWeak =
+        sess.has_test !== false &&
+        !ss.exempt &&
+        !ss.exempt_test &&
+        ss.test_score !== undefined &&
+        ss.test_score < ruleConfig.minTestScore;
       const hasComments = (ss.quick_preset_comments && ss.quick_preset_comments.length > 0) || !!ss.custom_comment;
 
       if (isAbsent || isHwWeak || isTestWeak || hasComments) {
@@ -930,77 +1143,64 @@ Cảm ơn sự đồng hành sát sao từ quý gia đình trong thời gian qua
 
     let weakTopicsSection = '';
     if (weakSessionItems.length > 0) {
-      weakTopicsSection = `\n📌 CHI TIẾT BÀI HỌC & CHUYÊN ĐỀ CẦN LƯU Ý:\n${weakSessionItems.join('\n')}\n`;
+      weakTopicsSection = `\n📌 CHI TIẾT BUỔI HỌC & CHUYÊN ĐỀ CẦN LƯU Ý:\n${weakSessionItems.join('\n')}\n`;
     }
 
     const actionAdviceList: string[] = [];
     if (hasMissingHw) {
-      actionAdviceList.push('• Đôn đốc em hoàn thành nộp bổ sung Bài tập về nhà cho Thầy/Cô trước buổi học tới.');
+      actionAdviceList.push(`• Đôn đốc ${studentPronoun} hoàn thành và nộp bổ sung Bài tập về nhà cho ${teacherTitle} trước buổi học tới.`);
     }
     if (hasLowScore || weakTopicsSet.size > 0) {
       const topicsStr = Array.from(weakTopicsSet).join(', ') || 'Chuyên đề môn Toán';
-      actionAdviceList.push(`• Hướng dẫn em xem lại lý thuyết & luyện tập thêm các dạng bài thuộc Chuyên đề: ${topicsStr}.`);
+      actionAdviceList.push(`• Nhắc ${studentPronoun} xem lại lý thuyết & luyện tập thêm các dạng bài thuộc Chuyên đề: ${topicsStr}.`);
     }
     if (hasAbsence) {
-      actionAdviceList.push('• Nhắc em mượn vở bạn chép bài đầy đủ và lấy phiếu bài tập của các buổi nghỉ.');
+      actionAdviceList.push(`• Nhắc ${studentPronoun} xem lại bài ghi chép và hoàn thành phiếu bài tập của buổi nghỉ.`);
     }
     if (actionAdviceList.length === 0) {
-      actionAdviceList.push('• Kiểm tra góc học tập và đôn đốc em duy trì thói quen ôn bài cũ 20 phút mỗi ngày.');
+      actionAdviceList.push(`• Động viên ${studentPronoun} duy trì thói quen ôn bài cũ 20 phút mỗi ngày trước khi làm BTVN.`);
     }
 
-    const actionGuideSection = `\n💡 HƯỚNG KHẮC PHỤC DÀNH CHO PHỤ HUYNH:\n${actionAdviceList.join('\n')}\n`;
+    const actionGuideSection = `\n💡 ĐỀ XUẤT PHỐI HỢP CÙNG GIA ĐÌNH:\n${actionAdviceList.join('\n')}\n`;
 
     const isPraise = w.priority === 'Praise';
-    const cleanReasonFull = (w.reason || '').replace(/\*\*/g, '').replace(/\[CHI TIẾT LỖ HỔNG TRUY VẾT\]:/g, '').trim();
-    const primaryReasonRaw = cleanReasonFull.split('\n')[0].trim();
-    // Tách phần danh sách buổi phía sau dấu hai chấm để không lặp lại danh sách buổi đã có ở mục bên dưới
-    const primaryReasonSummary = primaryReasonRaw.includes(': Buổi')
-      ? primaryReasonRaw.split(': Buổi')[0].trim()
-      : primaryReasonRaw;
+    const cleanReasonFull = (w.reason || '')
+      .replace(/\*\*/g, '')
+      .split('[CHI TIẾT LỖ HỔNG TRUY VẾT]:')[0]
+      .trim();
 
-    const normWarnType = (w.warning_type || '').replace(/^[🔴🟡🟢⚡📊⚠️\s]+/, '').trim().toLowerCase();
-    const normReason = primaryReasonSummary.replace(/^[🔴🟡🟢⚡📊⚠️\s]+/, '').trim().toLowerCase();
-
-    let warningHeaderBlock = '';
-    if (isPraise) {
-      warningHeaderBlock = `🌟 THÀNH TÍCH XUẤT SẮC: ${w.warning_type}`;
-    } else {
-      if (normReason && normReason !== normWarnType && !normWarnType.includes(normReason)) {
-        warningHeaderBlock = `⚠️ NỘI DUNG CẢNH BÁO: ${w.warning_type}\n- Ghi chú: ${primaryReasonSummary}`;
-      } else {
-        warningHeaderBlock = `⚠️ NỘI DUNG CẢNH BÁO: ${w.warning_type}`;
-      }
-    }
+    const warningHeaderBlock = isPraise
+      ? `🌟 THÀNH TÍCH TUYÊN DƯƠNG: ${w.warning_type}\n${cleanReasonFull}`
+      : `⚠️ TỔNG HỢP LƯU Ý HỌC TẬP: ${w.warning_type}\n${cleanReasonFull}`;
 
     return isPraise
-      ? `Kính gửi ${parentName} em ${studentName},
+      ? `Kính gửi ${parentName} (PH ${studentPronoun} ${studentName} - Lớp ${cls?.class_name || 'Toán'}),
 
-Trung tâm Toán TCT trân trọng gửi lời TUYÊN DƯƠNG đến em ${studentName} (Lớp ${cls?.class_name || 'Toán'}):
-
-${warningHeaderBlock}
-
-${statsSummary}
-
-Thầy/Cô tuyên dương tinh thần nỗ lực học tập tuyệt vời của em ${studentName} và mong em tiếp tục giữ vững phong độ xuất sắc! Xin chân thành cảm ơn PH!`
-      : `Kính gửi ${parentName} em ${studentName},
-
-Trung tâm Toán TCT xin thông báo báo cáo học tập định kỳ Chu kỳ ${countInSlice} buổi (${cycleRangeStr} - Lớp ${cls?.class_name || 'Toán'}):
+${teacherName} trân trọng gửi lời TUYÊN DƯƠNG kết quả học tập của ${studentPronoun} ${studentName} trong ${countInSlice} buổi gần nhất (${cycleRangeStr}):
 
 ${warningHeaderBlock}
 
 ${statsSummary}
-${weakTopicsSection}
-${actionGuideSection}
-Rất mong Quý Phụ huynh phối hợp cùng Trung tâm đôn đốc em ${studentName} ôn tập để giúp em nhanh chóng tiến bộ. Xin chân thành cảm ơn PH!`;
+
+${teacherTitle} rất vui và tự hào trước tinh thần nỗ lực của ${studentPronoun} ${studentName}. Mong Gia đình tiếp tục khích lệ để ${studentPronoun} giữ vững phong độ xuất sắc này! Trân trọng cảm ơn Gia đình!`
+      : `Kính gửi ${parentName} (PH ${studentPronoun} ${studentName} - Lớp ${cls?.class_name || 'Toán'}),
+
+${teacherName} xin gửi thông báo tình hình học tập của ${studentPronoun} ${studentName} qua ${countInSlice} buổi gần nhất (${cycleRangeStr}):
+
+${warningHeaderBlock}
+
+${statsSummary}
+${weakTopicsSection}${actionGuideSection}
+Rất mong Quý Phụ huynh phối hợp cùng ${teacherTitle} đôn đốc ${studentPronoun} ${studentName} ôn tập để ${studentPronoun} nhanh chóng bắt kịp tiến độ lớp. Trân trọng cảm ơn Gia đình!`;
   };
 
-  // Handle Changing Class in Cycle Range Picker
+  // Handle Changing Class in Cycle Range Picker (Mặc định Cửa sổ 2 buổi gần nhất)
   const handleCycleClassChange = async (newClassId: string) => {
     setCycleClassId(newClassId);
     const classSessions = await db.sessions.where('class_id').equals(newClassId).toArray();
     const sorted = [...classSessions].sort((a, b) => a.session_date.localeCompare(b.session_date));
     setCycleSessions(sorted);
-    const start = Math.max(0, sorted.length - 4);
+    const start = Math.max(0, sorted.length - 2);
     const end = Math.max(0, sorted.length - 1);
     setCycleStartIdx(start);
     setCycleEndIdx(end);
@@ -1024,12 +1224,18 @@ Rất mong Quý Phụ huynh phối hợp cùng Trung tâm đôn đốc em ${stud
     }
   };
 
-  // Open Zalo Message Modal & Generate Template with Real-time Student Stats
+  // Open Zalo Message Modal & Generate Unified Template (Default: Cửa sổ 2 buổi gần nhất)
   const handleOpenZaloModal = async (w: Warning) => {
-    const student = students.find((s) => s.id === w.student_id);
-    const cls = classes.find((c) => c.id === w.class_id);
-    const studentName = student?.full_name || 'em';
-    const parentName = student?.parent_name ? `anh/chị ${student.parent_name}` : 'Phụ huynh';
+    const student = students.find((s) => String(s.id) === String(w.student_id));
+    const cls = classes.find((c) => String(c.id) === String(w.class_id));
+    const studentName = student?.full_name || 'con';
+    const parentGreeting = student?.parent_name ? `anh/chị ${student.parent_name}` : 'Quý Phụ huynh';
+    const teacherTitle = pronounConfig.teacher_title || 'Thầy/Cô';
+    const teacherName =
+      pronounConfig.teacher_name && pronounConfig.teacher_name !== 'Giáo viên'
+        ? `${teacherTitle} ${pronounConfig.teacher_name}`
+        : teacherTitle;
+    const studentPronoun = (pronounConfig.student_pronoun || 'con').toLowerCase();
 
     let textCycle = '';
     let textSession = '';
@@ -1041,7 +1247,8 @@ Rất mong Quý Phụ huynh phối hợp cùng Trung tâm đôn đốc em ${stud
       setCycleClassId(w.class_id);
       setCycleSessions(sortedClassSessions);
 
-      const defaultStart = Math.max(0, sortedClassSessions.length - 4);
+      // Mặc định quét đúng Cửa sổ 2 buổi học gần nhất
+      const defaultStart = Math.max(0, sortedClassSessions.length - 2);
       const defaultEnd = Math.max(0, sortedClassSessions.length - 1);
       setCycleStartIdx(defaultStart);
       setCycleEndIdx(defaultEnd);
@@ -1058,47 +1265,53 @@ Rất mong Quý Phụ huynh phối hợp cùng Trung tâm đôn đốc em ${stud
       });
 
       const latestStudentSession = sortedStudentSessions[sortedStudentSessions.length - 1];
-      const latestSessionObj = latestStudentSession ? sortedClassSessions.find((s) => s.id === latestStudentSession.session_id) : null;
+      const latestSessionObj = latestStudentSession
+        ? sortedClassSessions.find((s) => s.id === latestStudentSession.session_id)
+        : null;
 
       if (latestSessionObj && latestStudentSession) {
-        let attStr = 'Đi học';
+        let attStr = 'Đi học đúng giờ';
         if (latestStudentSession.attendance === 'absent_unexcused') attStr = 'Vắng không phép';
-        else if (latestStudentSession.attendance === 'absent_excused') attStr = 'Vắng có phép';
+        else if (latestStudentSession.attendance === 'absent_excused') attStr = 'Nghỉ có phép';
         else if (latestStudentSession.attendance === 'late') attStr = 'Đi muộn';
 
-        let hwStr = 'Chưa làm';
+        let hwStr = 'Chưa nộp';
         if (latestStudentSession.homework_submitted) {
-          hwStr = latestStudentSession.homework_score !== undefined ? `Đã nộp - ${latestStudentSession.homework_score}đ` : 'Đã nộp';
+          hwStr =
+            latestStudentSession.homework_score !== undefined
+              ? `Đã nộp - ${latestStudentSession.homework_score}đ`
+              : 'Đã nộp';
         }
 
-        let testStr = latestStudentSession.test_score !== undefined ? `${latestStudentSession.test_score}đ` : 'Chưa kiểm tra';
+        let testStr =
+          latestStudentSession.test_score !== undefined
+            ? `${latestStudentSession.test_score}đ`
+            : 'Chưa kiểm tra';
         if (latestStudentSession.attendance.startsWith('absent')) testStr = 'Vắng mặt';
 
         const remList = [...(latestStudentSession.quick_preset_comments || [])];
         if (latestStudentSession.custom_comment) remList.push(latestStudentSession.custom_comment);
         const remStr = remList.length > 0 ? remList.join(', ') : 'Tiếp thu bài ổn định';
 
-        const latestIdx = sortedClassSessions.findIndex((s) => s.id === latestSessionObj.id);
-        const nextSessionObj = latestIdx >= 0 && latestIdx < sortedClassSessions.length - 1 ? sortedClassSessions[latestIdx + 1] : null;
-        const nextDateStr = nextSessionObj ? `ngày ${nextSessionObj.session_date}` : 'tiếp theo';
+        const cleanReasonFull = (w.reason || '')
+          .replace(/\*\*/g, '')
+          .split('[CHI TIẾT LỖ HỔNG TRUY VẾT]:')[0]
+          .trim();
 
-        const parentGreeting = student?.parent_name ? `anh/chị ${student.parent_name}` : 'anh/chị Phụ huynh';
-        const cleanReasonFull = (w.reason || '').replace(/\*\*/g, '').replace(/\[CHI TIẾT LỖ HỔNG TRUY VẾT\]:/g, '').trim();
-        const primaryReason = cleanReasonFull.split('\n')[0].trim();
+        textSession = `Kính gửi ${parentGreeting} (PH ${studentPronoun} ${studentName} - Lớp ${cls?.class_name || 'Toán'}),
+${teacherName} xin thông báo nhanh kết quả buổi học ngày ${latestSessionObj.session_date} - Bài "${latestSessionObj.lesson_title}":
 
-        const isCumulativeWarning = w.warning_type.toLowerCase().includes('tích lũy') || w.warning_type.toLowerCase().includes('trung bình tích lũy');
-        const warningLine = isCumulativeWarning ? '' : `⚠️ Lưu ý: ${w.warning_type}${primaryReason ? ` (${primaryReason})` : ''}\n\n`;
+${w.priority === 'Praise' ? '🌟 Tuyên dương:' : '⚠️ Lưu ý tổng hợp (2 buổi gần nhất):'} ${w.warning_type}
+${cleanReasonFull}
 
-        textSession = `Kính gửi ${parentGreeting} em ${studentName} (Lớp ${cls?.class_name || 'Toán'}),
-Trung tâm Toán TCT xin thông báo kết quả buổi học ngày ${latestSessionObj.session_date} - Bài "${latestSessionObj.lesson_title}":
-${warningLine}Tình hình buổi học:
+📌 Kết quả buổi học mới nhất (${latestSessionObj.session_date}):
 • Chuyên cần: ${attStr}
-• BTVN: ${hwStr}
-• Kiểm tra đầu giờ: ${testStr}
+• BTVN (30%): ${hwStr}
+• Kiểm tra tại lớp (70%): ${testStr}
 • Nhận xét: ${remStr}
 
-💡 Đề xuất phối hợp: Rất mong Gia đình đôn đốc em ôn lại bài "${latestSessionObj.lesson_title}" và hoàn thành bài tập trước buổi học ${nextDateStr}.
-Trân trọng cảm ơn PH!`;
+💡 Đề xuất phối hợp: Rất mong Gia đình đồng hành đôn đốc ${studentPronoun} ôn lại bài "${latestSessionObj.lesson_title}" và hoàn thành đầy đủ BTVN trước buổi học tới.
+Trân trọng cảm ơn Gia đình!`;
       } else {
         textSession = textCycle;
       }
@@ -1106,27 +1319,51 @@ Trân trọng cảm ơn PH!`;
 
     setZaloTextCycle(textCycle);
     setZaloTextSession(textSession);
-
-    // Mặc định chọn mẫu 1 buổi cho các cảnh báo theo buổi/nhắc nhở, chỉ chọn chu kỳ khi là báo cáo tổng hợp tích lũy
-    const isCycleType = w.warning_type.toLowerCase().includes('tích lũy') || w.warning_type.toLowerCase().includes('chu kỳ');
-    const defaultMode = isCycleType ? 'cycle' : 'session';
-    setZaloMode(defaultMode);
-    setZaloMessageText(defaultMode === 'session' ? textSession : textCycle);
+    setZaloMode('cycle');
+    setZaloMessageText(textCycle);
     setZaloModalWarning(w);
     setCopiedSuccess(false);
   };
 
-  // Copy Zalo Text & Open Zalo
-  const handleCopyAndOpenZalo = () => {
+  // Copy Zalo Text, Open Zalo & Log 1-Click to Student CRM
+  const handleCopyAndOpenZalo = async () => {
     navigator.clipboard.writeText(zaloMessageText);
     setCopiedSuccess(true);
 
-    const student = students.find((s) => s.id === zaloModalWarning?.student_id);
-    const phone = student?.parent_phone ? student.parent_phone.replace(/\s+/g, '') : '';
+    const student = students.find((s) => String(s.id) === String(zaloModalWarning?.student_id));
+    const phone = student?.parent_phone ? student.parent_phone.replace(/[\s.-]/g, '') : '';
+
+    if (zaloModalWarning && student?.id) {
+      const targetCrmStatus: CRMCustomerStatus =
+        zaloModalWarning.priority === 'P1'
+          ? 'at_risk'
+          : zaloModalWarning.priority === 'P2'
+          ? 'attention'
+          : 'satisfied';
+
+      const targetCategory: CRMTemplateCategory =
+        zaloModalWarning.priority === 'Praise'
+          ? 'praise_progress'
+          : zaloModalWarning.warning_type.includes('Chuyên cần') ||
+            zaloModalWarning.warning_type.includes('BTVN')
+          ? 'homework_attendance'
+          : 'knowledge_remedial';
+
+      await recordWarningCRMInteraction(String(student.id), {
+        channel: 'zalo',
+        templateCategory: targetCategory,
+        summary: `Gửi thông báo Zalo từ Trung tâm Cảnh báo: ${zaloModalWarning.warning_type}`,
+        messageSent: zaloMessageText,
+        newCrmStatus: targetCrmStatus,
+        statusReason: zaloModalWarning.warning_type,
+      });
+      onRefresh();
+    }
 
     setTimeout(() => {
       if (phone) {
-        window.open(`https://zalo.me/${phone}`, '_blank');
+        const formattedPhone = phone.startsWith('0') ? `84${phone.slice(1)}` : phone;
+        window.open(`https://zalo.me/${formattedPhone}`, '_blank');
       } else {
         window.open('https://chat.zalo.me/', '_blank');
       }
@@ -1167,33 +1404,44 @@ Trân trọng cảm ơn PH!`;
         <>
           {/* Header Info */}
           <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-            <div>
+            <div className="space-y-1">
               <div className="flex items-center gap-2">
                 <ShieldAlert className="w-5 h-5 text-rose-600 dark:text-rose-400" />
                 <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                  Hệ Thống Cảnh Báo Thông Minh
+                  Trung Tâm Cảnh Báo &amp; Tác Vụ CSKH Chủ Động
                 </h2>
               </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Cửa sổ quét: <strong className="text-slate-700 dark:text-slate-200">2 buổi học gần nhất</strong> (sau mốc Giải quyết) · Hợp nhất <strong className="text-slate-700 dark:text-slate-200">1 Học sinh = 1 Hồ sơ</strong> · Liên thông trực tiếp Nhật ký CRM
+              </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <button
                 onClick={handleRunManualScan}
                 disabled={isScanning}
-                className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-emerald-600/20 flex items-center gap-1.5 disabled:opacity-50"
+                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
               >
                 <RefreshCw className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} />
-                <span>Quét Cảnh Báo Ngay</span>
+                <span>Quét 2 Buổi Gần Nhất</span>
               </button>
 
-              <span className="px-3 py-2 bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300 rounded-xl text-xs font-bold border border-rose-200 dark:border-rose-800">
-                P1 Khẩn cấp: {warnings.filter((w) => !w.resolved && w.priority === 'P1').length}
+              <button
+                onClick={() => setIsRuleModalOpen(true)}
+                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+              >
+                <Sliders className="w-3.5 h-3.5" />
+                <span>Cấu Hình Ngưỡng</span>
+              </button>
+
+              <span className="px-3 py-2 bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300 rounded-xl text-xs font-bold border border-rose-200 dark:border-rose-800 tabular-nums">
+                🔴 P1 Nguy cơ cao: {activeUnifiedCounts.p1}
               </span>
-              <span className="px-3 py-2 bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300 rounded-xl text-xs font-bold border border-amber-200 dark:border-amber-800">
-                P2 Nội bộ: {warnings.filter((w) => !w.resolved && w.priority === 'P2').length}
+              <span className="px-3 py-2 bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300 rounded-xl text-xs font-bold border border-amber-200 dark:border-amber-800 tabular-nums">
+                🟠 P2 Cần chú ý: {activeUnifiedCounts.p2}
               </span>
-              <span className="px-3 py-2 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 rounded-xl text-xs font-bold border border-emerald-200 dark:border-emerald-800">
-                🟢 Tuyên dương: {warnings.filter((w) => !w.resolved && w.priority === 'Praise').length}
+              <span className="px-3 py-2 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 rounded-xl text-xs font-bold border border-emerald-200 dark:border-emerald-800 tabular-nums">
+                🟢 Tuyên dương: {activeUnifiedCounts.praise}
               </span>
             </div>
           </div>
@@ -1209,7 +1457,7 @@ Trân trọng cảm ơn PH!`;
           <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-white dark:bg-slate-900 p-3 rounded-2xl border border-slate-200 dark:border-slate-800">
             <div className="flex items-center gap-2">
               <Filter className="w-4 h-4 text-slate-400 ml-1" />
-              <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Lọc Cảnh Báo:</span>
+              <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Lọc Hồ Sơ:</span>
 
               {/* Status Tabs */}
               <div className="flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-xl">
@@ -1246,18 +1494,17 @@ Trân trọng cảm ơn PH!`;
               </div>
             </div>
 
-            {/* Priority & Class Dropdowns */}
+            {/* Priority & Class Dropdowns (Đã loại bỏ hoàn toàn P3 gây nhiễu) */}
             <div className="flex items-center gap-2 w-full sm:w-auto">
               <select
                 value={priorityFilter}
                 onChange={(e) => setPriorityFilter(e.target.value as any)}
                 className="text-xs font-bold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2 rounded-xl outline-none"
               >
-                <option value="all">Tất cả Cấp Độ (P1, P2, P3 & Praise)</option>
-                <option value="P1">🔴 P1 - Khẩn cấp (Màu đỏ)</option>
-                <option value="P2">🟠 P2 - Theo dõi (Màu cam)</option>
-                <option value="P3">🟡 P3 - Cảnh báo sớm (Màu vàng)</option>
-                <option value="Praise">🟢 Praise - Tuyên dương (Màu xanh)</option>
+                <option value="all">Tất cả Nhóm CSKH (P1, P2 &amp; Tuyên dương)</option>
+                <option value="P1">🔴 P1 - Nguy cơ cao (Cần liên hệ PH ngay)</option>
+                <option value="P2">🟠 P2 - Cần chú ý (Nhắc nhở sớm)</option>
+                <option value="Praise">🟢 Tuyên dương - Khen ngợi &amp; Tiến bộ</option>
               </select>
 
               <select
@@ -1277,16 +1524,40 @@ Trân trọng cảm ơn PH!`;
             </div>
           </div>
 
-          {/* Warnings List */}
+          {/* Unified Warnings List (1 Học sinh = 1 Hồ sơ cảnh báo hợp nhất) */}
           <div className="space-y-3">
             {filteredWarnings.length === 0 ? (
               <div className="p-8 text-center text-xs text-slate-500 bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-300 dark:border-slate-800">
-                Không tìm thấy cảnh báo nào phù hợp!
+                Không có hồ sơ cảnh báo nào cần xử lý trong 2 buổi học gần nhất!
               </div>
             ) : (
               filteredWarnings.map((w, idx) => {
-                const st = students.find((s) => s.id === w.student_id);
-                const cls = classes.find((c) => c.id === w.class_id);
+                const st = students.find((s) => String(s.id) === String(w.student_id));
+                const cls = classes.find((c) => String(c.id) === String(w.class_id));
+
+                // Tính thời gian liên hệ Phụ huynh gần nhất từ CRM
+                const lastContactIso = st?.crm_last_contacted_at;
+                let contactStatusText = 'Chưa có lịch sử CSKH';
+                let isContactedToday = false;
+                if (lastContactIso) {
+                  const diffDays = Math.floor(
+                    (Date.now() - new Date(lastContactIso).getTime()) / (1000 * 60 * 60 * 24)
+                  );
+                  if (diffDays <= 0) {
+                    contactStatusText = 'Đã liên hệ PH hôm nay';
+                    isContactedToday = true;
+                  } else {
+                    contactStatusText = `Liên hệ PH ${diffDays} ngày trước`;
+                  }
+                }
+
+                const crmStatus = st?.crm_status || (w.priority === 'P1' ? 'at_risk' : w.priority === 'P2' ? 'attention' : 'satisfied');
+                const crmLabel =
+                  crmStatus === 'at_risk'
+                    ? 'CRM: Nguy cơ nghỉ học'
+                    : crmStatus === 'attention'
+                    ? 'CRM: Cần chú ý'
+                    : 'CRM: Hài lòng';
 
                 return (
                   <div
@@ -1298,30 +1569,24 @@ Trân trọng cảm ơn PH!`;
                         ? 'bg-rose-50/80 dark:bg-rose-950/40 border-rose-200 dark:border-rose-900/80 shadow-sm'
                         : w.priority === 'P2'
                         ? 'bg-amber-50/80 dark:bg-amber-950/40 border-amber-200 dark:border-amber-900/80 shadow-sm'
-                        : w.priority === 'P3'
-                        ? 'bg-yellow-50/80 dark:bg-yellow-950/40 border-yellow-200 dark:border-yellow-900/80 shadow-sm'
                         : 'bg-emerald-50/90 dark:bg-emerald-950/50 border-emerald-300 dark:border-emerald-800 shadow-sm'
                     }`}
                   >
-                    <div className="space-y-1">
+                    <div className="space-y-1.5 flex-1">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span
-                          className={`px-2.5 py-0.5 rounded text-[10px] font-extrabold shadow-2xs ${
+                          className={`px-2.5 py-0.5 rounded text-[10px] font-extrabold ${
                             w.priority === 'P1'
                               ? 'bg-rose-600 text-white'
                               : w.priority === 'P2'
                               ? 'bg-amber-600 text-white'
-                              : w.priority === 'P3'
-                              ? 'bg-yellow-400 text-slate-950 font-black'
                               : 'bg-emerald-600 text-white'
                           }`}
                         >
                           {w.priority === 'P1'
-                            ? 'P1 - KHẨN CẤP'
+                            ? 'P1 - NGUY CƠ CAO'
                             : w.priority === 'P2'
-                            ? 'P2 - THEO DÕI'
-                            : w.priority === 'P3'
-                            ? 'P3 - CẢNH BÁO SỚM'
+                            ? 'P2 - CẦN CHÚ Ý'
                             : '🟢 TUYÊN DƯƠNG'}
                         </span>
 
@@ -1330,28 +1595,65 @@ Trân trọng cảm ơn PH!`;
                         </h3>
 
                         <span className="text-xs text-slate-500 dark:text-slate-400 font-medium">
-                          (Lớp {cls?.class_name || 'Toán'})
+                          · Lớp {cls?.class_name || 'Toán'}
+                        </span>
+
+                        <span className="text-xs text-slate-400 dark:text-slate-500">·</span>
+
+                        <span
+                          className={`text-xs font-bold ${
+                            crmStatus === 'at_risk'
+                              ? 'text-rose-600 dark:text-rose-400'
+                              : crmStatus === 'attention'
+                              ? 'text-amber-600 dark:text-amber-400'
+                              : 'text-emerald-600 dark:text-emerald-400'
+                          }`}
+                        >
+                          {crmLabel}
+                        </span>
+
+                        <span className="text-xs text-slate-400 dark:text-slate-500">·</span>
+
+                        <span
+                          className={`text-xs font-semibold ${
+                            isContactedToday
+                              ? 'text-emerald-700 dark:text-emerald-400 font-bold'
+                              : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          {contactStatusText}
                         </span>
                       </div>
 
-                      <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                        Loại cảnh báo:{' '}
-                        <span className="text-rose-700 dark:text-rose-400 font-bold">{w.warning_type}</span>
+                      <p className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                        Tóm tắt 2 buổi gần nhất:{' '}
+                        <span
+                          className={
+                            w.priority === 'Praise'
+                              ? 'text-emerald-700 dark:text-emerald-400'
+                              : w.priority === 'P1'
+                              ? 'text-rose-700 dark:text-rose-400'
+                              : 'text-amber-700 dark:text-amber-400'
+                          }
+                        >
+                          {w.warning_type}
+                        </span>
                       </p>
+
                       {(() => {
                         const parts = (w.reason || '').split('[CHI TIẾT LỖ HỔNG TRUY VẾT]:');
                         const mainReason = parts[0].replace(/\*\*/g, '').trim();
                         const traceDetails = parts[1] ? parts[1].trim() : null;
 
                         return (
-                          <div className="space-y-1 mt-0.5">
-                            <p className="text-xs text-slate-700 dark:text-slate-200 font-medium leading-relaxed">
+                          <div className="space-y-1.5 mt-0.5">
+                            <p className="text-xs text-slate-700 dark:text-slate-200 font-medium leading-relaxed whitespace-pre-line">
                               {mainReason}
                             </p>
                             {traceDetails && (
                               <details className="text-[11px] text-slate-600 dark:text-slate-300 bg-white/80 dark:bg-slate-950 p-2.5 rounded-lg border border-slate-200/80 dark:border-slate-800">
                                 <summary className="font-bold text-indigo-700 dark:text-indigo-400 cursor-pointer hover:underline select-none">
-                                  🔍 Xem chi tiết truy vết các buổi học & điểm số ({Math.max(1, traceDetails.split('• Bài:').length - 1)} buổi)
+                                  Xem chi tiết truy vết trong 2 buổi gần nhất ({Math.max(1, traceDetails.split('• Bài:').length - 1)} buổi)
                                 </summary>
                                 <pre className="mt-1.5 whitespace-pre-wrap font-sans text-[11px] leading-snug text-slate-800 dark:text-slate-200 bg-slate-50 dark:bg-slate-900 p-2 rounded border border-slate-100 dark:border-slate-800">
                                   {traceDetails}
@@ -1362,17 +1664,24 @@ Trân trọng cảm ơn PH!`;
                         );
                       })()}
 
-                      <div className="flex items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400 pt-1">
+                      <div className="flex items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400 pt-1 flex-wrap tabular-nums">
                         <span>
-                          SĐT Phụ huynh: <strong className="font-num text-slate-800 dark:text-slate-200 font-bold">{st?.parent_phone || 'N/A'}</strong>
+                          Phụ huynh: <strong className="text-slate-700 dark:text-slate-300">{st?.parent_name || 'PH'}</strong> ({st?.parent_phone || 'Chưa có SĐT'})
                         </span>
-                        <span>• Ngày tạo: {new Date(w.created_at).toLocaleDateString('vi-VN')}</span>
+                        <span>·</span>
+                        <span>Cập nhật: {new Date(w.updated_at || w.created_at).toLocaleDateString('vi-VN')}</span>
+                        {w.resolved_after_session_date && (
+                          <>
+                            <span>·</span>
+                            <span>Đã khép mốc đến buổi: {w.resolved_after_session_date}</span>
+                          </>
+                        )}
                       </div>
 
                       {w.resolved && (
-                        <div className="mt-2 p-2 bg-emerald-50 dark:bg-emerald-950/70 border border-emerald-300 dark:border-emerald-800 rounded-xl text-xs font-semibold text-emerald-900 dark:text-emerald-200 flex items-center gap-1.5">
+                        <div className="mt-2 p-2.5 bg-emerald-50 dark:bg-emerald-950/70 border border-emerald-300 dark:border-emerald-800 rounded-xl text-xs font-semibold text-emerald-900 dark:text-emerald-200 flex items-center gap-1.5">
                           <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                          <span>Đã xử lý: {w.resolved_action}</span>
+                          <span>Đã giải quyết &amp; khóa lỗi cũ: {w.resolved_action}</span>
                         </div>
                       )}
                     </div>
@@ -1380,19 +1689,19 @@ Trân trọng cảm ơn PH!`;
                     <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
                       <button
                         onClick={() => handleOpenZaloModal(w)}
-                        className="px-3 py-2 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:bg-sky-950/60 dark:text-sky-300 border border-sky-200 dark:border-sky-800 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5"
+                        className="px-3.5 py-2 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:bg-sky-950/60 dark:text-sky-300 border border-sky-200 dark:border-sky-800 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                       >
                         <MessageSquare className="w-4 h-4 text-sky-600" />
-                        <span>Gửi Zalo</span>
+                        <span>Nhắn Zalo PH 1-Click</span>
                       </button>
 
                       {!w.resolved && (
                         <button
                           onClick={() => handleOpenResolveModal(w)}
-                          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center gap-1.5"
+                          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                         >
                           <CheckCircle2 className="w-4 h-4" />
-                          <span>Giải Quyết Cảnh Báo</span>
+                          <span>Giải Quyết &amp; Khép Mốc</span>
                         </button>
                       )}
                     </div>
@@ -1895,11 +2204,55 @@ Trân trọng cảm ơn PH!`;
               </div>
 
               <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5">
+                  Đồng Bộ Nhãn CSKH (CRM 3 Mức) Sau Khi Giải Quyết:
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setResolveCrmStatus('satisfied')}
+                    className={`py-2 px-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                      resolveCrmStatus === 'satisfied'
+                        ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm'
+                        : 'bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    Hài lòng
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setResolveCrmStatus('attention')}
+                    className={`py-2 px-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                      resolveCrmStatus === 'attention'
+                        ? 'bg-amber-600 text-white border-amber-600 shadow-sm'
+                        : 'bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    Cần chú ý
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setResolveCrmStatus('at_risk')}
+                    className={`py-2 px-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                      resolveCrmStatus === 'at_risk'
+                        ? 'bg-rose-600 text-white border-rose-600 shadow-sm'
+                        : 'bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    Nguy cơ nghỉ
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Khi xác nhận, hệ thống tự động khép mốc vi phạm các buổi cũ (không tự bật lại) và ghi thẳng vào Nhật ký CRM của học sinh.
+                </p>
+              </div>
+
+              <div>
                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
                   Ghi Chú Chi Tiết Khác (Tùy chọn)
                 </label>
                 <textarea
-                  rows={3}
+                  rows={2}
                   value={actionNotes}
                   onChange={(e) => setActionNotes(e.target.value)}
                   placeholder="VD: Phụ huynh hứa phối hợp đôn đốc con làm bài tập về nhà đầy đủ..."
@@ -1916,9 +2269,9 @@ Trân trọng cảm ơn PH!`;
                 </button>
                 <button
                   onClick={handleExecuteResolve}
-                  className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 shadow-md shadow-emerald-600/20"
+                  className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 shadow-sm cursor-pointer"
                 >
-                  Xác Nhận Đã Giải Quyết
+                  Xác Nhận Giải Quyết &amp; Ghi CRM
                 </button>
               </div>
             </div>
@@ -1933,7 +2286,7 @@ Trân trọng cảm ơn PH!`;
             <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
               <h3 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
                 <MessageSquare className="w-5 h-5 text-sky-600" />
-                <span>Mẫu Tin Nhắn Zalo Phụ Huynh</span>
+                <span>Mẫu Tin Nhắn Zalo Phụ Huynh (Chuẩn 70% KT / 30% BTVN)</span>
               </h3>
               <button
                 onClick={() => setZaloModalWarning(null)}
@@ -1947,18 +2300,6 @@ Trân trọng cảm ơn PH!`;
             <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl gap-1">
               <button
                 type="button"
-                onClick={() => handleSwitchZaloMode('session')}
-                className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
-                  zaloMode === 'session'
-                    ? 'bg-white dark:bg-slate-700 text-sky-700 dark:text-sky-300 shadow-sm'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                }`}
-              >
-                <Zap className="w-3.5 h-3.5 text-amber-500" />
-                <span>⚡ Mẫu Nhanh (Theo Buổi)</span>
-              </button>
-              <button
-                type="button"
                 onClick={() => handleSwitchZaloMode('cycle')}
                 className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
                   zaloMode === 'cycle'
@@ -1967,15 +2308,27 @@ Trân trọng cảm ơn PH!`;
                 }`}
               >
                 <Calendar className="w-3.5 h-3.5 text-indigo-500" />
-                <span>📊 Mẫu Chu Kỳ (4 Buổi)</span>
+                <span>📊 Tổng Hợp Cửa Sổ (2 Buổi Gần Nhất)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSwitchZaloMode('session')}
+                className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                  zaloMode === 'session'
+                    ? 'bg-white dark:bg-slate-700 text-sky-700 dark:text-sky-300 shadow-sm'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5 text-amber-500" />
+                <span>⚡ Mẫu Nhanh (1 Buổi Mới Nhất)</span>
               </button>
             </div>
 
             <div className="space-y-3">
               <p className="text-xs text-slate-500">
-                {zaloMode === 'session'
-                  ? '⚡ Mẫu Nhanh: Tóm tắt trực diện kết quả buổi vừa học xong (Chuyên cần, BTVN, Điểm KT, Nhận xét). Ngắn gọn, đọc hiểu trong 5 giây.'
-                  : '📊 Mẫu Chu Kỳ: Báo cáo bức tranh toàn cảnh 4 buổi (Mốc từ buổi X -> buổi Y, điểm TB BTVN & KT, lỗ hổng chuyên đề và hướng khắc phục).'}
+                {zaloMode === 'cycle'
+                  ? '📊 Mẫu Tổng Hợp (Mặc định 2 buổi gần nhất): Tổng hợp tất cả các mục cần phối hợp (Chuyên cần, BTVN, Điểm KT) trong 01 tin nhắn duy nhất gửi Phụ huynh.'
+                  : '⚡ Mẫu Nhanh: Tóm tắt trực diện kết quả buổi vừa học xong kèm lưu ý tổng hợp.'}
               </p>
 
               {zaloMode === 'cycle' && (
@@ -1983,10 +2336,10 @@ Trân trọng cảm ơn PH!`;
                   <div className="flex items-center justify-between text-xs font-bold text-indigo-900 dark:text-indigo-200">
                     <span className="flex items-center gap-1.5">
                       <Filter className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
-                      <span>Bước Chọn Phạm Vi Tính Toán Chu Kỳ</span>
+                      <span>Phạm Vi Buổi Học Đưa Vào Tin Nhắn</span>
                     </span>
                     {cycleSessions.length > 0 && (
-                      <span className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-100 dark:bg-indigo-900/60 px-2 py-0.5 rounded-md">
+                      <span className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-100 dark:bg-indigo-900/60 px-2 py-0.5 rounded-md tabular-nums">
                         {cycleSessions.length} buổi học khả dụng
                       </span>
                     )}
@@ -2063,23 +2416,23 @@ Trân trọng cảm ơn PH!`;
                       type="button"
                       onClick={() => {
                         const end = Math.max(0, cycleSessions.length - 1);
+                        const start = Math.max(0, cycleSessions.length - 2);
+                        handleCycleRangeChange(start, end);
+                      }}
+                      className="px-2 py-0.5 bg-white dark:bg-slate-800 border border-indigo-200 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 rounded hover:bg-indigo-50 font-bold cursor-pointer"
+                    >
+                      ⚡ 2 buổi gần nhất (Chuẩn Cảnh báo)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const end = Math.max(0, cycleSessions.length - 1);
                         const start = Math.max(0, cycleSessions.length - 4);
                         handleCycleRangeChange(start, end);
                       }}
                       className="px-2 py-0.5 bg-white dark:bg-slate-800 border border-indigo-200 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 rounded hover:bg-indigo-50 font-semibold cursor-pointer"
                     >
-                      ⚡ 4 buổi gần nhất
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const start = 0;
-                        const end = Math.min(3, cycleSessions.length - 1);
-                        handleCycleRangeChange(start, end);
-                      }}
-                      className="px-2 py-0.5 bg-white dark:bg-slate-800 border border-indigo-200 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 rounded hover:bg-indigo-50 font-semibold cursor-pointer"
-                    >
-                      📍 Buổi 1 đến 4
+                      📊 4 buổi gần nhất
                     </button>
                     <button
                       type="button"
@@ -2094,19 +2447,16 @@ Trân trọng cảm ơn PH!`;
 
                   {/* Warning Box for Incomplete Sessions */}
                   {cycleIncompleteSessions.length > 0 && (
-                    <div className="bg-amber-50 dark:bg-amber-950/70 border-2 border-amber-400 dark:border-amber-700 p-3 rounded-xl space-y-2 mt-2">
+                    <div className="bg-amber-50 dark:bg-amber-950/70 border border-amber-400 dark:border-amber-700 p-3 rounded-xl space-y-2 mt-2">
                       <div className="flex items-center gap-1.5 text-xs font-bold text-amber-900 dark:text-amber-200">
                         <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
-                        <span>⚠️ PHÁT HIỆN {cycleIncompleteSessions.length} BUỔI CHƯA HOÀN THÀNH HỒ SƠ ĐIỂM:</span>
+                        <span>PHÁT HIỆN {cycleIncompleteSessions.length} BUỔI CHƯA HOÀN THÀNH HỒ SƠ ĐIỂM:</span>
                       </div>
-                      <p className="text-[11px] text-amber-800 dark:text-amber-300 font-medium leading-relaxed">
-                        Thầy/Cô nên hoàn thiện điểm danh, điểm BTVN hoặc điểm Kiểm tra trong Sổ điểm cho các buổi sau để báo cáo chu kỳ đạt độ chính xác tuyệt đối:
-                      </p>
                       <div className="space-y-1.5 pt-0.5">
                         {cycleIncompleteSessions.map((item, idx) => (
                           <div
                             key={idx}
-                            className="flex flex-wrap items-center justify-between gap-1.5 text-xs bg-white dark:bg-slate-900 p-2 rounded-lg border border-amber-200 dark:border-amber-800/80 shadow-xs"
+                            className="flex flex-wrap items-center justify-between gap-1.5 text-xs bg-white dark:bg-slate-900 p-2 rounded-lg border border-amber-200 dark:border-amber-800/80"
                           >
                             <div className="flex items-center gap-1.5 min-w-0">
                               <span className="font-bold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950 px-1.5 py-0.5 rounded text-[11px]">
@@ -2144,7 +2494,7 @@ Trân trọng cảm ơn PH!`;
               {copiedSuccess && (
                 <div className="p-2.5 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5">
                   <Check className="w-4 h-4 text-emerald-600" />
-                  <span>Đã sao chép! Đang mở Zalo...</span>
+                  <span>Đã sao chép &amp; ghi Nhật ký CRM! Đang mở Zalo...</span>
                 </div>
               )}
 
@@ -2157,10 +2507,10 @@ Trân trọng cảm ơn PH!`;
                 </button>
                 <button
                   onClick={handleCopyAndOpenZalo}
-                  className="px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-sky-600/20 flex items-center gap-1.5"
+                  className="px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1.5 cursor-pointer"
                 >
                   <ExternalLink className="w-4 h-4" />
-                  <span>Copy & Mở Zalo 1-Click</span>
+                  <span>Copy, Mở Zalo &amp; Ghi CRM 1-Click</span>
                 </button>
               </div>
             </div>
@@ -2187,7 +2537,7 @@ Trân trọng cảm ơn PH!`;
 
             <div className="space-y-3 text-xs">
               <p className="text-slate-500">
-                Bản tin học tập cá nhân hóa tóm tắt kết quả chuyên cần, điểm BTVN, điểm kiểm tra và xếp loại cảnh báo sư phạm trong 4 buổi học vừa qua. Bạn có thể sửa đổi trước khi gửi đi:
+                Bản tin học tập cá nhân hóa chuẩn trọng số 70% Kiểm tra / 30% BTVN. Khi bấm gửi, hệ thống sẽ tự động ghi vào Nhật ký CSKH (CRM):
               </p>
 
               <textarea
@@ -2200,7 +2550,7 @@ Trân trọng cảm ơn PH!`;
               {copiedSingleSuccess && (
                 <div className="p-2.5 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-xl font-bold flex items-center justify-center gap-1.5">
                   <Check className="w-4.5 h-4.5 text-emerald-600" />
-                  <span>Đã sao chép báo cáo cá nhân! Đang chuyển tiếp Zalo...</span>
+                  <span>Đã sao chép &amp; lưu Nhật ký CRM! Đang mở Zalo...</span>
                 </div>
               )}
 
@@ -2212,24 +2562,45 @@ Trân trọng cảm ơn PH!`;
                   Đóng
                 </button>
                 <button
-                  onClick={() => {
+                  onClick={async () => {
                     navigator.clipboard.writeText(zaloSingleText);
                     setCopiedSingleSuccess(true);
+
+                    if (singleStudentId) {
+                      const mappedStatus: CRMCustomerStatus =
+                        singleStudentWarningStatus === 'P1'
+                          ? 'at_risk'
+                          : singleStudentWarningStatus === 'P2'
+                          ? 'attention'
+                          : 'satisfied';
+                      await recordWarningCRMInteraction(singleStudentId, {
+                        channel: 'zalo',
+                        templateCategory: 'periodic_report',
+                        summary: 'Gửi báo cáo định kỳ chu kỳ 4 buổi qua Zalo',
+                        messageSent: zaloSingleText,
+                        newCrmStatus: mappedStatus,
+                        statusReason: `Báo cáo chu kỳ (${singleStudentWarningStatus === 'normal' ? 'Ổn định' : singleStudentWarningStatus})`,
+                      });
+                      onRefresh();
+                    }
+
                     setTimeout(() => {
                       setCopiedSingleSuccess(false);
                       setIsZaloSingleOpen(false);
-                      // Format phone for zalo.me link
                       let sanitizedPhone = (singleStudentPhone || '').replace(/[\s.-]/g, '');
                       if (sanitizedPhone.startsWith('0')) {
                         sanitizedPhone = '84' + sanitizedPhone.slice(1);
                       }
-                      window.open(`https://zalo.me/${sanitizedPhone}`, '_blank');
-                    }, 1200);
+                      window.open(
+                        sanitizedPhone ? `https://zalo.me/${sanitizedPhone}` : 'https://chat.zalo.me/',
+                        '_blank'
+                      );
+                    }, 900);
                   }}
-                  className="px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-xl font-bold transition-all shadow-md shadow-sky-600/20 flex items-center gap-1.5"
+                  className="px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-xl font-bold transition-all shadow-sm flex items-center gap-1.5 cursor-pointer"
                 >
                   <ExternalLink className="w-4 h-4" />
-                  <span>Sao Chép & Gửi Zalo</span>
+                  <span>Sao Chép, Gửi Zalo &amp; Ghi CRM</span>
                 </button>
               </div>
             </div>

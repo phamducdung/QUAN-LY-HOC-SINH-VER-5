@@ -1,531 +1,508 @@
-import React, { useState, useMemo } from 'react';
+import React, { useMemo } from 'react';
 import {
-  ResponsiveContainer,
+  TrendingUp,
+  TrendingDown,
+  Target,
+  Activity,
+  Award,
+  CheckCircle2,
+  AlertTriangle,
+  BookOpen,
+  Calendar,
+} from 'lucide-react';
+import {
   LineChart,
   Line,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
+  ResponsiveContainer,
   ReferenceLine,
 } from 'recharts';
 import {
-  TrendingUp,
-  Activity,
-  Target,
-  Sparkles,
-  BarChart2,
-  Flame,
-} from 'lucide-react';
-import {
-  TrendSessionPoint,
-  generatePerformanceTrendSeries,
-  analyzePerformanceInsights,
-} from '../../utils/performanceTrendEngine';
+  RawSessionHistoryPoint,
+  computePerformanceSummary,
+  computeSessionComposite,
+} from '../../utils/performanceReportCardGenerator';
 
 interface StudentPerformanceTrendProps {
-  rawHistory: {
-    session: string;
-    sessionFullName?: string;
-    date?: string;
-    hwScore: number | null;
-    testScore: number | null;
-  }[];
+  rawHistory: RawSessionHistoryPoint[];
   targetDescription?: string;
-  className?: string;
 }
 
 export const StudentPerformanceTrend: React.FC<StudentPerformanceTrendProps> = ({
   rawHistory,
   targetDescription = 'Thi vào Lớp 10 Công lập 8.0+',
-  className = '',
 }) => {
-  // Chart Display Toggles
-  const [showSma3, setShowSma3] = useState<boolean>(true);
-  const [showSma5, setShowSma5] = useState<boolean>(false);
-  const [showHwLine, setShowHwLine] = useState<boolean>(true);
-  const [showBenchmark, setShowBenchmark] = useState<boolean>(true);
+  const summary = useMemo(
+    () => computePerformanceSummary(rawHistory, targetDescription),
+    [rawHistory, targetDescription]
+  );
 
-  // Parse Target Benchmark Score
-  const targetVal = useMemo(() => {
-    const match = targetDescription.match(/(\d+(\.\d+)?)/);
-    return match ? parseFloat(match[1]) : 8.0;
-  }, [targetDescription]);
+  const chartData = useMemo(
+    () =>
+      rawHistory.map((item) => ({
+        ...item,
+        compositeScore: computeSessionComposite(item.testScore, item.hwScore),
+      })),
+    [rawHistory]
+  );
 
-  // Compute Trend Series with SMA
-  const trendSeries = useMemo(() => {
-    return generatePerformanceTrendSeries(rawHistory, targetVal);
-  }, [rawHistory, targetVal]);
-
-  // Analyze Comprehensive Insights
-  const insights = useMemo(() => {
-    return analyzePerformanceInsights(trendSeries, targetVal);
-  }, [trendSeries, targetVal]);
-
-  if (!rawHistory || rawHistory.length === 0) {
-    return (
-      <div className="bg-slate-50 dark:bg-slate-800/40 p-8 rounded-2xl border border-slate-200 dark:border-slate-800 text-center space-y-2">
-        <Activity className="w-10 h-10 text-slate-400 mx-auto opacity-50" />
-        <h4 className="text-sm font-bold text-slate-700 dark:text-slate-300">
-          Chưa Có Dữ Liệu Điểm Số
-        </h4>
-        <p className="text-xs text-slate-500 max-w-sm mx-auto">
-          Học sinh chưa có buổi kiểm tra hoặc làm bài tập nào được ghi nhận để phân tích phong độ và đường trung bình động.
-        </p>
-      </div>
-    );
-  }
+  const twoSessionStyle = useMemo(() => {
+    switch (summary.twoSessionStatus) {
+      case 'improving':
+        return {
+          badgeBg: 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/60',
+          icon: <TrendingUp className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />,
+          accentText: 'text-emerald-600 dark:text-emerald-400',
+        };
+      case 'stable_good':
+        return {
+          badgeBg: 'bg-sky-50 dark:bg-sky-950/40 text-sky-700 dark:text-sky-300 border-sky-200 dark:border-sky-800/60',
+          icon: <CheckCircle2 className="w-4 h-4 text-sky-600 dark:text-sky-400" />,
+          accentText: 'text-sky-600 dark:text-sky-400',
+        };
+      case 'attention':
+        return {
+          badgeBg: 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800/60',
+          icon: <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />,
+          accentText: 'text-amber-600 dark:text-amber-400',
+        };
+      case 'declining':
+        return {
+          badgeBg: 'bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border-rose-200 dark:border-rose-800/60',
+          icon: <TrendingDown className="w-4 h-4 text-rose-600 dark:text-rose-400" />,
+          accentText: 'text-rose-600 dark:text-rose-400',
+        };
+      default:
+        return {
+          badgeBg: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700',
+          icon: <Activity className="w-4 h-4 text-slate-500" />,
+          accentText: 'text-slate-600 dark:text-slate-400',
+        };
+    }
+  }, [summary.twoSessionStatus]);
 
   return (
-    <div className={`space-y-4 ${className}`}>
-      {/* 1. Main Performance Trend Chart Card */}
-      <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
-        {/* Chart Header & Controls */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-slate-100 dark:border-slate-800/80">
-          <div className="space-y-0.5">
-            <h4 className="text-xs font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
-              <TrendingUp className="w-4 h-4 text-violet-600 dark:text-violet-400" />
-              <span>Biểu Đồ Phong Độ & Đường Trung Bình Động (Moving Average)</span>
-            </h4>
-            <p className="text-[11px] text-slate-400">
-              Đường SMA làm mịn biến động từng buổi, phản ánh thực lực cốt lõi và xu thế phát triển dài hạn.
+    <div className="space-y-4">
+      {/* 1. Target Banner */}
+      <div className="bg-gradient-to-r from-emerald-50 to-teal-50 dark:from-emerald-950/30 dark:to-teal-950/20 p-3.5 rounded-2xl border border-emerald-200/70 dark:border-emerald-800/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5">
+          <div className="p-2 bg-emerald-600 text-white rounded-xl shadow-sm">
+            <Target className="w-4 h-4" />
+          </div>
+          <div>
+            <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 dark:text-emerald-400 block">
+              Mục Tiêu Đầu Ra Của Lớp Học
+            </span>
+            <p className="text-xs font-extrabold text-slate-900 dark:text-white">
+              {targetDescription} (Ngưỡng chuẩn: {summary.targetScore} điểm)
             </p>
           </div>
-
-          {/* Quick Filter Toggles */}
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <button
-              onClick={() => setShowSma3(!showSma3)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all flex items-center gap-1.5 ${
-                showSma3
-                  ? 'bg-violet-50 text-violet-700 border-violet-300 dark:bg-violet-950/50 dark:text-violet-300 dark:border-violet-700 shadow-xs'
-                  : 'bg-slate-50 text-slate-500 border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 opacity-60'
+        </div>
+        {summary.compositeScore !== null && (
+          <div className="flex items-center gap-2 self-start sm:self-auto">
+            <span
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-extrabold border ${
+                summary.compositeScore >= summary.targetScore
+                  ? 'bg-emerald-100 text-emerald-800 border-emerald-300 dark:bg-emerald-900/50 dark:text-emerald-300 dark:border-emerald-700'
+                  : 'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800'
               }`}
-              title="Đường Trung bình động 3 buổi gần nhất (SMA-3)"
             >
-              <span className="w-2 h-2 rounded-full bg-violet-600 dark:bg-violet-400" />
-              <span>SMA-3 (Làm mịn)</span>
-            </button>
+              {summary.compositeScore >= summary.targetScore
+                ? `Đã đạt mục tiêu (${summary.compositeScore}/${summary.targetScore}đ)`
+                : `Còn thiếu ${(summary.targetScore - summary.compositeScore).toFixed(2)}đ để chạm mốc ${summary.targetScore}đ`}
+            </span>
+          </div>
+        )}
+      </div>
 
-            <button
-              onClick={() => setShowSma5(!showSma5)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all flex items-center gap-1.5 ${
-                showSma5
-                  ? 'bg-indigo-50 text-indigo-700 border-indigo-300 dark:bg-indigo-950/50 dark:text-indigo-300 dark:border-indigo-700 shadow-xs'
-                  : 'bg-slate-50 text-slate-500 border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 opacity-60'
-              }`}
-              title="Đường Trung bình động 5 buổi dài hạn (SMA-5)"
-            >
-              <span className="w-2 h-2 rounded-full bg-indigo-500" />
-              <span>SMA-5</span>
-            </button>
+      {/* 2. Four Parent-Friendly Performance Cards (70/30 & 2-Session Focus) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {/* Card 1: Điểm Phong Độ Tổng Hợp (70% KT + 30% BTVN) */}
+        <div className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+              1. Điểm Phong Độ Tổng Hợp (70/30)
+            </span>
+            <Award className="w-4 h-4 text-emerald-600" />
+          </div>
 
-            <button
-              onClick={() => setShowHwLine(!showHwLine)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all flex items-center gap-1.5 ${
-                showHwLine
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-300 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-700 shadow-xs'
-                  : 'bg-slate-50 text-slate-500 border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 opacity-60'
-              }`}
-              title="Bật/Tắt đường điểm BTVN"
-            >
-              <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              <span>Điểm BTVN</span>
-            </button>
+          <div className="flex items-baseline gap-2">
+            <span className="text-2xl font-black text-emerald-600 dark:text-emerald-400">
+              {summary.compositeScore !== null ? `${summary.compositeScore}đ` : '--'}
+            </span>
+            <span className="text-[11px] text-slate-500 font-semibold">
+              / {summary.targetScore}đ mục tiêu ({summary.targetAchievementPct ?? 0}%)
+            </span>
+          </div>
 
-            <button
-              onClick={() => setShowBenchmark(!showBenchmark)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all flex items-center gap-1.5 ${
-                showBenchmark
-                  ? 'bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-700 shadow-xs'
-                  : 'bg-slate-50 text-slate-500 border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 opacity-60'
-              }`}
-              title="Đường Điểm chuẩn mục tiêu lớp học"
-            >
-              <Target className="w-3 h-3 text-amber-600" />
-              <span>Mục tiêu ({targetVal}đ)</span>
-            </button>
+          <div className="grid grid-cols-2 gap-2 pt-1.5 border-t border-slate-100 dark:border-slate-800/80 text-[11px]">
+            <div className="bg-emerald-50/60 dark:bg-emerald-950/20 px-2.5 py-1.5 rounded-lg border border-emerald-100 dark:border-emerald-900/40">
+              <span className="text-slate-500 dark:text-slate-400 block text-[10px] font-semibold">
+                TB Kiểm Tra (70%)
+              </span>
+              <span className="font-extrabold text-emerald-700 dark:text-emerald-300">
+                {summary.avgTest !== null ? `${summary.avgTest}đ` : 'Chưa có'}
+              </span>
+            </div>
+            <div className="bg-blue-50/60 dark:bg-blue-950/20 px-2.5 py-1.5 rounded-lg border border-blue-100 dark:border-blue-900/40">
+              <span className="text-slate-500 dark:text-slate-400 block text-[10px] font-semibold">
+                TB Bài Tập Về Nhà (30%)
+              </span>
+              <span className="font-extrabold text-blue-700 dark:text-blue-300">
+                {summary.avgHw !== null ? `${summary.avgHw}đ` : 'Chưa có'}
+              </span>
+            </div>
           </div>
         </div>
 
-        {/* The Recharts Visual Canvas */}
-        <div className="h-64 w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart
-              data={trendSeries}
-              margin={{ top: 15, right: 15, left: -20, bottom: 5 }}
+        {/* Card 2: Phong Độ 2 Buổi Học Gần Nhất */}
+        <div className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+              2. Phong Độ 2 Buổi Học Gần Nhất
+            </span>
+            {twoSessionStyle.icon}
+          </div>
+
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <span className={`text-xl font-black ${twoSessionStyle.accentText}`}>
+                {summary.recent2CompositeAvg !== null ? `${summary.recent2CompositeAvg}đ` : '--'}
+              </span>
+              <span className="text-[10px] text-slate-400 font-semibold block">
+                TB Tổng hợp 2 buổi gần nhất
+              </span>
+            </div>
+            <span
+              className={`px-2.5 py-1 rounded-lg text-[10px] font-extrabold border ${twoSessionStyle.badgeBg}`}
             >
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-                stroke="#e2e8f0"
-                className="dark:stroke-slate-800"
-              />
-              <XAxis
-                dataKey="session"
-                tick={{ fontSize: 11, fill: '#64748b' }}
-                tickLine={false}
-              />
-              <YAxis
-                domain={[0, 10]}
-                ticks={[0, 2, 4, 6, 8, 10]}
-                tick={{ fontSize: 11, fill: '#64748b' }}
-                tickLine={false}
-              />
+              {summary.twoSessionBadgeText}
+            </span>
+          </div>
 
-              {/* Ngưỡng Báo động Cần Cải Thiện (Dưới 5.0đ) */}
-              <ReferenceLine
-                y={5.0}
-                stroke="#f43f5e"
-                strokeDasharray="2 2"
-                strokeWidth={1}
-                strokeOpacity={0.6}
-              />
+          <div className="grid grid-cols-2 gap-2 pt-1.5 border-t border-slate-100 dark:border-slate-800/80 text-[11px]">
+            <div className="bg-slate-50 dark:bg-slate-800/60 px-2.5 py-1.5 rounded-lg">
+              <span className="text-slate-400 block text-[10px] font-semibold">
+                {summary.prevSession ? `Buổi trước (${summary.prevSession.session})` : 'Buổi liền trước'}
+              </span>
+              <span className="font-bold text-slate-700 dark:text-slate-200">
+                {summary.prevSession
+                  ? `KT: ${summary.prevSession.testScore ?? '--'}đ | BT: ${summary.prevSession.hwScore ?? '--'}đ`
+                  : 'Chưa có'}
+              </span>
+            </div>
+            <div className="bg-slate-50 dark:bg-slate-800/60 px-2.5 py-1.5 rounded-lg">
+              <span className="text-slate-400 block text-[10px] font-semibold">
+                {summary.latestSession ? `Buổi mới nhất (${summary.latestSession.session})` : 'Buổi mới nhất'}
+              </span>
+              <span className="font-bold text-slate-800 dark:text-slate-100">
+                {summary.latestSession
+                  ? `KT: ${summary.latestSession.testScore ?? '--'}đ | BT: ${summary.latestSession.hwScore ?? '--'}đ`
+                  : 'Chưa có'}
+              </span>
+            </div>
+          </div>
+        </div>
 
-              {/* Đường Ngưỡng Mục tiêu Benchmark */}
-              {showBenchmark && (
-                <ReferenceLine
-                  y={targetVal}
-                  stroke="#f59e0b"
-                  strokeWidth={2}
-                  strokeDasharray="4 4"
-                  label={{
-                    value: `Chuẩn: ${targetVal}đ`,
-                    position: 'top',
-                    fill: '#d97706',
-                    fontSize: 10,
-                    fontWeight: 700,
+        {/* Card 3: Chuyên Cần & Kỷ Luật BTVN */}
+        <div className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+              3. Chuyên Cần & Kỷ Luật BTVN
+            </span>
+            <BookOpen className="w-4 h-4 text-indigo-600" />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <span className="text-xl font-black text-indigo-600 dark:text-indigo-400">
+                {summary.attendanceRate}%
+              </span>
+              <span className="text-[10px] text-slate-500 block font-semibold">
+                Có mặt: {summary.presentCount + summary.lateCount}/{summary.totalSessions} buổi
+              </span>
+            </div>
+            <div>
+              <span className="text-xl font-black text-teal-600 dark:text-teal-400">
+                {summary.hwCompletionRate}%
+              </span>
+              <span className="text-[10px] text-slate-500 block font-semibold">
+                Hoàn thành BTVN đúng/đủ
+              </span>
+            </div>
+          </div>
+
+          <div className="pt-1.5 border-t border-slate-100 dark:border-slate-800/80 flex flex-wrap gap-1.5 text-[10px] font-bold">
+            <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-300">
+              Nộp đúng hạn: {summary.hwSubmittedOnTimeCount} buổi
+            </span>
+            {summary.hwLateCount > 0 && (
+              <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">
+                Nộp muộn: {summary.hwLateCount} buổi
+              </span>
+            )}
+            {summary.hwMissingCount > 0 && (
+              <span className="px-2 py-0.5 rounded bg-rose-50 text-rose-700 dark:bg-rose-950/30 dark:text-rose-300">
+                Chưa nộp BTVN (0đ): {summary.hwMissingCount} buổi
+              </span>
+            )}
+            {summary.absentUnexcusedCount > 0 && (
+              <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">
+                Vắng K.Phép: {summary.absentUnexcusedCount} buổi
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Card 4: Nhận Xét & Khuyến Nghị Trao Đổi Phụ Huynh */}
+        <div className="p-4 rounded-2xl border border-emerald-200/80 dark:border-emerald-900/40 bg-emerald-50/40 dark:bg-emerald-950/15 shadow-sm space-y-2 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-extrabold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
+              4. Nhận Xét Sư Phạm (Gợi Ý Trao Đổi PH)
+            </span>
+            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+          </div>
+
+          <p className="text-xs font-semibold text-slate-700 dark:text-slate-200 leading-relaxed">
+            {summary.twoSessionAdvice}
+          </p>
+
+          <div className="text-[10px] text-slate-500 dark:text-slate-400 font-medium pt-1 border-t border-emerald-200/50 dark:border-emerald-800/40">
+            Công thức chuẩn: Điểm Tổng Hợp = 70% Điểm Kiểm Tra + 30% Điểm BTVN (Buổi không nộp BTVN tính 0đ).
+          </div>
+        </div>
+      </div>
+
+      {/* 3. Simplified Parent-Friendly Chart (Test Score, HW Score, Target Line) */}
+      <div className="bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl border border-slate-200/80 dark:border-slate-800">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+          <div>
+            <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+              <Activity className="w-4 h-4 text-emerald-600" />
+              <span>Biểu Đồ Điểm Kiểm Tra (70%) & Điểm BTVN (30%) Qua Các Buổi Học</span>
+            </h4>
+            <p className="text-[10px] text-slate-500">
+              Hiển thị trực quan điểm thực tế từng buổi so với đường mục tiêu {summary.targetScore} điểm
+            </p>
+          </div>
+
+          {/* Clean Legend */}
+          <div className="flex flex-wrap items-center gap-3 text-[10px] font-bold">
+            <div className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block" />
+              <span className="text-slate-700 dark:text-slate-300">Điểm Kiểm Tra (70%)</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-blue-500 inline-block" />
+              <span className="text-slate-700 dark:text-slate-300">Điểm BTVN (30%)</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-3.5 h-0.5 border-b-2 border-dashed border-rose-500 inline-block" />
+              <span className="text-rose-600 dark:text-rose-400">Mục tiêu ({summary.targetScore}đ)</span>
+            </div>
+          </div>
+        </div>
+
+        {chartData.length === 0 ? (
+          <div className="py-8 text-center text-xs text-slate-400 font-medium">
+            Chưa có dữ liệu điểm các buổi học để hiển thị biểu đồ.
+          </div>
+        ) : (
+          <div className="h-60">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={chartData} margin={{ top: 10, right: 16, left: -20, bottom: 0 }}>
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  vertical={false}
+                  stroke="#e2e8f0"
+                  className="dark:stroke-slate-800"
+                />
+                <XAxis dataKey="session" tick={{ fontSize: 10, fontWeight: 600 }} />
+                <YAxis domain={[0, 10]} tick={{ fontSize: 11 }} />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (active && payload && payload.length) {
+                      const pt = payload[0].payload as RawSessionHistoryPoint & {
+                        compositeScore: number | null;
+                      };
+                      return (
+                        <div className="bg-slate-900/95 backdrop-blur-md text-white p-3 rounded-xl shadow-xl border border-slate-700 text-xs space-y-1.5">
+                          <div className="font-bold text-emerald-400 border-b border-slate-800 pb-1">
+                            {pt.sessionFullName || `Buổi ${label}`}
+                          </div>
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between gap-4">
+                              <span className="text-slate-400">Điểm Kiểm Tra (70%):</span>
+                              <span className="font-bold text-emerald-400">
+                                {pt.testScore !== null ? `${pt.testScore} điểm` : 'Miễn / Chưa chấm'}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between gap-4">
+                              <span className="text-slate-400">Điểm BTVN (30%):</span>
+                              <span className="font-bold text-blue-400">
+                                {pt.homework_submitted === false
+                                  ? '0 điểm (Chưa nộp)'
+                                  : pt.hwScore !== null
+                                  ? `${pt.hwScore} điểm${pt.late_submit ? ' (Nộp muộn)' : ''}`
+                                  : 'Miễn / Chưa chấm'}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between gap-4 pt-1 border-t border-slate-800">
+                              <span className="text-slate-300 font-semibold">Điểm Tổng Hợp Buổi:</span>
+                              <span className="font-extrabold text-amber-300">
+                                {pt.compositeScore !== null ? `${pt.compositeScore} điểm` : '--'}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+                    return null;
                   }}
                 />
-              )}
 
-              {/* Custom Tooltip */}
-              <Tooltip
-                content={({ active, payload, label }) => {
-                  if (!active || !payload || !payload.length) return null;
-                  const data = payload[0].payload as TrendSessionPoint;
-                  return (
-                    <div className="bg-slate-900/95 backdrop-blur-md text-white p-3 rounded-xl border border-slate-700 shadow-xl text-xs space-y-1.5 min-w-[200px]">
-                      <div className="flex justify-between items-center border-b border-slate-700/80 pb-1.5">
-                        <span className="font-bold text-slate-200">{label}</span>
-                        {data.date && (
-                          <span className="text-[10px] text-slate-400">{data.date}</span>
-                        )}
-                      </div>
-                      {data.sessionFullName && (
-                        <p className="text-[10.5px] text-slate-300 font-medium truncate max-w-[220px]">
-                          {data.sessionFullName}
-                        </p>
-                      )}
-                      <div className="space-y-1 pt-1">
-                        {data.testScore !== null && (
-                          <div className="flex justify-between items-center text-[11px]">
-                            <span className="text-sky-400 font-bold flex items-center gap-1">
-                              <span className="w-2 h-2 rounded-full bg-sky-400 inline-block" />
-                              Điểm Kiểm Tra:
-                            </span>
-                            <span className="font-extrabold text-white">
-                              {data.testScore}đ
-                            </span>
-                          </div>
-                        )}
-                        {data.hwScore !== null && showHwLine && (
-                          <div className="flex justify-between items-center text-[11px]">
-                            <span className="text-emerald-400 font-bold flex items-center gap-1">
-                              <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block" />
-                              Điểm BTVN:
-                            </span>
-                            <span className="font-extrabold text-white">
-                              {data.hwScore}đ
-                            </span>
-                          </div>
-                        )}
-                        {data.testSma3 !== null && showSma3 && (
-                          <div className="flex justify-between items-center text-[11px]">
-                            <span className="text-violet-300 font-bold flex items-center gap-1">
-                              <span className="w-2 h-2 rounded-full bg-violet-400 inline-block" />
-                              SMA-3 (Xu thế):
-                            </span>
-                            <span className="font-extrabold text-violet-200">
-                              {data.testSma3}đ
-                            </span>
-                          </div>
-                        )}
-                        {data.testSma5 !== null && showSma5 && (
-                          <div className="flex justify-between items-center text-[11px]">
-                            <span className="text-indigo-300 font-bold flex items-center gap-1">
-                              <span className="w-2 h-2 rounded-full bg-indigo-400 inline-block" />
-                              SMA-5:
-                            </span>
-                            <span className="font-extrabold text-indigo-200">
-                              {data.testSma5}đ
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                }}
-              />
+                <ReferenceLine
+                  y={summary.targetScore}
+                  stroke="#ef4444"
+                  strokeDasharray="5 5"
+                  strokeWidth={1.5}
+                />
 
-              {/* 1. Actual Test Score Line (Blue) */}
-              <Line
-                type="monotone"
-                dataKey="testScore"
-                name="Điểm Kiểm Tra"
-                stroke="#0284c7"
-                strokeWidth={2.5}
-                dot={{ r: 4, fill: '#0284c7', strokeWidth: 1.5, stroke: '#ffffff' }}
-                activeDot={{ r: 7, fill: '#0284c7' }}
-                connectNulls
-              />
+                <Line
+                  type="monotone"
+                  dataKey="testScore"
+                  name="Điểm Kiểm Tra"
+                  stroke="#10b981"
+                  strokeWidth={2.5}
+                  dot={{ r: 4, fill: '#10b981' }}
+                  activeDot={{ r: 6 }}
+                  connectNulls
+                />
 
-              {/* 2. Actual Homework Score Line (Emerald) */}
-              {showHwLine && (
                 <Line
                   type="monotone"
                   dataKey="hwScore"
                   name="Điểm BTVN"
-                  stroke="#10b981"
+                  stroke="#3b82f6"
                   strokeWidth={2}
-                  strokeOpacity={0.85}
-                  dot={{ r: 3, fill: '#10b981', strokeWidth: 1, stroke: '#ffffff' }}
-                  activeDot={{ r: 6, fill: '#10b981' }}
+                  dot={{ r: 3.5, fill: '#3b82f6' }}
+                  activeDot={{ r: 5 }}
                   connectNulls
                 />
-              )}
-
-              {/* 3. Moving Average SMA-3 Line (Violet) */}
-              {showSma3 && (
-                <Line
-                  type="monotone"
-                  dataKey="testSma3"
-                  name="SMA-3 (TB Động 3 buổi)"
-                  stroke="#8b5cf6"
-                  strokeWidth={3}
-                  strokeDasharray="5 5"
-                  dot={false}
-                  activeDot={{ r: 6, fill: '#8b5cf6' }}
-                  connectNulls
-                />
-              )}
-
-              {/* 4. Moving Average SMA-5 Line (Indigo) */}
-              {showSma5 && (
-                <Line
-                  type="monotone"
-                  dataKey="testSma5"
-                  name="SMA-5 (Dài hạn)"
-                  stroke="#6366f1"
-                  strokeWidth={2.5}
-                  strokeDasharray="3 3"
-                  dot={false}
-                  activeDot={{ r: 5, fill: '#6366f1' }}
-                  connectNulls
-                />
-              )}
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-
-        {/* Legend Summary Footer */}
-        <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-100 dark:border-slate-800/80">
-          <div className="flex items-center gap-4 flex-wrap">
-            <span className="flex items-center gap-1.5">
-              <span className="w-3 h-1 bg-sky-600 rounded-full" />
-              <span>Điểm KT thực tế</span>
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-3 h-1 bg-emerald-500 rounded-full" />
-              <span>Điểm BTVN</span>
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-3 h-1 bg-violet-500 border-b border-dashed border-violet-400 rounded-full" />
-              <span>SMA-3 (Xu thế thực lực)</span>
-            </span>
+              </LineChart>
+            </ResponsiveContainer>
           </div>
-          <div className="font-bold text-slate-700 dark:text-slate-300">
-            Hiện tại (SMA-3): <span className="text-violet-600 dark:text-violet-400 font-extrabold">{insights.currentTestSma3 ? `${insights.currentTestSma3}đ` : 'N/A'}</span>
-          </div>
-        </div>
+        )}
       </div>
 
-      {/* 2. Target Progress Benchmark Bar */}
-      <div className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-3 shadow-sm">
-        <div className="flex items-center justify-between">
-          <div className="space-y-0.5">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider block">
-              Mục tiêu Lớp Học:
-            </span>
-            <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
-              {targetDescription}
-            </span>
-          </div>
-          <span
-            className={`px-2.5 py-1 text-[10px] font-extrabold rounded-lg ${
-              insights.avgTest === 0
-                ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
-                : insights.targetGap >= 0
-                ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200/50'
-                : insights.targetGap >= -1.0
-                ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400 border border-amber-200/50'
-                : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-200/50'
-            }`}
-          >
-            {insights.avgTest === 0
-              ? 'Chưa đủ dữ liệu'
-              : insights.targetGap >= 0
-              ? `Vượt mục tiêu (+${insights.targetGap}đ)`
-              : `Tiệm cận (thiếu ${Math.abs(insights.targetGap)}đ)`}
+      {/* 4. Transparent Session-by-Session History Table */}
+      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
+        <div className="px-4 py-3 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+          <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+            <Calendar className="w-4 h-4 text-emerald-600" />
+            <span>Bảng Điểm & Nhận Xét Chi Tiết Từng Buổi Học ({rawHistory.length} buổi)</span>
+          </h4>
+          <span className="text-[10px] font-bold text-slate-500">
+            Mới nhất ở trên
           </span>
         </div>
 
-        <div className="space-y-1.5">
-          <div className="flex justify-between text-[11px] font-bold text-slate-500">
-            <span>Tiến độ đạt điểm chuẩn</span>
-            <span className="text-slate-800 dark:text-slate-200">
-              {insights.targetPercent}%
-            </span>
+        {rawHistory.length === 0 ? (
+          <div className="p-6 text-center text-xs text-slate-400">
+            Học sinh chưa có dữ liệu buổi học nào.
           </div>
-          <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-2.5 overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all duration-500 ${
-                insights.targetGap >= 0
-                  ? 'bg-emerald-500'
-                  : insights.targetGap >= -1.0
-                  ? 'bg-amber-500'
-                  : 'bg-rose-500'
-              }`}
-              style={{ width: `${insights.targetPercent}%` }}
-            />
-          </div>
-          <div className="flex justify-between items-center pt-1 text-[10px] text-slate-400">
-            <span>
-              Điểm TB hiện tại:{' '}
-              <strong className="text-slate-700 dark:text-slate-300 font-bold">
-                {insights.avgTest > 0 ? `${insights.avgTest}đ` : 'N/A'}
-              </strong>
-            </span>
-            <span>
-              Điểm chuẩn mục tiêu:{' '}
-              <strong className="text-slate-700 dark:text-slate-300 font-bold">
-                {insights.targetVal}đ
-              </strong>
-            </span>
-          </div>
-        </div>
-      </div>
+        ) : (
+          <div className="max-h-56 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+            {[...rawHistory]
+              .reverse()
+              .map((row, idx) => {
+                const comp = computeSessionComposite(row.testScore, row.hwScore);
+                const isRecent2 = idx < 2;
+                return (
+                  <div
+                    key={row.sessionId || `${row.session}-${idx}`}
+                    className={`p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+                      isRecent2 ? 'bg-emerald-50/20 dark:bg-emerald-950/10' : ''
+                    }`}
+                  >
+                    <div className="space-y-0.5 min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {isRecent2 && (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/50 text-emerald-800 dark:text-emerald-300 text-[9px] font-extrabold uppercase">
+                            2 Buổi gần nhất
+                          </span>
+                        )}
+                        <span className="font-extrabold text-slate-800 dark:text-slate-100">
+                          {row.sessionDate || row.session}
+                        </span>
+                        <span className="text-slate-600 dark:text-slate-300 font-semibold truncate">
+                          — {row.topicName || row.sessionFullName || 'Buổi học thường kỳ'}
+                        </span>
+                      </div>
+                      {row.teacher_comment && (
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 italic">
+                          💬 "{row.teacher_comment}"
+                        </p>
+                      )}
+                    </div>
 
-      {/* 3. Deep Performance Analytics 4-Card Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {/* Card 1: Xu Hướng & Vận Tốc Điểm Số */}
-        <div className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-              <Flame className="w-3.5 h-3.5 text-amber-500" />
-              <span>Xu Hướng & Vận Tốc Điểm</span>
-            </span>
-            <span
-              className={`text-[10px] font-extrabold px-2 py-0.5 rounded ${
-                insights.trendStatus === 'breakthrough' || insights.trendStatus === 'improving'
-                  ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
-                  : insights.trendStatus === 'declining'
-                  ? 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300'
-                  : 'bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300'
-              }`}
-            >
-              {insights.velocityScore > 0
-                ? `+${insights.velocityScore}đ/chu kỳ`
-                : `${insights.velocityScore}đ/chu kỳ`}
-            </span>
-          </div>
-          <h5 className="text-xs font-bold text-slate-800 dark:text-slate-200">
-            {insights.trendTitle}
-          </h5>
-          <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
-            {insights.trendDescription}
-          </p>
-        </div>
+                    <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                      <span
+                        className={`px-2 py-0.5 rounded-lg text-[10px] font-bold border ${
+                          row.attendance === 'absent_unexcused'
+                            ? 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300'
+                            : row.attendance === 'absent_excused'
+                            ? 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-400'
+                            : row.attendance === 'late'
+                            ? 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300'
+                            : 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300'
+                        }`}
+                      >
+                        {row.attendance === 'absent_unexcused'
+                          ? 'Vắng K.Phép'
+                          : row.attendance === 'absent_excused'
+                          ? 'Vắng C.Phép'
+                          : row.attendance === 'late'
+                          ? 'Đi muộn'
+                          : 'Có mặt'}
+                      </span>
 
-        {/* Card 2: Độ Ổn Định Phong Độ (Consistency Score) */}
-        <div className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-              <Activity className="w-3.5 h-3.5 text-sky-500" />
-              <span>Chỉ Số Vững Vàng (Ổn Định)</span>
-            </span>
-            <span className="text-[10px] font-bold text-slate-400 font-mono">
-              σ = {insights.standardDeviation}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <h5 className={`text-xs font-bold ${insights.consistencyColor}`}>
-              {insights.consistencyLevel}
-            </h5>
-          </div>
-          <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
-            {insights.standardDeviation < 1.0
-              ? 'Phong độ thi cử rất đều tay, ít bị ảnh hưởng tâm lý hay dao động đề bài.'
-              : insights.standardDeviation < 1.8
-              ? 'Điểm số dao động trong ngưỡng chấp nhận được giữa các dạng bài.'
-              : 'Độ lệch chuẩn cao (≥ 1.8đ), có hiện tượng học tủ hoặc tâm lý thi không vững.'}
-          </p>
-        </div>
+                      <span
+                        className={`px-2 py-0.5 rounded-lg text-[10px] font-extrabold ${
+                          row.testScore !== null && row.testScore < 6
+                            ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/50 dark:text-rose-300'
+                            : 'bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-200'
+                        }`}
+                      >
+                        KT: {row.testScore !== null ? `${row.testScore}đ` : 'Miễn'}
+                      </span>
 
-        {/* Card 3: Tương Quan Thi vs BTVN */}
-        <div className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-              <BarChart2 className="w-3.5 h-3.5 text-indigo-500" />
-              <span>Tương Quan Thi vs BTVN</span>
-            </span>
-            <span className="text-[10px] font-extrabold text-slate-500">
-              Lệch: {insights.gapAnalysis.gapDiff}đ
-            </span>
-          </div>
-          <div className="flex items-center gap-3 text-xs">
-            <div>
-              <span className="text-[10px] text-slate-400 block">TB BTVN</span>
-              <span className="font-extrabold text-emerald-600 dark:text-emerald-400">
-                {insights.avgHw > 0 ? `${insights.avgHw}đ` : 'N/A'}
-              </span>
-            </div>
-            <div className="text-slate-300 dark:text-slate-700">vs</div>
-            <div>
-              <span className="text-[10px] text-slate-400 block">TB Kiểm Tra</span>
-              <span className="font-extrabold text-sky-600 dark:text-sky-400">
-                {insights.avgTest > 0 ? `${insights.avgTest}đ` : 'N/A'}
-              </span>
-            </div>
-          </div>
-          <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
-            {insights.gapAnalysis.gapDescription}
-          </p>
-        </div>
+                      <span
+                        className={`px-2 py-0.5 rounded-lg text-[10px] font-extrabold ${
+                          row.homework_submitted === false
+                            ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/50 dark:text-rose-300'
+                            : row.late_submit
+                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-300'
+                            : 'bg-blue-50 text-blue-800 dark:bg-blue-950/50 dark:text-blue-300'
+                        }`}
+                      >
+                        {row.homework_submitted === false
+                          ? 'BTVN: 0đ (Chưa nộp)'
+                          : `BTVN: ${row.hwScore !== null ? `${row.hwScore}đ` : 'Miễn'}${row.late_submit ? ' (Muộn)' : ''}`}
+                      </span>
 
-        {/* Card 4: Dự Báo Điểm Kỳ Vọng Buổi Tới */}
-        <div className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-2 bg-gradient-to-br from-violet-50/40 to-indigo-50/40 dark:from-slate-900 dark:to-indigo-950/20">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-violet-700 dark:text-violet-400 uppercase tracking-wider flex items-center gap-1.5">
-              <Sparkles className="w-3.5 h-3.5 text-violet-600" />
-              <span>Dự Báo Kỳ Vọng Buổi Tới</span>
-            </span>
-            <span className="text-[10px] font-extrabold px-1.5 py-0.5 rounded bg-violet-100 dark:bg-violet-950 text-violet-700 dark:text-violet-300">
-              Độ tin cậy: {insights.forecast.confidence}
-            </span>
+                      <span className="px-2 py-0.5 rounded-lg text-[10px] font-black bg-emerald-600 text-white">
+                        TH: {comp !== null ? `${comp}đ` : '--'}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
           </div>
-          <div className="flex items-baseline gap-2">
-            <span className="text-lg font-black font-num text-violet-700 dark:text-violet-300">
-              {insights.forecast.expectedMin} – {insights.forecast.expectedMax}đ
-            </span>
-            <span className="text-[10px] text-slate-500 font-medium">
-              (Kỳ vọng tâm: ~{insights.forecast.expectedCenter}đ)
-            </span>
-          </div>
-          <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
-            Dự báo dựa trên 65% trọng số SMA-3 gần nhất và phân phối độ lệch chuẩn thực tế.
-          </p>
-        </div>
+        )}
       </div>
     </div>
   );

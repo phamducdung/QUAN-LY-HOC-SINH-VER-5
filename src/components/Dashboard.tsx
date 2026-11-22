@@ -8,6 +8,7 @@ import { DashboardKpiCards } from './dashboard/DashboardKpiCards';
 import { TodayClassesCard } from './dashboard/TodayClassesCard';
 import { ClassComparisonCard } from './dashboard/ClassComparisonCard';
 import { UrgentWarningsCard } from './dashboard/UrgentWarningsCard';
+import { OperationalSopCard } from './dashboard/OperationalSopCard';
 import {
   computeDashboardMetrics,
   computeTodayClassesList,
@@ -180,6 +181,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
         onNavigateToStudents={() => onNavigateTab('students')}
         onNavigateToGradeEntry={() => onNavigateTab('grade-entry')}
         onNavigateToWarnings={() => onNavigateTab('warnings')}
+      />
+
+      {/* Interactive SOP Checklist for Teacher & Customer Care (5-Min Post-Session & 15-Min Post-Cycle) */}
+      <OperationalSopCard
+        classes={filteredClasses}
+        students={filteredStudents}
+        warnings={filteredWarnings}
+        sessions={sessions}
+        onNavigateTab={onNavigateTab}
       />
 
       {/* 2-Column Bento Grid: Today's Classes & Urgent Warnings */}
