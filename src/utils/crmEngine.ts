@@ -121,23 +121,30 @@ export interface StudentParentReportData {
   unexcusedCount: number;
   attendanceRate: number;
   absentOrLateDetails: string[];
-  // Homework metrics
+  // Homework metrics (30% weight, 0đ for unsubmitted/unexcused)
   hwSessionCount: number;
   hwSubmittedCount: number;
   hwCompletionRate: number;
   studentHwAvg: number | null;
   classHwAvg: number | null;
   missingHwTitles: string[];
-  // Test metrics
+  // Test metrics (70% weight, 0đ for unexcused)
   testSessionCount: number;
   studentTestAvg: number | null;
   classTestAvg: number | null;
+  // Weighted Composite metrics (70% Test + 30% Homework)
+  studentWeightedAvg: number | null;
+  classWeightedAvg: number | null;
   latestTestScore: number | null;
   highestTestScore: number | null;
   scoreTrendText: 'Tiến bộ rõ rệt' | 'Giữ phong độ ổn định' | 'Đang có dấu hiệu giảm, cần lưu ý';
   // Knowledge Mastery
   strongTopics: Array<{ name: string; score: number }>;
   weakTopics: Array<{ name: string; score: number }>;
+  // Session-by-session breakdown & Warning summary (unified with WarningCenter)
+  weakSessionDetails: string[];
+  allSessionDetails: string[];
+  warningSummaryBlock: string;
   // Qualitative observations
   teacherComments: Array<{ date: string; lesson: string; comment: string; remedial?: string }>;
   remedialActionsSummary: string[];
@@ -153,93 +160,196 @@ export const DEFAULT_CRM_MESSAGE_TEMPLATES: CRMMessageTemplate[] = [
   {
     id: 'tpl_periodic_report',
     category: 'periodic_report',
-    title: '1. Báo cáo học tập định kỳ chuẩn (Đầy đủ số liệu)',
-    description: 'Tổng hợp chính xác chuyên cần, điểm BTVN, điểm Kiểm tra so với mặt bằng lớp và nhận xét từng buổi.',
-    body: `Dạ {danh_xung_gv} {ten_gv} xin phép gửi Gia đình báo cáo tình hình học tập môn Toán của {danh_xung_hs} {ten_hs} ({ten_lop} - {chu_ky}):
+    title: '1. Báo cáo tổng hợp chuẩn (70% KT + 30% BTVN & Lưu ý học tập)',
+    description: 'Mẫu chuẩn đồng nhất giữa Cảnh báo học tập & CRM: Chuyên cần, BTVN (30%), Kiểm tra (70%), Điểm tổng hợp và chi tiết buổi học.',
+    body: `Kính gửi {ten_ph} (PH {danh_xung_hs} {ten_hs} - Lớp {ten_lop}),
 
-1. Chuyên cần & Ý thức học tập:
-- Tỷ lệ tham gia: {ty_le_chuyen_can}% ({so_buoi_co_mat}/{tong_so_buoi} buổi).
-- Ghi nhận chi tiết: {chi_tiet_vang_muon}
+{danh_xung_gv} {ten_gv} xin gửi thông báo tình hình học tập môn Toán của {danh_xung_hs} {ten_hs} qua {chu_ky}:
 
-2. Kết quả Bài tập về nhà (BTVN):
-- Tỷ lệ hoàn thành BTVN: {ty_le_nop_btvn}% ({so_btvn_da_nop}/{tong_so_btvn} bài).
-- Điểm TB BTVN của {danh_xung_hs}: {diem_tb_btvn}/10 (Điểm TB chung của lớp: {diem_tb_btvn_lop}/10).
+{tom_tat_canh_bao}
 
-3. Kết quả Kiểm tra & Đánh giá năng lực:
-- Điểm TB Kiểm tra của {danh_xung_hs}: {diem_tb_kt}/10 (Điểm TB chung của lớp: {diem_tb_kt_lop}/10).
-- Xu hướng học lực: {xu_huong_diem}.
-- Chuyên đề nắm vững: {chuyen_de_vung}.
-- Chuyên đề cần rèn luyện thêm: {chuyen_de_can_ren}.
+📊 TỔNG HỢP KẾT QUẢ HỌC TẬP (CHUẨN TRỌNG SỐ 70% KT + 30% BTVN):
+• Chuyên cần: {so_buoi_co_mat}/{tong_so_buoi} buổi ({ty_le_chuyen_can}% - {chi_tiet_vang_muon})
+• Điểm TB Bài kiểm tra (Trọng số 70%): {diem_tb_kt}/10 (TB lớp: {diem_tb_kt_lop}/10 - {xu_huong_diem})
+• Điểm TB Bài tập về nhà (Trọng số 30%): {diem_tb_btvn}/10 (Hoàn thành: {so_btvn_da_nop}/{tong_so_btvn} bài - {ty_le_nop_btvn}%)
+🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): {diem_tb_tong_hop}/10
 
-4. Nhận xét & Định hướng của {danh_xung_gv}:
-{nhan_xet_chi_tiet}
-- Giải pháp đồng hành: {giai_phap_de_xuat}
+📌 CHI TIẾT BUỔI HỌC & CHUYÊN ĐỀ CẦN LƯU Ý:
+{chi_tiet_buoi_hoc}
+• Chuyên đề nắm vững: {chuyen_de_vung}
+• Chuyên đề cần rèn luyện thêm: {chuyen_de_can_ren}
 
-Gia đình xem qua báo cáo, nếu có điểm nào cần trao đổi thêm về việc học của {danh_xung_hs}, Phụ huynh nhắn lại giúp {danh_xung_gv} nhé ạ!`,
+💡 ĐỀ XUẤT PHỐI HỢP CÙNG GIA ĐÌNH:
+{giai_phap_de_xuat}
+
+Rất mong Quý Phụ huynh phối hợp cùng {danh_xung_gv} đôn đốc {danh_xung_hs} {ten_hs} ôn tập để {danh_xung_hs} đạt kết quả tốt nhất. Trân trọng cảm ơn Gia đình!`,
   },
   {
     id: 'tpl_praise_progress',
     category: 'praise_progress',
-    title: '2. Thư khen ngợi tiến bộ & Tuyên dương kết quả tốt',
-    description: 'Dành cho học sinh nhóm Hài lòng / Đạt điểm cao hoặc có bước tiến bộ vượt bậc.',
-    body: `Dạ {danh_xung_gv} {ten_gv} xin gửi lời chúc mừng và tuyên dương {danh_xung_hs} {ten_hs} ({ten_lop}) tới Gia đình ạ!
+    title: '2. Thư khen ngợi tiến bộ & Tuyên dương thành tích xuất sắc',
+    description: 'Dành cho học sinh được thẻ Tuyên dương, đạt điểm cao hoặc có bước tiến bộ vượt bậc.',
+    body: `Kính gửi {ten_ph} (PH {danh_xung_hs} {ten_hs} - Lớp {ten_lop}),
 
-Trong {chu_ky} vừa qua, {danh_xung_hs} đã thể hiện tinh thần học tập rất đáng khen ngợi:
-- Chuyên cần: Đạt {ty_le_chuyen_can}% ({so_buoi_co_mat}/{tong_so_buoi} buổi), hoàn thành {ty_le_nop_btvn}% BTVN.
-- Điểm Kiểm tra trung bình đạt: {diem_tb_kt}/10 (Mặt bằng lớp: {diem_tb_kt_lop}/10) - {xu_huong_diem}.
-- Các mảng kiến thức {danh_xung_hs} nắm rất chắc: {chuyen_de_vung}.
-- Ghi nhận trên lớp: {nhan_xet_chi_tiet}
+{danh_xung_gv} {ten_gv} trân trọng gửi lời TUYÊN DƯƠNG kết quả học tập môn Toán của {danh_xung_hs} {ten_hs} trong {chu_ky}:
 
-Nhờ Gia đình gửi lời khen ngợi để khích lệ tinh thần giúp {danh_xung_hs} tiếp tục giữ vững phong độ trong các chuyên đề nâng cao sắp tới nhé ạ!`,
+{tom_tat_canh_bao}
+
+📊 TỔNG HỢP KẾT QUẢ HỌC TẬP (CHUẨN TRỌNG SỐ 70% KT + 30% BTVN):
+• Chuyên cần: {so_buoi_co_mat}/{tong_so_buoi} buổi ({ty_le_chuyen_can}% - {chi_tiet_vang_muon})
+• Điểm TB Bài kiểm tra (Trọng số 70%): {diem_tb_kt}/10 (TB lớp: {diem_tb_kt_lop}/10 - {xu_huong_diem})
+• Điểm TB Bài tập về nhà (Trọng số 30%): {diem_tb_btvn}/10 (Hoàn thành: {so_btvn_da_nop}/{tong_so_btvn} bài - {ty_le_nop_btvn}%)
+🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): {diem_tb_tong_hop}/10
+
+📌 GHI NHẬN CHUYÊN ĐỀ & NHẬN XÉT TRÊN LỚP:
+• Các mảng kiến thức {danh_xung_hs} nắm rất chắc: {chuyen_de_vung}
+{nhan_xet_chi_tiet}
+
+{danh_xung_gv} rất vui và tự hào trước tinh thần nỗ lực của {danh_xung_hs} {ten_hs}. Nhờ Gia đình gửi lời khen ngợi để khích lệ {danh_xung_hs} tiếp tục giữ vững phong độ xuất sắc này trong các chuyên đề nâng cao sắp tới nhé ạ!`,
   },
   {
     id: 'tpl_homework_attendance',
     category: 'homework_attendance',
     title: '3. Phối hợp nhắc nhở Chuyên cần & Bài tập về nhà',
-    description: 'Dành cho học sinh nhóm Cần chú ý do quên BTVN hoặc đi muộn/vắng học.',
-    body: `Dạ {danh_xung_gv} {ten_gv} xin phép thông tin nhanh tới Gia đình về tình hình chuyên cần và làm BTVN của {danh_xung_hs} {ten_hs} ({ten_lop}) trong {chu_ky}:
+    description: 'Dành cho học sinh có cảnh báo thiếu BTVN, điểm BTVN thấp hoặc đi muộn/vắng học.',
+    body: `Kính gửi {ten_ph} (PH {danh_xung_hs} {ten_hs} - Lớp {ten_lop}),
 
-- Tham gia buổi học: {so_buoi_co_mat}/{tong_so_buoi} buổi ({chi_tiet_vang_muon}).
-- Hoàn thành BTVN: {so_btvn_da_nop}/{tong_so_btvn} bài (Điểm TB BTVN: {diem_tb_btvn}/10).
-- Các bài tập cần bổ sung: {danh_sach_thieu_btvn}.
+{danh_xung_gv} {ten_gv} xin phép thông tin tới Gia đình về tình hình chuyên cần và làm Bài tập về nhà (BTVN) của {danh_xung_hs} {ten_hs} trong {chu_ky}:
 
-Do môn Toán THCS có tính hệ thống cao, việc làm đầy đủ BTVN giúp {danh_xung_hs} nhớ công thức và không bị lúng túng khi làm bài kiểm tra (hiện điểm TB Kiểm tra của {danh_xung_hs} là {diem_tb_kt}/10).
+{tom_tat_canh_bao}
 
-{danh_xung_gv} đã {giai_phap_de_xuat}. Nhờ Gia đình nhắc nhở {danh_xung_hs} dành khoảng 30-45 phút mỗi tối hoàn thành bài tập trước khi đến lớp cùng {danh_xung_gv} nhé ạ!`,
+📊 TỔNG HỢP KẾT QUẢ HỌC TẬP (CHUẨN TRỌNG SỐ 70% KT + 30% BTVN):
+• Chuyên cần: {so_buoi_co_mat}/{tong_so_buoi} buổi ({ty_le_chuyen_can}% - {chi_tiet_vang_muon})
+• Hoàn thành BTVN (Trọng số 30%): {so_btvn_da_nop}/{tong_so_btvn} bài ({ty_le_nop_btvn}%) - Điểm TB BTVN: {diem_tb_btvn}/10
+• Các bài tập cần bổ sung: {danh_sach_thieu_btvn}
+• Điểm TB Bài kiểm tra (Trọng số 70%): {diem_tb_kt}/10 | 🎯 Điểm TB Tổng hợp: {diem_tb_tong_hop}/10
+
+📌 CHI TIẾT BUỔI HỌC CẦN LƯU Ý:
+{chi_tiet_buoi_hoc}
+
+💡 ĐỀ XUẤT PHỐI HỢP CÙNG GIA ĐÌNH:
+{giai_phap_de_xuat}
+
+Do môn Toán THCS có tính hệ thống cao, nhờ Gia đình nhắc nhở {danh_xung_hs} dành khoảng 30-45 phút hoàn thành đầy đủ BTVN trước khi đến lớp cùng {danh_xung_gv} nhé ạ!`,
   },
   {
     id: 'tpl_knowledge_remedial',
     category: 'knowledge_remedial',
     title: '4. Kế hoạch phụ đạo bù lỗ hổng kiến thức chuyên đề',
-    description: 'Báo cáo rõ chuyên đề Toán con đang bị mất gốc và kế hoạch kèm bổ trợ của Giáo viên.',
-    body: `Dạ {danh_xung_gv} {ten_gv} xin phép trao đổi kỹ hơn với Gia đình về kết quả kiểm tra và các chuyên đề Toán của {danh_xung_hs} {ten_hs} ({ten_lop}) qua {chu_ky}:
+    description: 'Báo cáo rõ chuyên đề Toán con đang bị hổng kiến thức và kế hoạch kèm bổ trợ của Giáo viên.',
+    body: `Kính gửi {ten_ph} (PH {danh_xung_hs} {ten_hs} - Lớp {ten_lop}),
 
-- Điểm TB Kiểm tra hiện tại: {diem_tb_kt}/10 (Điểm TB lớp: {diem_tb_kt_lop}/10).
-- Điểm TB BTVN: {diem_tb_btvn}/10 (Tỷ lệ nộp bài: {ty_le_nop_btvn}%).
-- Qua chấm chữa bài chi tiết, {danh_xung_gv} nhận thấy {danh_xung_hs} đã nắm được: {chuyen_de_vung}.
-- Tuy nhiên, {danh_xung_hs} đang còn hổng kiến thức ở chuyên đề: {chuyen_de_can_ren}.
-- Nhận xét chuyên môn: {nhan_xet_chi_tiet}
+{danh_xung_gv} {ten_gv} xin phép trao đổi kỹ hơn với Gia đình về kết quả kiểm tra và kế hoạch bù lỗ hổng chuyên đề Toán của {danh_xung_hs} {ten_hs} qua {chu_ky}:
 
-Kế hoạch hỗ trợ của {danh_xung_gv} trong tuần này:
-- {giai_phap_de_xuat}
-Nhờ Gia đình động viên {danh_xung_hs} đi học đúng giờ và ôn lại các dạng bài {danh_xung_gv} đã chữa kỹ trong vở để cải thiện điểm số trong kỳ kiểm tra tới ạ!`,
+{tom_tat_canh_bao}
+
+📊 TỔNG HỢP KẾT QUẢ HỌC TẬP (CHUẨN TRỌNG SỐ 70% KT + 30% BTVN):
+• Điểm TB Bài kiểm tra (Trọng số 70%): {diem_tb_kt}/10 (TB lớp: {diem_tb_kt_lop}/10 - {xu_huong_diem})
+• Điểm TB Bài tập về nhà (Trọng số 30%): {diem_tb_btvn}/10 (Tỷ lệ nộp bài: {ty_le_nop_btvn}%)
+🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): {diem_tb_tong_hop}/10
+
+📌 CHI TIẾT CHUYÊN ĐỀ & BUỔI HỌC CẦN CỦNG CỐ:
+• Chuyên đề đã nắm được: {chuyen_de_vung}
+• Chuyên đề đang còn hổng cần rèn luyện: {chuyen_de_can_ren}
+{chi_tiet_buoi_hoc}
+
+💡 KẾ HOẠCH HỖ TRỢ & PHỐI HỢP CÙNG GIA ĐÌNH:
+{giai_phap_de_xuat}
+
+Nhờ Gia đình động viên {danh_xung_hs} đi học đúng giờ và ôn lại các dạng bài {danh_xung_gv} đã chữa kỹ trong vở để cải thiện điểm số trong bài kiểm tra tới ạ!`,
   },
   {
     id: 'tpl_retention_care',
     category: 'retention_care',
-    title: '5. Thăm hỏi đặc biệt & Đồng hành tháo gỡ khó khăn (Chống nghỉ học)',
-    description: 'Dành cho học sinh nhóm Nguy cơ nghỉ học, bị áp lực điểm số hoặc cần tháo gỡ tâm lý.',
-    body: `Dạ chào Gia đình em {ten_hs} ạ, {danh_xung_gv} {ten_gv} xin phép nhắn tin hỏi thăm tình hình học tập của {danh_xung_hs} tại lớp {ten_lop} trong {chu_ky} vừa qua:
+    title: '5. Thăm hỏi đặc biệt & Đồng hành tháo gỡ khó khăn (Chống nghỉ học - P1)',
+    description: 'Dành cho học sinh Cảnh báo Đỏ P1 / Nguy cơ nghỉ học, bị áp lực điểm số hoặc cần tháo gỡ tâm lý.',
+    body: `Kính gửi {ten_ph} (PH {danh_xung_hs} {ten_hs} - Lớp {ten_lop}),
 
-Qua theo dõi sát sao trên lớp (Chuyên cần {so_buoi_co_mat}/{tong_so_buoi} buổi, Điểm TB Kiểm tra {diem_tb_kt}/10), {danh_xung_gv} nhận thấy thời gian gần đây {danh_xung_hs} có phần gặp khó khăn ở phần: {chuyen_de_can_ren} ({nhan_xet_chi_tiet}).
+{danh_xung_gv} {ten_gv} xin phép nhắn tin hỏi thăm tình hình học tập của {danh_xung_hs} {ten_hs} tại lớp {ten_lop} trong {chu_ky} vừa qua:
 
-Để {danh_xung_hs} không bị tâm lý áp lực hay chán nản khi gặp bài khó, {danh_xung_gv} và Trợ giảng đã chủ động xây dựng phương án hỗ trợ riêng cho {danh_xung_hs}:
-1. {giai_phap_de_xuat}
-2. Chia nhỏ lượng bài tập về nhà vừa sức để {danh_xung_hs} lấy lại sự tự tin và gốc kiến thức từng bước.
+{tom_tat_canh_bao}
+
+📊 TỔNG HỢP KẾT QUẢ HỌC TẬP (CHUẨN TRỌNG SỐ 70% KT + 30% BTVN):
+• Chuyên cần: {so_buoi_co_mat}/{tong_so_buoi} buổi ({ty_le_chuyen_can}% - {chi_tiet_vang_muon})
+• Điểm TB Bài kiểm tra (Trọng số 70%): {diem_tb_kt}/10 | Điểm TB BTVN (Trọng số 30%): {diem_tb_btvn}/10
+🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): {diem_tb_tong_hop}/10
+
+📌 CHI TIẾT BUỔI HỌC & CHUYÊN ĐỀ GẶP KHÓ KHĂN:
+• Chuyên đề cần tháo gỡ: {chuyen_de_can_ren}
+{chi_tiet_buoi_hoc}
+
+💡 PHƯƠNG ÁN ĐỒNG HÀNH RIÊNG CỦA GIÁO VIÊN & TRỢ GIẢNG:
+{giai_phap_de_xuat}
+• Chia nhỏ lượng bài tập về nhà vừa sức để {danh_xung_hs} lấy lại sự tự tin và gốc kiến thức từng bước.
 
 Gia đình cho {danh_xung_gv} hỏi thêm ở nhà {danh_xung_hs} có chia sẻ khó khăn gì về bài vở hay thời gian biểu không ạ? {danh_xung_gv} rất mong được lắng nghe để điều chỉnh phương pháp hỗ trợ {danh_xung_hs} tốt nhất ạ!`,
   },
 ];
+
+/**
+ * Resolves the active template list, automatically upgrading legacy un-customized templates
+ * to the unified 70% Test / 30% HW standard while preserving user-customized templates.
+ */
+export function resolveActiveCRMTemplates(
+  savedTemplates?: CRMMessageTemplate[]
+): CRMMessageTemplate[] {
+  if (!savedTemplates || savedTemplates.length === 0) {
+    return DEFAULT_CRM_MESSAGE_TEMPLATES;
+  }
+  return DEFAULT_CRM_MESSAGE_TEMPLATES.map((defaultTpl) => {
+    const saved = savedTemplates.find((t) => t.id === defaultTpl.id);
+    if (saved && saved.isCustom && saved.body.includes('{diem_tb_tong_hop}')) {
+      return saved;
+    }
+    return defaultTpl;
+  });
+}
+
+/**
+ * Selects the recommended template ID consistently across both WarningCenter and CustomerCRM.
+ */
+export function selectRecommendedCRMTemplateId(
+  report: StudentParentReportData,
+  explicitWarning?: Warning | null
+): string {
+  const targetWarning = explicitWarning || report.activeWarnings[0];
+
+  if (targetWarning) {
+    if (targetWarning.priority === 'Praise') {
+      return 'tpl_praise_progress';
+    }
+    // Check if warning is mainly about homework/attendance vs test/knowledge vs P1
+    const wText = `${targetWarning.warning_type || ''} ${(targetWarning.issue_tags || []).join(' ')}`.toLowerCase();
+    if (
+      targetWarning.priority === 'P2' &&
+      (wText.includes('btvn') || wText.includes('chuyên cần') || wText.includes('vắng')) &&
+      !wText.includes('kiểm tra') &&
+      !wText.includes('tụt')
+    ) {
+      return 'tpl_homework_attendance';
+    }
+    // Default unified periodic + warning summary template so 100% of multi-issue cards are clear
+    return 'tpl_periodic_report';
+  }
+
+  if (
+    report.studentTestAvg !== null &&
+    report.studentTestAvg >= 8.0 &&
+    report.hwCompletionRate >= 85 &&
+    report.unexcusedCount === 0
+  ) {
+    return 'tpl_praise_progress';
+  }
+
+  if (report.suggestedStatus === 'attention') {
+    if (report.hwCompletionRate < 85 || report.unexcusedCount > 0) {
+      return 'tpl_homework_attendance';
+    }
+    return 'tpl_knowledge_remedial';
+  }
+
+  return 'tpl_periodic_report';
+}
 
 export function calculateDaysSince(isoOrDate?: string): number | null {
   if (!isoOrDate) return null;
@@ -429,19 +539,23 @@ export function evaluateStudentCRMSuggestion(params: {
 
 /**
  * Compiles 100% deterministic, accurate academic report data for a student
- * across a chosen session cycle ('1' | '4' | '8' | 'all').
+ * across a chosen session cycle ('1' | '2' | '4' | '8' | 'all' or customSessionsSlice).
+ * Uses the exact same 70% Test + 30% Homework and 0-point rule as warningEngine.ts.
  */
 export function compileAccurateStudentParentReport(params: {
   student: Student;
   classes: ClassItem[];
   enrolledClassIds: string[];
   selectedClassId?: string;
-  cycleLimit: 1 | 4 | 8 | 'all';
+  cycleLimit: 1 | 2 | 4 | 8 | 'all';
   allSessions: Session[];
   allStudentSessions: StudentSession[];
   allWarnings: Warning[];
   allKnowledgeTags: KnowledgeTag[];
   allKnowledgeResults: KnowledgeResult[];
+  customSessionsSlice?: Session[];
+  customPeriodLabel?: string;
+  explicitWarning?: Warning | null;
 }): StudentParentReportData {
   const {
     student,
@@ -454,6 +568,9 @@ export function compileAccurateStudentParentReport(params: {
     allWarnings,
     allKnowledgeTags,
     allKnowledgeResults,
+    customSessionsSlice,
+    customPeriodLabel,
+    explicitWarning,
   } = params;
 
   const studentIdStr = String(student.id);
@@ -479,7 +596,7 @@ export function compileAccurateStudentParentReport(params: {
   // Filter sessions belonging to the student's class(es), sorted ascending by date
   const classSessionsSorted = allSessions
     .filter((s) => targetClassIds.has(String(s.class_id)))
-    .sort((a, b) => a.session_date.localeCompare(b.session_date));
+    .sort((a, b) => (a.session_date || '').localeCompare(b.session_date || ''));
 
   // Index student_sessions by session_id
   const recordsBySession = new Map<string, StudentSession[]>();
@@ -496,30 +613,40 @@ export function compileAccurateStudentParentReport(params: {
     }
   }
 
-  // Filter sessions where this student has a record (or sessions in their enrolled class)
-  const relevantSessions = classSessionsSorted.filter((s) =>
-    studentRecordBySession.has(String(s.id))
-  );
-  const baseSessions =
-    relevantSessions.length > 0 ? relevantSessions : classSessionsSorted;
-
-  const slicedSessions =
-    cycleLimit === 'all' ? baseSessions : baseSessions.slice(-cycleLimit);
+  let slicedSessions: Session[];
+  if (customSessionsSlice && customSessionsSlice.length > 0) {
+    slicedSessions = [...customSessionsSlice].sort((a, b) =>
+      (a.session_date || '').localeCompare(b.session_date || '')
+    );
+  } else {
+    const relevantSessions = classSessionsSorted.filter((s) =>
+      studentRecordBySession.has(String(s.id))
+    );
+    const baseSessions =
+      relevantSessions.length > 0 ? relevantSessions : classSessionsSorted;
+    slicedSessions =
+      cycleLimit === 'all' ? baseSessions : baseSessions.slice(-cycleLimit);
+  }
 
   const periodLabel =
-    cycleLimit === 1
+    customPeriodLabel ||
+    (cycleLimit === 1
       ? 'Buổi học gần nhất'
+      : cycleLimit === 2
+      ? `${slicedSessions.length} buổi gần nhất`
       : cycleLimit === 4
       ? `Chu kỳ ${slicedSessions.length} buổi gần nhất`
       : cycleLimit === 8
       ? `Chu kỳ ${slicedSessions.length} buổi (2 tháng)`
-      : `Toàn khóa (${slicedSessions.length} buổi)`;
+      : `Toàn khóa (${slicedSessions.length} buổi)`);
 
   const dateRangeText =
     slicedSessions.length > 0
-      ? `${slicedSessions[0].session_date} đến ${
-          slicedSessions[slicedSessions.length - 1].session_date
-        }`
+      ? slicedSessions.length === 1
+        ? `Ngày ${slicedSessions[0].session_date}`
+        : `${slicedSessions[0].session_date} đến ${
+            slicedSessions[slicedSessions.length - 1].session_date
+          }`
       : 'Chưa có buổi học';
 
   let presentCount = 0;
@@ -546,46 +673,70 @@ export function compileAccurateStudentParentReport(params: {
   }> = [];
   const remedialSet = new Set<string>();
   const sessionRows: StudentSessionEnriched[] = [];
+  const weakSessionDetails: string[] = [];
+  const allSessionDetails: string[] = [];
+
+  const tagMap = new Map<string, KnowledgeTag>();
+  allKnowledgeTags.forEach((t) => {
+    if (t.id) tagMap.set(String(t.id), t);
+  });
+
+  const strongTopicsMap = new Map<string, number>();
+  const weakTopicsMap = new Map<string, number>();
 
   for (const sess of slicedSessions) {
     const sessId = String(sess.id);
     const rec = studentRecordBySession.get(sessId);
     const classRecs = recordsBySession.get(sessId) || [];
 
-    // Compute class HW avg for this session
-    const validClassHw = classRecs.filter(
-      (r) =>
-        sess.has_homework !== false &&
-        !r.exempt &&
-        !r.exempt_homework &&
-        typeof r.homework_score === 'number' &&
-        r.homework_score > 0
-    );
+    // Compute class HW avg for this session (including 0đ for unsubmitted/unexcused)
+    const classHwScoresForSess: number[] = [];
+    if (sess.has_homework !== false) {
+      for (const r of classRecs) {
+        if (r.exempt || r.exempt_homework) continue;
+        if (r.attendance === 'absent_unexcused') {
+          classHwScoresForSess.push(0);
+        } else if (r.attendance === 'present' || r.attendance === 'late') {
+          if (
+            !r.homework_submitted &&
+            !r.late_submit &&
+            (r.homework_score === undefined || r.homework_score === null)
+          ) {
+            classHwScoresForSess.push(0);
+          } else if (typeof r.homework_score === 'number' && r.homework_score >= 0) {
+            classHwScoresForSess.push(Number(r.homework_score));
+          }
+        }
+      }
+    }
     const classAvgHw =
-      validClassHw.length > 0
+      classHwScoresForSess.length > 0
         ? Number(
             (
-              validClassHw.reduce((sum, r) => sum + Number(r.homework_score || 0), 0) /
-              validClassHw.length
+              classHwScoresForSess.reduce((sum, v) => sum + v, 0) /
+              classHwScoresForSess.length
             ).toFixed(1)
           )
         : null;
 
-    // Compute class Test avg for this session
-    const validClassTest = classRecs.filter(
-      (r) =>
-        sess.has_test !== false &&
-        !r.exempt &&
-        !r.exempt_test &&
-        typeof r.test_score === 'number' &&
-        r.test_score > 0
-    );
+    // Compute class Test avg for this session (including 0đ for unexcused absence)
+    const classTestScoresForSess: number[] = [];
+    if (sess.has_test !== false) {
+      for (const r of classRecs) {
+        if (r.exempt || r.exempt_test) continue;
+        if (r.attendance === 'absent_unexcused') {
+          classTestScoresForSess.push(0);
+        } else if (typeof r.test_score === 'number' && r.test_score >= 0) {
+          classTestScoresForSess.push(Number(r.test_score));
+        }
+      }
+    }
     const classAvgTest =
-      validClassTest.length > 0
+      classTestScoresForSess.length > 0
         ? Number(
             (
-              validClassTest.reduce((sum, r) => sum + Number(r.test_score || 0), 0) /
-              validClassTest.length
+              classTestScoresForSess.reduce((sum, v) => sum + v, 0) /
+              classTestScoresForSess.length
             ).toFixed(1)
           )
         : null;
@@ -599,7 +750,21 @@ export function compileAccurateStudentParentReport(params: {
       classAvgTest,
     });
 
-    // Attendance
+    // Resolve topic name for this session
+    let topicName = '';
+    if (sess.knowledge_tag_id && tagMap.has(String(sess.knowledge_tag_id))) {
+      topicName = tagMap.get(String(sess.knowledge_tag_id))!.tag_name;
+    } else if (sess.test_knowledge_tag && sess.test_knowledge_tag !== 'same') {
+      topicName = sess.test_knowledge_tag;
+    } else if (sess.chapter) {
+      topicName = sess.chapter;
+    } else if (sess.lesson_title) {
+      topicName = sess.lesson_title.includes(' - ')
+        ? sess.lesson_title.split(' - ').slice(-1)[0].trim()
+        : sess.lesson_title;
+    }
+
+    // 1. Attendance
     if (rec.attendance === 'present') {
       presentCount++;
     } else if (rec.attendance === 'late') {
@@ -616,42 +781,94 @@ export function compileAccurateStudentParentReport(params: {
       );
     }
 
-    // Homework
-    if (sess.has_homework !== false && !rec.exempt && !rec.exempt_homework) {
-      hwSessionCount++;
-      if (rec.homework_submitted || Number(rec.homework_score || 0) > 0) {
-        hwSubmittedCount++;
-        if (typeof rec.homework_score === 'number' && rec.homework_score > 0) {
-          studentHwScores.push(Number(rec.homework_score));
-          if (classAvgHw !== null) classHwAverages.push(classAvgHw);
+    const isHwExempt = Boolean(rec.exempt || rec.exempt_homework);
+    const isTestExempt = Boolean(rec.exempt || rec.exempt_test);
+
+    // 2. Homework (30% weight, aligned 100% with calculateStudentStats)
+    let isHwWeak = false;
+    if (sess.has_homework !== false) {
+      if (rec.attendance === 'absent_unexcused') {
+        hwSessionCount++;
+        studentHwScores.push(0);
+        if (classAvgHw !== null) classHwAverages.push(classAvgHw);
+        missingHwTitles.push(`${sess.session_date} (${sess.lesson_title} - Vắng không phép)`);
+        isHwWeak = true;
+      } else if (rec.attendance === 'present' || rec.attendance === 'late') {
+        if (!isHwExempt) {
+          if (
+            !rec.homework_submitted &&
+            !rec.late_submit &&
+            (rec.homework_score === undefined || rec.homework_score === null)
+          ) {
+            hwSessionCount++;
+            studentHwScores.push(0);
+            if (classAvgHw !== null) classHwAverages.push(classAvgHw);
+            missingHwTitles.push(`${sess.session_date} (${sess.lesson_title})`);
+            isHwWeak = true;
+          } else if (!rec.homework_submitted) {
+            missingHwTitles.push(`${sess.session_date} (${sess.lesson_title})`);
+            isHwWeak = true;
+            if (typeof rec.homework_score === 'number' && rec.homework_score >= 0) {
+              hwSessionCount++;
+              studentHwScores.push(Number(rec.homework_score));
+              if (classAvgHw !== null) classHwAverages.push(classAvgHw);
+            } else {
+              hwSessionCount++;
+              studentHwScores.push(0);
+              if (classAvgHw !== null) classHwAverages.push(classAvgHw);
+            }
+          } else {
+            hwSubmittedCount++;
+            if (typeof rec.homework_score === 'number' && rec.homework_score >= 0) {
+              hwSessionCount++;
+              studentHwScores.push(Number(rec.homework_score));
+              if (classAvgHw !== null) classHwAverages.push(classAvgHw);
+              if (rec.homework_score < 5.0) isHwWeak = true;
+            }
+          }
         }
-      } else if (
-        rec.attendance !== 'absent_excused' &&
-        rec.attendance !== 'absent_unexcused'
-      ) {
-        missingHwTitles.push(`${sess.session_date} (${sess.lesson_title})`);
       }
     }
 
-    // Test
-    if (
-      sess.has_test !== false &&
-      !rec.exempt &&
-      !rec.exempt_test &&
-      typeof rec.test_score === 'number' &&
-      rec.test_score > 0
-    ) {
-      testSessionCount++;
-      studentTestScores.push(Number(rec.test_score));
-      if (classAvgTest !== null) classTestAverages.push(classAvgTest);
+    // 3. Test (70% weight, aligned 100% with calculateStudentStats)
+    let isTestWeak = false;
+    if (sess.has_test !== false) {
+      if (rec.attendance === 'absent_unexcused') {
+        testSessionCount++;
+        studentTestScores.push(0);
+        if (classAvgTest !== null) classTestAverages.push(classAvgTest);
+        isTestWeak = true;
+        if (topicName) weakTopicsMap.set(topicName, 0);
+      } else if (rec.attendance === 'absent_excused') {
+        if (typeof rec.test_score === 'number' && rec.test_score >= 0) {
+          testSessionCount++;
+          studentTestScores.push(Number(rec.test_score));
+          if (classAvgTest !== null) classTestAverages.push(classAvgTest);
+          if (rec.test_score < 5.0) isTestWeak = true;
+        }
+      } else if (rec.attendance === 'present' || rec.attendance === 'late') {
+        if (!isTestExempt && typeof rec.test_score === 'number' && rec.test_score >= 0) {
+          testSessionCount++;
+          studentTestScores.push(Number(rec.test_score));
+          if (classAvgTest !== null) classTestAverages.push(classAvgTest);
+          if (rec.test_score < 5.0) isTestWeak = true;
+          if (topicName) {
+            if (rec.test_score >= 7.5) {
+              strongTopicsMap.set(topicName, Number(rec.test_score));
+            } else if (rec.test_score < 6.5) {
+              weakTopicsMap.set(topicName, Number(rec.test_score));
+            }
+          }
+        }
+      }
     }
 
-    // Comments & Remedial Actions
+    // 4. Comments & Remedial Actions + Session Breakdown Line
     const combinedPresets = Array.isArray(rec.quick_preset_comments)
       ? rec.quick_preset_comments.filter(Boolean)
       : [];
     const customText = (rec.custom_comment || '').trim();
-    const fullComment = [...combinedPresets, customText].filter(Boolean).join('. ');
+    const fullComment = [...combinedPresets, customText].filter(Boolean).join(', ');
     const remedials = Array.isArray(rec.remedial_actions)
       ? rec.remedial_actions.filter(Boolean)
       : [];
@@ -664,6 +881,51 @@ export function compileAccurateStudentParentReport(params: {
         comment: fullComment || 'Đã theo dõi trên lớp',
         remedial: remedials.length > 0 ? remedials.join(', ') : undefined,
       });
+    }
+
+    const isAbsent =
+      rec.attendance === 'absent_unexcused' || rec.attendance === 'absent_excused';
+
+    let hwStr = 'Chưa nộp (0đ)';
+    if (sess.has_homework === false) {
+      hwStr = 'Không giao';
+    } else if (isHwExempt) {
+      hwStr = 'Miễn';
+    } else if (isAbsent) {
+      hwStr = rec.attendance === 'absent_unexcused' ? 'Vắng không phép (0đ)' : 'Nghỉ có phép';
+    } else if (rec.homework_submitted) {
+      hwStr =
+        typeof rec.homework_score === 'number' ? `${rec.homework_score}đ` : 'Đã nộp';
+    }
+
+    let testStr =
+      typeof rec.test_score === 'number' ? `${rec.test_score}đ` : 'Chưa kiểm tra';
+    if (sess.has_test === false) {
+      testStr = 'Không KT';
+    } else if (isTestExempt) {
+      testStr = 'Miễn';
+    } else if (isAbsent) {
+      testStr =
+        rec.attendance === 'absent_unexcused'
+          ? 'Nghỉ không phép (0đ)'
+          : typeof rec.test_score === 'number'
+          ? `${rec.test_score}đ (Thi bù)`
+          : 'Nghỉ có phép';
+    }
+
+    const remarksStr =
+      fullComment ||
+      (isAbsent || isHwWeak || isTestWeak
+        ? 'Cần chú ý ôn tập & bổ sung bài đầy đủ'
+        : 'Chú ý nghe giảng, tiếp thu bài ổn định');
+
+    const sessionDetailLine = `• Bài: ${sess.lesson_title} (${sess.session_date})\n  ↳ Chuyên đề: ${
+      topicName || 'Toán THCS'
+    } | Kết quả: BTVN: ${hwStr} - Kiểm tra: ${testStr}\n  ↳ Nhận xét: ${remarksStr}`;
+
+    allSessionDetails.push(sessionDetailLine);
+    if (isAbsent || isHwWeak || isTestWeak || Boolean(fullComment)) {
+      weakSessionDetails.push(sessionDetailLine);
     }
   }
 
@@ -712,6 +974,25 @@ export function compileAccurateStudentParentReport(params: {
         )
       : null;
 
+  // Compute Weighted Composite Avg (70% Test + 30% Homework) matching calculateStudentStats 100%
+  let studentWeightedAvg: number | null = null;
+  if (studentTestAvg !== null && studentHwAvg !== null) {
+    studentWeightedAvg = Number((studentTestAvg * 0.7 + studentHwAvg * 0.3).toFixed(1));
+  } else if (studentTestAvg !== null) {
+    studentWeightedAvg = studentTestAvg;
+  } else if (studentHwAvg !== null) {
+    studentWeightedAvg = studentHwAvg;
+  }
+
+  let classWeightedAvg: number | null = null;
+  if (classTestAvg !== null && classHwAvg !== null) {
+    classWeightedAvg = Number((classTestAvg * 0.7 + classHwAvg * 0.3).toFixed(1));
+  } else if (classTestAvg !== null) {
+    classWeightedAvg = classTestAvg;
+  } else if (classHwAvg !== null) {
+    classWeightedAvg = classHwAvg;
+  }
+
   const latestTestScore =
     studentTestScores.length > 0
       ? studentTestScores[studentTestScores.length - 1]
@@ -743,51 +1024,69 @@ export function compileAccurateStudentParentReport(params: {
   }
 
   // Knowledge tags & mastery for this student
-  const tagMap = new Map<string, KnowledgeTag>();
-  allKnowledgeTags.forEach((t) => {
-    if (t.id) tagMap.set(String(t.id), t);
-  });
-
   const studentKRs = allKnowledgeResults.filter(
     (kr) => String(kr.student_id) === studentIdStr
   );
-
-  const strongTopics: Array<{ name: string; score: number }> = [];
-  const weakTopics: Array<{ name: string; score: number }> = [];
 
   for (const kr of studentKRs) {
     const tag = tagMap.get(String(kr.knowledge_tag_id));
     if (!tag) continue;
     const score = Number(kr.mastery_score || 0);
-    if (score >= 7.5) {
-      strongTopics.push({ name: tag.tag_name, score });
-    } else if (score > 0 && score < 6.5) {
-      weakTopics.push({ name: tag.tag_name, score });
+    if (score >= 7.5 && !strongTopicsMap.has(tag.tag_name)) {
+      strongTopicsMap.set(tag.tag_name, score);
+    } else if (score > 0 && score < 6.5 && !weakTopicsMap.has(tag.tag_name)) {
+      weakTopicsMap.set(tag.tag_name, score);
     }
   }
 
-  // Also check test_knowledge_tag from low/high test sessions if knowledge_results are sparse
-  for (const row of sessionRows) {
-    const topicName = row.session.test_knowledge_tag || row.session.chapter;
-    if (!topicName) continue;
-    if (row.record.test_score >= 8.0 && strongTopics.length < 4) {
-      if (!strongTopics.some((t) => t.name === topicName)) {
-        strongTopics.push({ name: topicName, score: row.record.test_score });
-      }
-    } else if (
-      row.record.test_score > 0 &&
-      row.record.test_score < 6.5 &&
-      weakTopics.length < 4
-    ) {
-      if (!weakTopics.some((t) => t.name === topicName)) {
-        weakTopics.push({ name: topicName, score: row.record.test_score });
-      }
+  const strongTopics = Array.from(strongTopicsMap.entries())
+    .map(([name, score]) => ({ name, score }))
+    .slice(0, 5);
+  const weakTopics = Array.from(weakTopicsMap.entries())
+    .map(([name, score]) => ({ name, score }))
+    .slice(0, 5);
+
+  // Active unresolved warnings for this student (sorted P1 > P2 > Praise)
+  const rankP = (p: string) => (p === 'P1' ? 3 : p === 'P2' ? 2 : 1);
+  const activeWarnings = allWarnings
+    .filter(
+      (w) =>
+        String(w.student_id) === studentIdStr &&
+        !w.resolved &&
+        w.priority !== 'P3' &&
+        (!selectedClassId ||
+          selectedClassId === 'all' ||
+          String(w.class_id) === String(selectedClassId))
+    )
+    .sort((a, b) => rankP(b.priority) - rankP(a.priority));
+
+  // Build Unified Warning / Praise Summary Block
+  const targetWarning = explicitWarning || activeWarnings[0];
+  let warningSummaryBlock = '';
+  if (targetWarning) {
+    const isPraise = targetWarning.priority === 'Praise';
+    const cleanReasonFull = (targetWarning.reason || '')
+      .replace(/\*\*/g, '')
+      .split('[CHI TIẾT LỖ HỔNG TRUY VẾT]:')[0]
+      .trim();
+    warningSummaryBlock = isPraise
+      ? `🌟 THÀNH TÍCH TUYÊN DƯƠNG: ${targetWarning.warning_type}\n${cleanReasonFull}`
+      : `⚠️ TỔNG HỢP LƯU Ý HỌC TẬP (${targetWarning.priority}): ${targetWarning.warning_type}\n${cleanReasonFull}`;
+  } else {
+    const issues: string[] = [];
+    if (unexcusedCount > 0) issues.push(`Vắng không phép ${unexcusedCount} buổi`);
+    if (missingHwTitles.length > 0) issues.push(`Chưa nộp BTVN ${missingHwTitles.length} bài`);
+    if (studentTestAvg !== null && studentTestAvg < 6.5) {
+      issues.push(`Điểm TB Kiểm tra cần củng cố (${studentTestAvg}đ)`);
+    }
+    if (issues.length > 0) {
+      warningSummaryBlock = `⚠️ TỔNG HỢP LƯU Ý HỌC TẬP: ${issues.join(' + ')}`;
+    } else if (studentWeightedAvg !== null && studentWeightedAvg >= 8.0 && attendanceRate === 100) {
+      warningSummaryBlock = `🌟 THÀNH TÍCH TUYÊN DƯƠNG: Chuyên cần 100%, Điểm Tổng hợp đạt ${studentWeightedAvg}/10 (${scoreTrendText})`;
+    } else {
+      warningSummaryBlock = `✅ ĐÁNH GIÁ CHUNG: Duy trì nề nếp chuyên cần và tiến độ học tập ổn định (${scoreTrendText})`;
     }
   }
-
-  const activeWarnings = allWarnings.filter(
-    (w) => String(w.student_id) === studentIdStr && !w.resolved
-  );
 
   const daysSinceLastContact = calculateDaysSince(
     student.crm_last_contacted_at ||
@@ -827,11 +1126,16 @@ export function compileAccurateStudentParentReport(params: {
     testSessionCount,
     studentTestAvg,
     classTestAvg,
+    studentWeightedAvg,
+    classWeightedAvg,
     latestTestScore,
     highestTestScore,
     scoreTrendText,
     strongTopics,
     weakTopics,
+    weakSessionDetails,
+    allSessionDetails,
+    warningSummaryBlock,
     teacherComments,
     remedialActionsSummary: Array.from(remedialSet),
     activeWarnings,
@@ -844,6 +1148,7 @@ export function compileAccurateStudentParentReport(params: {
 
 /**
  * Renders a personalized Zalo/SMS message from a template and the student's compiled report.
+ * Unified 100% between WarningCenter and CustomerCRM.
  */
 export function renderCRMTemplate(
   templateBody: string,
@@ -851,8 +1156,16 @@ export function renderCRMTemplate(
   pronounConfig?: PronounConfig
 ): string {
   const teacherTitle = pronounConfig?.teacher_title || 'Thầy';
-  const teacherName = pronounConfig?.teacher_name || 'Giáo viên Toán';
+  const rawName = pronounConfig?.teacher_name?.trim() || '';
+  const teacherName =
+    rawName && rawName !== 'Giáo viên' && rawName !== teacherTitle
+      ? rawName
+      : 'Giáo viên Toán';
   const studentPronoun = (pronounConfig?.student_pronoun || 'con').toLowerCase();
+
+  const parentGreeting = report.student.parent_name
+    ? `anh/chị ${report.student.parent_name}`
+    : `Quý Phụ huynh`;
 
   const absentOrLateStr =
     report.absentOrLateDetails.length > 0
@@ -873,16 +1186,47 @@ export function renderCRMTemplate(
   const commentsStr =
     recentComments.length > 0
       ? recentComments
-          .map((c) => `- Ngày ${c.date} (${c.lesson}): ${c.comment}`)
+          .map((c) => `• Ngày ${c.date} (${c.lesson}): ${c.comment}`)
           .join('\n')
-      : `- Trên lớp ${studentPronoun} chú ý nghe giảng và ghi chép bài đầy đủ.`;
+      : `• Trên lớp ${studentPronoun} chú ý nghe giảng và ghi chép bài đầy đủ.`;
 
-  const remedialStr =
-    report.remedialActionsSummary.length > 0
-      ? report.remedialActionsSummary.join('; ')
-      : report.weakTopics.length > 0
-      ? `Giao phiếu bài tập củng cố riêng phần ${report.weakTopics[0].name} và kèm chữa chi tiết trên lớp`
-      : `Tiếp tục luyện các bài toán nâng cao lấy điểm 8.5 - 9+ trong đề thi`;
+  const sessionBreakdownStr =
+    report.weakSessionDetails.length > 0
+      ? report.weakSessionDetails.join('\n')
+      : report.allSessionDetails.length > 0
+      ? report.allSessionDetails.join('\n')
+      : `• Các buổi học trong kỳ ${studentPronoun} tham gia đầy đủ, hoàn thành bài tập đúng tiến độ.`;
+
+  // Build unified action advice list matching WarningCenter + CRM
+  const actionAdviceItems: string[] = [];
+  if (report.remedialActionsSummary.length > 0) {
+    actionAdviceItems.push(`• Biện pháp tại lớp: ${report.remedialActionsSummary.join('; ')}.`);
+  }
+  if (report.missingHwTitles.length > 0 || (report.studentHwAvg !== null && report.studentHwAvg < 6.0)) {
+    actionAdviceItems.push(
+      `• Đôn đốc ${studentPronoun} hoàn thành và nộp bổ sung Bài tập về nhà cho ${teacherTitle} trước buổi học tới.`
+    );
+  }
+  if (report.weakTopics.length > 0 || (report.studentTestAvg !== null && report.studentTestAvg < 6.5)) {
+    const topicsText =
+      report.weakTopics.length > 0
+        ? report.weakTopics.map((t) => t.name).join(', ')
+        : 'các dạng bài trọng tâm trên lớp';
+    actionAdviceItems.push(
+      `• Nhắc ${studentPronoun} xem lại lý thuyết & luyện tập thêm các dạng bài thuộc Chuyên đề: ${topicsText}.`
+    );
+  }
+  if (report.unexcusedCount > 0 || report.excusedCount > 0) {
+    actionAdviceItems.push(
+      `• Nhắc ${studentPronoun} xem lại bài ghi chép và hoàn thành phiếu bài tập của buổi nghỉ.`
+    );
+  }
+  if (actionAdviceItems.length === 0) {
+    actionAdviceItems.push(
+      `• Động viên ${studentPronoun} duy trì thói quen ôn bài cũ 20-30 phút mỗi ngày và phát huy phong độ hiện tại.`
+    );
+  }
+  const remedialStr = actionAdviceItems.join('\n');
 
   const missingHwStr =
     report.missingHwTitles.length > 0
@@ -894,9 +1238,10 @@ export function renderCRMTemplate(
     '{ten_gv}': teacherName,
     '{danh_xung_hs}': studentPronoun,
     '{ten_hs}': report.student.full_name,
-    '{ten_ph}': report.student.parent_name || `Phụ huynh ${studentPronoun} ${report.student.full_name}`,
-    '{ten_lop}': report.primaryClass?.class_name || 'Lớp Toán THCS',
+    '{ten_ph}': parentGreeting,
+    '{ten_lop}': report.primaryClass?.class_name || 'Toán THCS',
     '{chu_ky}': `${report.periodLabel} (${report.dateRangeText})`,
+    '{tom_tat_canh_bao}': report.warningSummaryBlock,
     '{ty_le_chuyen_can}': String(report.attendanceRate),
     '{so_buoi_co_mat}': String(report.presentCount),
     '{tong_so_buoi}': String(report.totalSessionsInPeriod),
@@ -904,12 +1249,17 @@ export function renderCRMTemplate(
     '{ty_le_nop_btvn}': String(report.hwCompletionRate),
     '{so_btvn_da_nop}': String(report.hwSubmittedCount),
     '{tong_so_btvn}': String(report.hwSessionCount),
-    '{diem_tb_btvn}': report.studentHwAvg !== null ? String(report.studentHwAvg) : 'Chưa chấm điểm',
+    '{diem_tb_btvn}': report.studentHwAvg !== null ? String(report.studentHwAvg) : 'Chưa chấm',
     '{diem_tb_btvn_lop}': report.classHwAvg !== null ? String(report.classHwAvg) : '7.5',
     '{danh_sach_thieu_btvn}': missingHwStr,
-    '{diem_tb_kt}': report.studentTestAvg !== null ? String(report.studentTestAvg) : 'Chưa có bài KT',
+    '{diem_tb_kt}': report.studentTestAvg !== null ? String(report.studentTestAvg) : 'Chưa KT',
     '{diem_tb_kt_lop}': report.classTestAvg !== null ? String(report.classTestAvg) : '7.2',
+    '{diem_tb_tong_hop}':
+      report.studentWeightedAvg !== null ? String(report.studentWeightedAvg) : 'Đang cập nhật',
+    '{diem_tb_tong_hop_lop}':
+      report.classWeightedAvg !== null ? String(report.classWeightedAvg) : '7.3',
     '{xu_huong_diem}': report.scoreTrendText,
+    '{chi_tiet_buoi_hoc}': sessionBreakdownStr,
     '{chuyen_de_vung}': strongStr,
     '{chuyen_de_can_ren}': weakStr,
     '{nhan_xet_chi_tiet}': commentsStr,

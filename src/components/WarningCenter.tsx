@@ -21,6 +21,13 @@ import {
   calculateStudentStats,
 } from '../utils/warningEngine';
 import {
+  DEFAULT_CRM_MESSAGE_TEMPLATES,
+  compileAccurateStudentParentReport,
+  renderCRMTemplate,
+  resolveActiveCRMTemplates,
+  selectRecommendedCRMTemplateId,
+} from '../utils/crmEngine';
+import {
   ShieldAlert,
   AlertTriangle,
   CheckCircle2,
@@ -239,47 +246,40 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
           } : null;
         });
 
-        const presentSessions = ssList.filter(ss => ss.attendance === 'present' || ss.attendance === 'late');
-        const presentCount = presentSessions.length;
+        // Sử dụng đồng nhất thuật toán calculateStudentStats (Trọng số 70% KT + 30% BTVN, 0đ khi không nộp/vắng không phép)
+        const stats = calculateStudentStats(String(student.id), cycleSessions, ssList, ruleConfig);
+        const presentCount = stats.presentCount + stats.lateCount;
         const totalOpportunities = cycleSessions.length;
-        const attendancePercent = totalOpportunities > 0 ? (presentCount / totalOpportunities) * 100 : 0;
+        const attendancePercent = totalOpportunities > 0 ? Math.round((presentCount / totalOpportunities) * 100) : 0;
 
         totalAttendanceRateSum += attendancePercent;
         presentCountTotal += presentCount;
         totalOpportunity += totalOpportunities;
 
-        const hwSessions = ssList.filter(ss => {
-          const session = cycleSessions.find((s: any) => String(s.id) === String(ss.session_id));
-          return session?.has_homework !== false && ss.homework_score !== undefined && ss.homework_score >= 0;
-        });
-        const hwSum = hwSessions.reduce((acc, ss) => acc + ss.homework_score, 0);
-        const hwAvg = hwSessions.length > 0 ? Number((hwSum / hwSessions.length).toFixed(1)) : 0;
-
-        if (hwSessions.length > 0) {
+        const hwAvg = stats.hwAverage;
+        if (stats.totalSessions > 0) {
           totalHwSum += hwAvg;
           hwCount++;
         }
 
-        const testSessions = ssList.filter(ss => {
-          const session = cycleSessions.find((s: any) => String(s.id) === String(ss.session_id));
-          return session?.has_test !== false && ss.test_score !== undefined && ss.test_score >= 0;
-        });
-        const testSum = testSessions.reduce((acc, ss) => acc + ss.test_score, 0);
-        const testAvg = testSessions.length > 0 ? Number((testSum / testSessions.length).toFixed(1)) : 0;
-
-        if (testSessions.length > 0) {
+        const testAvg = stats.testAverage;
+        if (stats.totalSessions > 0 && testAvg >= 0) {
           totalTestSum += testAvg;
           testCount++;
         }
 
-        const unexcusedCount = ssList.filter(ss => ss.attendance === 'absent_unexcused').length;
-        const missingHwCount = ssList.filter(ss => {
-          const session = cycleSessions.find(s => s.id === ss.session_id);
-          return session?.has_homework !== false && ss.attendance === 'present' && !ss.homework_submitted;
-        }).length;
+        const unexcusedCount = stats.unexcusedCount;
+        const missingHwCount = stats.unsubmittedHwCount;
         const lowTestsCount = ssList.filter(ss => {
-          const session = cycleSessions.find(s => s.id === ss.session_id);
-          return session?.has_test !== false && ss.attendance === 'present' && ss.test_score < 5.0;
+          const session = cycleSessions.find(s => String(s.id) === String(ss.session_id));
+          return (
+            session?.has_test !== false &&
+            !(ss.exempt || ss.exempt_test) &&
+            (ss.attendance === 'absent_unexcused' ||
+              ((ss.attendance === 'present' || ss.attendance === 'late') &&
+                typeof ss.test_score === 'number' &&
+                ss.test_score < 5.0))
+          );
         }).length;
 
         let warningStatus: 'normal' | 'P1' | 'P2' | 'Praise' = 'normal';
@@ -429,46 +429,40 @@ export const WarningCenter: React.FC<WarningCenterProps> = ({
     setIsPrintModalOpen(true);
   };
 
-  // Single Zalo summary trigger
-  const handleOpenZaloSingle = (student: any) => {
-    const cls = classes.find((c) => String(c.id) === String(reportClassId));
+  // Single Zalo summary trigger (Đồng nhất 100% thuật toán & mẫu tin với CRM Chăm sóc phụ huynh)
+  const handleOpenZaloSingle = async (student: any) => {
     const currentCycle = cycles.find((c) => c.index === selectedCycleIndex);
-    const parentName = student.parent_name ? `anh/chị ${student.parent_name}` : 'Quý Phụ huynh';
-    const teacherTitle = pronounConfig.teacher_title || 'Thầy/Cô';
-    const teacherName =
-      pronounConfig.teacher_name && pronounConfig.teacher_name !== 'Giáo viên'
-        ? `${teacherTitle} ${pronounConfig.teacher_name}`
-        : teacherTitle;
-    const studentPronoun = (pronounConfig.student_pronoun || 'con').toLowerCase();
+    const fullStudent =
+      students.find((s) => String(s.id) === String(student.id)) || (student as Student);
 
-    const weightedCycleAvg =
-      student.hwAvg > 0 && student.testAvg > 0
-        ? parseFloat((student.hwAvg * 0.3 + student.testAvg * 0.7).toFixed(1))
-        : student.testAvg || student.hwAvg || 0;
+    const [allSessions, allStudentSessions, allKnowledgeTags, allKnowledgeResults, settingsList] =
+      await Promise.all([
+        db.sessions.toArray(),
+        db.student_sessions.toArray(),
+        db.knowledge_tags.toArray(),
+        db.knowledge_results.toArray(),
+        db.settings.toArray(),
+      ]);
 
-    let evaluationStr = `Nhìn chung ${studentPronoun} có ý thức học tập ổn định trong chu kỳ này!`;
-    if (student.warningStatus === 'P1') {
-      evaluationStr = `⚠️ Cảnh báo cần phối hợp gấp: ${student.warningReason}. Rất mong Gia đình sát sao đôn đốc ${studentPronoun} đi học và hoàn thành bài tập đầy đủ.`;
-    } else if (student.warningStatus === 'P2') {
-      evaluationStr = `⚠️ Lưu ý học tập: ${student.warningReason}. ${teacherTitle} sẽ kèm sát hơn để hỗ trợ ${studentPronoun} cải thiện điểm số.`;
-    } else if (student.warningStatus === 'Praise') {
-      evaluationStr = `🌟 Tuyên dương: ${student.warningReason}. Thành tích rất xuất sắc, tinh thần học tập gương mẫu!`;
-    }
+    const activeTemplates = resolveActiveCRMTemplates(settingsList[0]?.crm_message_templates);
+    const report = compileAccurateStudentParentReport({
+      student: fullStudent,
+      classes,
+      enrolledClassIds: reportClassId ? [String(reportClassId)] : [],
+      selectedClassId: reportClassId ? String(reportClassId) : undefined,
+      cycleLimit: 4,
+      allSessions,
+      allStudentSessions,
+      allWarnings: warnings,
+      allKnowledgeTags,
+      allKnowledgeResults,
+      customSessionsSlice: currentCycle?.sessions,
+      customPeriodLabel: currentCycle?.name || 'Chu kỳ 4 buổi',
+    });
 
-    const text = `Kính gửi ${parentName} (PH ${studentPronoun} ${student.full_name} - Lớp ${cls?.class_name || 'Toán'}),
-
-${teacherName} xin gửi báo cáo kết quả học tập của ${studentPronoun} trong ${currentCycle?.name} (${currentCycle?.dateRange || 'vừa qua'}):
-
-📊 CHỈ SỐ HỌC TẬP CHU KỲ:
-• Chuyên cần: ${student.attendancePercent}% (${student.attendanceMap.filter((a: any) => a !== null && (a.attendance === 'present' || a.attendance === 'late')).length}/${student.attendanceMap.length} buổi)
-• Điểm TB Kiểm tra (Trọng số 70%): ${student.testAvg > 0 ? student.testAvg + 'đ' : 'Chưa nhập'}
-• Điểm TB Bài tập về nhà (Trọng số 30%): ${student.hwAvg > 0 ? student.hwAvg + 'đ' : 'Chưa nhập'}
-🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): ${weightedCycleAvg > 0 ? weightedCycleAvg + 'đ' : 'Đang cập nhật'}
-
-📝 ĐÁNH GIÁ TỪ GIÁO VIÊN:
-• ${evaluationStr}
-
-Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle} để giúp ${studentPronoun} tiến bộ mỗi ngày!`;
+    const recommendedId = selectRecommendedCRMTemplateId(report);
+    const tpl = activeTemplates.find((t) => t.id === recommendedId) || activeTemplates[0];
+    const text = renderCRMTemplate(tpl.body, report, pronounConfig);
 
     setZaloSingleText(text);
     setSingleStudentPhone(student.parent_phone ? student.parent_phone.replace(/\s+/g, '') : '');
@@ -704,12 +698,13 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
   const [makeupScore, setMakeupScore] = useState<string>('8');
   const [resolveCrmStatus, setResolveCrmStatus] = useState<CRMCustomerStatus>('attention');
 
-  // Modal State for Zalo Message
+  // Modal State for Zalo Message (Đồng nhất với 5 mẫu kịch bản CRM)
   const [zaloModalWarning, setZaloModalWarning] = useState<Warning | null>(null);
   const [zaloMessageText, setZaloMessageText] = useState<string>('');
   const [zaloTextSession, setZaloTextSession] = useState<string>('');
   const [zaloTextCycle, setZaloTextCycle] = useState<string>('');
   const [zaloMode, setZaloMode] = useState<'session' | 'cycle'>('cycle');
+  const [zaloTemplateId, setZaloTemplateId] = useState<string>(DEFAULT_CRM_MESSAGE_TEMPLATES[0].id);
   const [copiedSuccess, setCopiedSuccess] = useState(false);
 
   // Cycle Range Selection States
@@ -1012,12 +1007,14 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
   };
 
   // Generate text dynamically for a specific student, class & session range (Mặc định Cửa sổ 2 buổi gần nhất)
+  // Generate text dynamically for a specific student, class & session range using Unified CRM Engine (70% KT + 30% BTVN)
   const generateCycleTextForRange = async (
     studentId: string,
     classId: string,
     startIdx: number,
     endIdx: number,
-    w: Warning
+    w: Warning,
+    overrideTemplateId?: string
   ) => {
     const student = students.find((s) => String(s.id) === String(studentId));
     const cls = classes.find((c) => String(c.id) === String(classId));
@@ -1030,12 +1027,21 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
         : teacherTitle;
     const studentPronoun = (pronounConfig.student_pronoun || 'con').toLowerCase();
 
-    const classSessions = await db.sessions.where('class_id').equals(classId).toArray();
+    const [allSessions, allStudentSessions, allKnowledgeTags, allKnowledgeResults, settingsList] =
+      await Promise.all([
+        db.sessions.toArray(),
+        db.student_sessions.toArray(),
+        db.knowledge_tags.toArray(),
+        db.knowledge_results.toArray(),
+        db.settings.toArray(),
+      ]);
+
+    const classSessions = allSessions.filter((s) => String(s.class_id) === String(classId));
     const sortedClassSessions = [...classSessions].sort((a, b) =>
       (a.session_date || '').localeCompare(b.session_date || '')
     );
 
-    if (sortedClassSessions.length === 0) {
+    if (sortedClassSessions.length === 0 || !student) {
       return `Kính gửi ${parentName} (PH ${studentPronoun} ${studentName}),\n${teacherName} xin thông báo: Hiện lớp ${cls?.class_name || ''} chưa có dữ liệu buổi học.`;
     }
 
@@ -1043,16 +1049,17 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
     const validEnd = Math.max(validStart, Math.min(endIdx, sortedClassSessions.length - 1));
 
     const slicedClassSessions = sortedClassSessions.slice(validStart, validEnd + 1);
-    const slicedSessionIds = new Set(slicedClassSessions.map((s) => s.id));
+    const slicedSessionIds = new Set(slicedClassSessions.map((s) => String(s.id)));
 
-    const allStudentSessions = await db.student_sessions.where('student_id').equals(studentId).toArray();
-    const slicedStudentSessions = allStudentSessions.filter((ss) => slicedSessionIds.has(ss.session_id));
+    const slicedStudentSessions = allStudentSessions.filter(
+      (ss) => String(ss.student_id) === String(studentId) && slicedSessionIds.has(String(ss.session_id))
+    );
 
     // Validate completeness of session records for the selected range
     const incompleteList: { sessionTitle: string; date: string; sessionNum: number; missingInfo: string[] }[] = [];
 
     slicedClassSessions.forEach((sess, idx) => {
-      const ss = slicedStudentSessions.find((s) => s.session_id === sess.id);
+      const ss = slicedStudentSessions.find((s) => String(s.session_id) === String(sess.id));
       const missingInfo: string[] = [];
 
       if (!ss || !ss.attendance) {
@@ -1084,148 +1091,33 @@ Trân trọng cảm ơn Gia đình đã luôn đồng hành cùng ${teacherTitle
 
     setCycleIncompleteSessions(incompleteList);
 
-    const stats = calculateStudentStats(studentId, slicedClassSessions, slicedStudentSessions, ruleConfig);
-
-    const firstSess = slicedClassSessions[0];
-    const lastSess = slicedClassSessions[slicedClassSessions.length - 1];
     const countInSlice = slicedClassSessions.length;
-    const attendedInSlice = stats.presentCount + stats.lateCount;
+    const customLabel =
+      countInSlice === 1
+        ? `Buổi ${validStart + 1}`
+        : `${countInSlice} buổi gần nhất (Buổi ${validStart + 1} -> Buổi ${validEnd + 1})`;
 
-    const cycleRangeStr =
-      firstSess && lastSess
-        ? `Buổi ${validStart + 1} (${firstSess.session_date}) -> Buổi ${validEnd + 1} (${lastSess.session_date})`
-        : `${stats.totalSessions} buổi gần nhất`;
-
-    const statsSummary = `📊 TỔNG HỢP KẾT QUẢ ${countInSlice} BUỔI HỌC GẦN NHẤT:
-• Chuyên cần: ${attendedInSlice}/${countInSlice} buổi (${Math.round((attendedInSlice / (countInSlice || 1)) * 100)}%${stats.lateCount > 0 ? ` - Đi muộn ${stats.lateCount}b` : ''}${stats.unexcusedCount > 0 ? ` - Vắng không phép ${stats.unexcusedCount}b` : ''})
-• Điểm TB Bài kiểm tra (Trọng số 70%): ${stats.testAverage}đ
-• Điểm TB Bài tập về nhà (Trọng số 30%): ${stats.hwAverage}đ
-🎯 Điểm TB Tổng hợp (70% KT + 30% BTVN): ${stats.weightedAverage}đ`;
-
-    const sortedStudentSessions = [...slicedStudentSessions].sort((a, b) => {
-      const sa = slicedClassSessions.find((s) => s.id === a.session_id);
-      const sb = slicedClassSessions.find((s) => s.id === b.session_id);
-      if (!sa || !sb) return 0;
-      return sa.session_date.localeCompare(sb.session_date);
+    const report = compileAccurateStudentParentReport({
+      student,
+      classes,
+      enrolledClassIds: [String(classId)],
+      selectedClassId: String(classId),
+      cycleLimit: countInSlice === 1 ? 1 : 2,
+      allSessions,
+      allStudentSessions,
+      allWarnings: warnings,
+      allKnowledgeTags,
+      allKnowledgeResults,
+      customSessionsSlice: slicedClassSessions,
+      customPeriodLabel: customLabel,
+      explicitWarning: w,
     });
 
-    const weakSessionItems: string[] = [];
-    const weakTopicsSet = new Set<string>();
-    const processedSessionIds = new Set<string>();
-    let hasMissingHw = false;
-    let hasLowScore = false;
-    let hasAbsence = false;
+    const activeTemplates = resolveActiveCRMTemplates(settingsList[0]?.crm_message_templates);
+    const targetTplId = overrideTemplateId || selectRecommendedCRMTemplateId(report, w);
+    const tpl = activeTemplates.find((t) => t.id === targetTplId) || activeTemplates[0];
 
-    sortedStudentSessions.forEach((ss) => {
-      if (!ss.session_id || processedSessionIds.has(ss.session_id)) return;
-      processedSessionIds.add(ss.session_id);
-
-      const sess = slicedClassSessions.find((s) => s.id === ss.session_id);
-      if (!sess) return;
-
-      const isAbsent = ss.attendance === 'absent_unexcused' || ss.attendance === 'absent_excused';
-      const isHwWeak =
-        sess.has_homework !== false &&
-        !ss.exempt &&
-        !ss.exempt_homework &&
-        (!ss.homework_submitted || (ss.homework_score !== undefined && ss.homework_score < ruleConfig.minHomeworkScore));
-      const isTestWeak =
-        sess.has_test !== false &&
-        !ss.exempt &&
-        !ss.exempt_test &&
-        ss.test_score !== undefined &&
-        ss.test_score < ruleConfig.minTestScore;
-      const hasComments = (ss.quick_preset_comments && ss.quick_preset_comments.length > 0) || !!ss.custom_comment;
-
-      if (isAbsent || isHwWeak || isTestWeak || hasComments) {
-        let chTag = sess.test_knowledge_tag && sess.test_knowledge_tag !== 'same' ? sess.test_knowledge_tag : '';
-        if (!chTag) {
-          const lTitle = sess?.lesson_title || '';
-          chTag = lTitle.includes(' - ') ? lTitle.split(' - ').slice(-1)[0] : 'Đại số & Hình học';
-        }
-        if (chTag) weakTopicsSet.add(chTag);
-
-        if (isAbsent) hasAbsence = true;
-        if (isHwWeak) hasMissingHw = true;
-        if (isTestWeak) hasLowScore = true;
-
-        const remarksList = [...(ss.quick_preset_comments || [])];
-        if (ss.custom_comment) remarksList.push(ss.custom_comment);
-        const remarksStr = remarksList.length > 0 ? remarksList.join(', ') : 'Cần chú ý ôn tập thêm';
-
-        let hwStr = 'Chưa nộp';
-        if (ss.exempt || ss.exempt_homework) {
-          hwStr = 'Miễn';
-        } else if (ss.homework_submitted) {
-          hwStr = ss.homework_score !== undefined ? `${ss.homework_score}đ` : 'Đã nộp';
-        }
-        let testStr = ss.test_score !== undefined ? `${ss.test_score}đ` : 'Chưa kiểm tra';
-        if (ss.exempt || ss.exempt_test) {
-          testStr = 'Miễn';
-        }
-
-        if (isAbsent) {
-          testStr = ss.attendance === 'absent_unexcused' ? 'Nghỉ không phép' : 'Nghỉ có phép';
-          hwStr = 'Vắng mặt';
-        }
-
-        weakSessionItems.push(
-          `• Bài: ${sess.lesson_title} (${sess.session_date})\n  ↳ Chuyên đề: ${chTag}\n  ↳ Kết quả: BTVN: ${hwStr} | Kiểm tra: ${testStr}\n  ↳ Nhận xét: ${remarksStr}`
-        );
-      }
-    });
-
-    let weakTopicsSection = '';
-    if (weakSessionItems.length > 0) {
-      weakTopicsSection = `\n📌 CHI TIẾT BUỔI HỌC & CHUYÊN ĐỀ CẦN LƯU Ý:\n${weakSessionItems.join('\n')}\n`;
-    }
-
-    const actionAdviceList: string[] = [];
-    if (hasMissingHw) {
-      actionAdviceList.push(`• Đôn đốc ${studentPronoun} hoàn thành và nộp bổ sung Bài tập về nhà cho ${teacherTitle} trước buổi học tới.`);
-    }
-    if (hasLowScore || weakTopicsSet.size > 0) {
-      const topicsStr = Array.from(weakTopicsSet).join(', ') || 'Chuyên đề môn Toán';
-      actionAdviceList.push(`• Nhắc ${studentPronoun} xem lại lý thuyết & luyện tập thêm các dạng bài thuộc Chuyên đề: ${topicsStr}.`);
-    }
-    if (hasAbsence) {
-      actionAdviceList.push(`• Nhắc ${studentPronoun} xem lại bài ghi chép và hoàn thành phiếu bài tập của buổi nghỉ.`);
-    }
-    if (actionAdviceList.length === 0) {
-      actionAdviceList.push(`• Động viên ${studentPronoun} duy trì thói quen ôn bài cũ 20 phút mỗi ngày trước khi làm BTVN.`);
-    }
-
-    const actionGuideSection = `\n💡 ĐỀ XUẤT PHỐI HỢP CÙNG GIA ĐÌNH:\n${actionAdviceList.join('\n')}\n`;
-
-    const isPraise = w.priority === 'Praise';
-    const cleanReasonFull = (w.reason || '')
-      .replace(/\*\*/g, '')
-      .split('[CHI TIẾT LỖ HỔNG TRUY VẾT]:')[0]
-      .trim();
-
-    const warningHeaderBlock = isPraise
-      ? `🌟 THÀNH TÍCH TUYÊN DƯƠNG: ${w.warning_type}\n${cleanReasonFull}`
-      : `⚠️ TỔNG HỢP LƯU Ý HỌC TẬP: ${w.warning_type}\n${cleanReasonFull}`;
-
-    return isPraise
-      ? `Kính gửi ${parentName} (PH ${studentPronoun} ${studentName} - Lớp ${cls?.class_name || 'Toán'}),
-
-${teacherName} trân trọng gửi lời TUYÊN DƯƠNG kết quả học tập của ${studentPronoun} ${studentName} trong ${countInSlice} buổi gần nhất (${cycleRangeStr}):
-
-${warningHeaderBlock}
-
-${statsSummary}
-
-${teacherTitle} rất vui và tự hào trước tinh thần nỗ lực của ${studentPronoun} ${studentName}. Mong Gia đình tiếp tục khích lệ để ${studentPronoun} giữ vững phong độ xuất sắc này! Trân trọng cảm ơn Gia đình!`
-      : `Kính gửi ${parentName} (PH ${studentPronoun} ${studentName} - Lớp ${cls?.class_name || 'Toán'}),
-
-${teacherName} xin gửi thông báo tình hình học tập của ${studentPronoun} ${studentName} qua ${countInSlice} buổi gần nhất (${cycleRangeStr}):
-
-${warningHeaderBlock}
-
-${statsSummary}
-${weakTopicsSection}${actionGuideSection}
-Rất mong Quý Phụ huynh phối hợp cùng ${teacherTitle} đôn đốc ${studentPronoun} ${studentName} ôn tập để ${studentPronoun} nhanh chóng bắt kịp tiến độ lớp. Trân trọng cảm ơn Gia đình!`;
+    return renderCRMTemplate(tpl.body, report, pronounConfig);
   };
 
   // Handle Changing Class in Cycle Range Picker (Mặc định Cửa sổ 2 buổi gần nhất)
@@ -1240,7 +1132,14 @@ Rất mong Quý Phụ huynh phối hợp cùng ${teacherTitle} đôn đốc ${st
     setCycleEndIdx(end);
 
     if (zaloModalWarning) {
-      const text = await generateCycleTextForRange(zaloModalWarning.student_id, newClassId, start, end, zaloModalWarning);
+      const text = await generateCycleTextForRange(
+        zaloModalWarning.student_id,
+        newClassId,
+        start,
+        end,
+        zaloModalWarning,
+        zaloTemplateId
+      );
       setZaloTextCycle(text);
       if (zaloMode === 'cycle') setZaloMessageText(text);
     }
@@ -1252,31 +1151,72 @@ Rất mong Quý Phụ huynh phối hợp cùng ${teacherTitle} đôn đốc ${st
     setCycleEndIdx(newEnd);
 
     if (zaloModalWarning && cycleClassId) {
-      const text = await generateCycleTextForRange(zaloModalWarning.student_id, cycleClassId, newStart, newEnd, zaloModalWarning);
+      const text = await generateCycleTextForRange(
+        zaloModalWarning.student_id,
+        cycleClassId,
+        newStart,
+        newEnd,
+        zaloModalWarning,
+        zaloTemplateId
+      );
       setZaloTextCycle(text);
       if (zaloMode === 'cycle') setZaloMessageText(text);
     }
   };
 
+  // Handle Changing Unified CRM Template inside WarningCenter Zalo Modal
+  const handleChangeZaloTemplate = async (newTemplateId: string) => {
+    setZaloTemplateId(newTemplateId);
+    setCopiedSuccess(false);
+    if (!zaloModalWarning || !cycleClassId) return;
+
+    const textCycle = await generateCycleTextForRange(
+      zaloModalWarning.student_id,
+      cycleClassId,
+      cycleStartIdx,
+      cycleEndIdx,
+      zaloModalWarning,
+      newTemplateId
+    );
+    const latestIdx = Math.max(0, cycleSessions.length - 1);
+    const textSession = await generateCycleTextForRange(
+      zaloModalWarning.student_id,
+      cycleClassId,
+      latestIdx,
+      latestIdx,
+      zaloModalWarning,
+      newTemplateId
+    );
+
+    setZaloTextCycle(textCycle);
+    setZaloTextSession(textSession);
+    setZaloMessageText(zaloMode === 'session' ? textSession : textCycle);
+  };
+
   // Open Zalo Message Modal & Generate Unified Template (Default: Cửa sổ 2 buổi gần nhất)
   const handleOpenZaloModal = async (w: Warning) => {
     const student = students.find((s) => String(s.id) === String(w.student_id));
-    const cls = classes.find((c) => String(c.id) === String(w.class_id));
-    const studentName = student?.full_name || 'con';
-    const parentGreeting = student?.parent_name ? `anh/chị ${student.parent_name}` : 'Quý Phụ huynh';
-    const teacherTitle = pronounConfig.teacher_title || 'Thầy/Cô';
-    const teacherName =
-      pronounConfig.teacher_name && pronounConfig.teacher_name !== 'Giáo viên'
-        ? `${teacherTitle} ${pronounConfig.teacher_name}`
-        : teacherTitle;
-    const studentPronoun = (pronounConfig.student_pronoun || 'con').toLowerCase();
-
     let textCycle = '';
     let textSession = '';
 
+    // Pick initial recommended template ID consistent with CustomerCRM
+    const defaultTplId =
+      w.priority === 'Praise'
+        ? 'tpl_praise_progress'
+        : w.priority === 'P2' &&
+          (w.warning_type.toLowerCase().includes('btvn') ||
+            w.warning_type.toLowerCase().includes('chuyên cần')) &&
+          !w.warning_type.toLowerCase().includes('kiểm tra')
+        ? 'tpl_homework_attendance'
+        : 'tpl_periodic_report';
+
+    setZaloTemplateId(defaultTplId);
+
     if (student?.id && w.class_id) {
       const classSessions = await db.sessions.where('class_id').equals(w.class_id).toArray();
-      const sortedClassSessions = [...classSessions].sort((a, b) => a.session_date.localeCompare(b.session_date));
+      const sortedClassSessions = [...classSessions].sort((a, b) =>
+        (a.session_date || '').localeCompare(b.session_date || '')
+      );
 
       setCycleClassId(w.class_id);
       setCycleSessions(sortedClassSessions);
@@ -1287,68 +1227,24 @@ Rất mong Quý Phụ huynh phối hợp cùng ${teacherTitle} đôn đốc ${st
       setCycleStartIdx(defaultStart);
       setCycleEndIdx(defaultEnd);
 
-      textCycle = await generateCycleTextForRange(student.id, w.class_id, defaultStart, defaultEnd, w);
+      textCycle = await generateCycleTextForRange(
+        student.id,
+        w.class_id,
+        defaultStart,
+        defaultEnd,
+        w,
+        defaultTplId
+      );
 
-      // Single session message generator for latest session
-      const studentSessions = await db.student_sessions.where('student_id').equals(student.id).toArray();
-      const sortedStudentSessions = [...studentSessions].sort((a, b) => {
-        const sa = sortedClassSessions.find((s) => s.id === a.session_id);
-        const sb = sortedClassSessions.find((s) => s.id === b.session_id);
-        if (!sa || !sb) return 0;
-        return sa.session_date.localeCompare(sb.session_date);
-      });
-
-      const latestStudentSession = sortedStudentSessions[sortedStudentSessions.length - 1];
-      const latestSessionObj = latestStudentSession
-        ? sortedClassSessions.find((s) => s.id === latestStudentSession.session_id)
-        : null;
-
-      if (latestSessionObj && latestStudentSession) {
-        let attStr = 'Đi học đúng giờ';
-        if (latestStudentSession.attendance === 'absent_unexcused') attStr = 'Vắng không phép';
-        else if (latestStudentSession.attendance === 'absent_excused') attStr = 'Nghỉ có phép';
-        else if (latestStudentSession.attendance === 'late') attStr = 'Đi muộn';
-
-        let hwStr = 'Chưa nộp';
-        if (latestStudentSession.homework_submitted) {
-          hwStr =
-            latestStudentSession.homework_score !== undefined
-              ? `Đã nộp - ${latestStudentSession.homework_score}đ`
-              : 'Đã nộp';
-        }
-
-        let testStr =
-          latestStudentSession.test_score !== undefined
-            ? `${latestStudentSession.test_score}đ`
-            : 'Chưa kiểm tra';
-        if (latestStudentSession.attendance.startsWith('absent')) testStr = 'Vắng mặt';
-
-        const remList = [...(latestStudentSession.quick_preset_comments || [])];
-        if (latestStudentSession.custom_comment) remList.push(latestStudentSession.custom_comment);
-        const remStr = remList.length > 0 ? remList.join(', ') : 'Tiếp thu bài ổn định';
-
-        const cleanReasonFull = (w.reason || '')
-          .replace(/\*\*/g, '')
-          .split('[CHI TIẾT LỖ HỔNG TRUY VẾT]:')[0]
-          .trim();
-
-        textSession = `Kính gửi ${parentGreeting} (PH ${studentPronoun} ${studentName} - Lớp ${cls?.class_name || 'Toán'}),
-${teacherName} xin thông báo nhanh kết quả buổi học ngày ${latestSessionObj.session_date} - Bài "${latestSessionObj.lesson_title}":
-
-${w.priority === 'Praise' ? '🌟 Tuyên dương:' : '⚠️ Lưu ý tổng hợp (2 buổi gần nhất):'} ${w.warning_type}
-${cleanReasonFull}
-
-📌 Kết quả buổi học mới nhất (${latestSessionObj.session_date}):
-• Chuyên cần: ${attStr}
-• BTVN (30%): ${hwStr}
-• Kiểm tra tại lớp (70%): ${testStr}
-• Nhận xét: ${remStr}
-
-💡 Đề xuất phối hợp: Rất mong Gia đình đồng hành đôn đốc ${studentPronoun} ôn lại bài "${latestSessionObj.lesson_title}" và hoàn thành đầy đủ BTVN trước buổi học tới.
-Trân trọng cảm ơn Gia đình!`;
-      } else {
-        textSession = textCycle;
-      }
+      // Single session (latest session) using the exact same unified CRM engine
+      textSession = await generateCycleTextForRange(
+        student.id,
+        w.class_id,
+        defaultEnd,
+        defaultEnd,
+        w,
+        defaultTplId
+      );
     }
 
     setZaloTextCycle(textCycle);
@@ -2518,8 +2414,26 @@ Trân trọng cảm ơn Gia đình!`;
                 </div>
               )}
 
+              {/* Chọn 5 Mẫu Kịch Bản CSKH Đồng Nhất Với Trang CRM */}
+              <div className="space-y-1.5">
+                <label className="block text-[11px] font-bold text-slate-700 dark:text-slate-300">
+                  Mẫu kịch bản tin nhắn Phụ huynh (Đồng nhất 100% với trang CRM CSKH):
+                </label>
+                <select
+                  value={zaloTemplateId}
+                  onChange={(e) => handleChangeZaloTemplate(e.target.value)}
+                  className="w-full text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2 rounded-xl outline-none font-bold text-slate-800 dark:text-slate-100"
+                >
+                  {DEFAULT_CRM_MESSAGE_TEMPLATES.map((tpl) => (
+                    <option key={tpl.id} value={tpl.id}>
+                      {tpl.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               <textarea
-                rows={9}
+                rows={10}
                 value={zaloMessageText}
                 onChange={(e) => setZaloMessageText(e.target.value)}
                 className="w-full text-xs font-sans bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-3 rounded-xl outline-none leading-relaxed text-slate-800 dark:text-slate-100"

@@ -21,6 +21,8 @@ import {
   DEFAULT_CRM_MESSAGE_TEMPLATES,
   compileAccurateStudentParentReport,
   renderCRMTemplate,
+  resolveActiveCRMTemplates,
+  selectRecommendedCRMTemplateId,
   getFollowUpUrgency,
   StudentParentReportData,
 } from '../utils/crmEngine';
@@ -89,7 +91,7 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
   >('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [showCriteriaGuide, setShowCriteriaGuide] = useState(true);
-  const [cycleLimit, setCycleLimit] = useState<1 | 4 | 8 | 'all'>(4);
+  const [cycleLimit, setCycleLimit] = useState<1 | 2 | 4 | 8 | 'all'>(2);
 
   // Active modals
   const [reportModalStudentId, setReportModalStudentId] = useState<string | null>(null);
@@ -285,13 +287,7 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
   }, [compiledRows, selectedClassId]);
 
   const templates: CRMMessageTemplate[] = useMemo(() => {
-    if (
-      activeSettings?.crm_message_templates &&
-      activeSettings.crm_message_templates.length > 0
-    ) {
-      return activeSettings.crm_message_templates;
-    }
-    return DEFAULT_CRM_MESSAGE_TEMPLATES;
+    return resolveActiveCRMTemplates(activeSettings?.crm_message_templates);
   }, [activeSettings]);
 
   const activeReportRow = useMemo(() => {
@@ -343,29 +339,16 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
     return d.toISOString().slice(0, 10);
   };
 
-  // Handler: Open 1-Click Parent Report Modal
+  // Handler: Open 1-Click Parent Report Modal (Unified with WarningCenter template selection)
   const handleOpenReportModal = (row: (typeof compiledRows)[number]) => {
     setReportModalStudentId(String(row.student.id));
-    // Auto-select the best matching template based on student status
+    const recommendedTplId = selectRecommendedCRMTemplateId(row.report);
+    setSelectedTemplateId(recommendedTplId);
     if (row.currentStatus === 'at_risk') {
-      setSelectedTemplateId('tpl_retention_care');
       setAutoFollowupDays(3);
     } else if (row.currentStatus === 'attention') {
-      if (row.report.hwCompletionRate < 85 || row.report.unexcusedCount > 0) {
-        setSelectedTemplateId('tpl_homework_attendance');
-      } else {
-        setSelectedTemplateId('tpl_knowledge_remedial');
-      }
       setAutoFollowupDays(7);
     } else {
-      if (
-        row.report.studentTestAvg !== null &&
-        row.report.studentTestAvg >= 8.0
-      ) {
-        setSelectedTemplateId('tpl_praise_progress');
-      } else {
-        setSelectedTemplateId('tpl_periodic_report');
-      }
       setAutoFollowupDays(14);
     }
     setIsMessageEdited(false);
@@ -702,7 +685,8 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
           <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
             {(
               [
-                { val: 1, label: '1 Buổi gần nhất' },
+                { val: 1, label: '1 Buổi' },
+                { val: 2, label: '2 Buổi (Chuẩn CB)' },
                 { val: 4, label: 'Chu kỳ 4 Buổi' },
                 { val: 8, label: 'Chu kỳ 8 Buổi' },
                 { val: 'all', label: 'Toàn khóa' },
@@ -1209,7 +1193,7 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
                         </div>
                         <div className="flex items-center gap-2 text-xs mt-1">
                           <span className="text-slate-500 dark:text-slate-400 font-sans">
-                            Điểm KT:
+                            Điểm KT (70%):
                           </span>
                           <span
                             className={`font-bold ${
@@ -1226,11 +1210,16 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
                               ? `${report.studentTestAvg}/10`
                               : 'Chưa KT'}
                           </span>
-                          {report.classTestAvg !== null && (
-                            <span className="text-[11px] text-slate-400">
-                              (Lớp: {report.classTestAvg})
-                            </span>
-                          )}
+                        </div>
+                        <div className="flex items-center gap-2 text-xs mt-1 pt-1 border-t border-slate-100 dark:border-slate-800">
+                          <span className="text-slate-500 dark:text-slate-400 font-sans font-semibold">
+                            TB Tổng hợp (70/30):
+                          </span>
+                          <span className="font-extrabold text-indigo-700 dark:text-indigo-400">
+                            {report.studentWeightedAvg !== null
+                              ? `${report.studentWeightedAvg}/10`
+                              : '—'}
+                          </span>
                         </div>
                       </td>
 
@@ -1353,12 +1342,13 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
                   <span className="text-xs font-bold text-slate-700 dark:text-slate-200">
                     Khoảng dữ liệu tổng hợp báo cáo:
                   </span>
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 flex-wrap">
                     {(
                       [
-                        { val: 1, label: '1 Buổi gần nhất' },
-                        { val: 4, label: '4 Buổi gần nhất' },
-                        { val: 8, label: '8 Buổi gần nhất' },
+                        { val: 1, label: '1 Buổi' },
+                        { val: 2, label: '2 Buổi (Chuẩn CB)' },
+                        { val: 4, label: '4 Buổi' },
+                        { val: 8, label: '8 Buổi' },
                         { val: 'all', label: 'Toàn khóa' },
                       ] as const
                     ).map((opt) => (
@@ -1399,8 +1389,8 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
                     </div>
                   </div>
 
-                  {/* 3 Core Academic Metric Boxes */}
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 font-mono tabular-nums">
+                  {/* 4 Core Academic Metric Boxes (Unified 70% Test + 30% HW) */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 font-mono tabular-nums">
                     <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800">
                       <div className="text-[11px] font-sans font-semibold text-slate-500 dark:text-slate-400">
                         1. Tỷ lệ Chuyên cần
@@ -1417,7 +1407,7 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
 
                     <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800">
                       <div className="text-[11px] font-sans font-semibold text-slate-500 dark:text-slate-400">
-                        2. Điểm TB BTVN vs Lớp
+                        2. Điểm TB BTVN (30%)
                       </div>
                       <div className="text-lg font-bold text-slate-900 dark:text-slate-100 mt-0.5">
                         {activeReportRow.report.studentHwAvg !== null
@@ -1435,7 +1425,7 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
 
                     <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800">
                       <div className="text-[11px] font-sans font-semibold text-slate-500 dark:text-slate-400">
-                        3. Điểm TB Kiểm tra vs Lớp
+                        3. Điểm TB Kiểm tra (70%)
                       </div>
                       <div className="text-lg font-bold text-emerald-700 dark:text-emerald-400 mt-0.5">
                         {activeReportRow.report.studentTestAvg !== null
@@ -1448,6 +1438,23 @@ export const CustomerCRM: React.FC<CustomerCRMProps> = ({
                       <div className="text-[11px] font-sans text-slate-500 dark:text-slate-400 mt-1">
                         Cao nhất: {activeReportRow.report.highestTestScore ?? '—'} · Gần nhất:{' '}
                         {activeReportRow.report.latestTestScore ?? '—'}
+                      </div>
+                    </div>
+
+                    <div className="p-3 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800">
+                      <div className="text-[11px] font-sans font-bold text-indigo-700 dark:text-indigo-300">
+                        4. Điểm Tổng Hợp (70/30)
+                      </div>
+                      <div className="text-lg font-extrabold text-indigo-700 dark:text-indigo-300 mt-0.5">
+                        {activeReportRow.report.studentWeightedAvg !== null
+                          ? `${activeReportRow.report.studentWeightedAvg}/10`
+                          : '—'}{' '}
+                        <span className="text-xs font-normal text-slate-500">
+                          (Lớp: {activeReportRow.report.classWeightedAvg ?? '—'})
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-sans text-indigo-600/80 dark:text-indigo-400 mt-1">
+                        Chuẩn 70% KT + 30% BTVN
                       </div>
                     </div>
                   </div>
